@@ -1,0 +1,37 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark light">
+  <title>KTrader</title>
+  <link rel="icon" href="favicon.svg" type="image/svg+xml">
+  <link rel="preload" href="/static/fonts/ktrader-cjk.woff2" as="font" type="font/woff2" crossorigin>
+  <link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+  <div id="app" class="app">
+    <header class="topbar" id="topbar" hidden>
+      <div class="brand">
+        <span class="brand-mark" aria-hidden="true"></span>
+        <span class="brand-name" data-i18n="app_name">KTrader</span>
+        <span class="brand-sub" data-i18n="app_subtitle"></span>
+      </div>
+      <nav class="tabs" id="nav" aria-label="Pages"></nav>
+      <div class="topbar-right">
+        <div class="feed-pills" id="feed-pills" title=""></div>
+        <button class="icon-btn" id="health-btn" type="button" title="" aria-label="health"></button>
+        <button class="icon-btn" id="theme-btn" type="button" title="" aria-label="theme"></button>
+        <button class="lang-btn" id="lang-btn" type="button"></button>
+        <span class="user-chip" id="user-chip"></span>
+        <a class="logout" id="logout-link" href="/logout"></a>
+      </div>
+    </header>
+    <div class="banner" id="conn-banner" hidden></div>
+    <main class="content" id="content"></main>
+    <div class="toasts" id="toasts" aria-live="polite"></div>
+    <div class="modal-root" id="modal-root"></div>
+  </div>
+  <script src="/static/app.js" defer></script>
+</body>
+</html>

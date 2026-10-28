@@ -1,0 +1,115 @@
+{
+  "accounts_file": "./trading_accounts.json",
+  "symbols": [
+    "TSLA",
+    "NVDA",
+    "AEHL",
+    "BIYA",
+    "POM"
+  ],
+  "auth": {
+    "users": {
+      "admin": {
+        "password": "CHANGE-ME-admin"
+      },
+      "trader": {
+        "password": "CHANGE-ME-trader"
+      },
+      "lmh": {
+        "password": "CHANGE-ME-lmh"
+      }
+    }
+  },
+  "server": {
+    "host": "0.0.0.0",
+    "port": 8000,
+    "ssl_enabled": false,
+    "ssl_certfile": "../certs/server.crt",
+    "ssl_keyfile": "../certs/server.key"
+  },
+  "kafka": {
+    "bootstrap_servers": "127.0.0.1:9092",
+    "market_data_bootstrap_servers": "45.32.121.19:9092",
+    "account_details_topic": "account-details",
+    "trading_commands_topic": "trading-commands",
+    "market_data_topic": "price-books",
+    "stock_quotes_topic": "stock-quotes",
+    "group_id": "account-dashboard",
+    "market_data_group_id": "market-data-dashboard",
+    "auto_offset_reset": "latest",
+    "market_data_auto_offset_reset": "earliest",
+    "poll_timeout_sec": 1.0,
+    "producer": {
+      "acks": "all",
+      "enable_idempotence": true,
+      "linger_ms": 5
+    }
+  },
+  "market_data": {
+    "historical_prices_csv": "./historical_prices.csv",
+    "market_insights_max_levels": 20
+  },
+  "smart_selling": {
+    "enabled": true,
+    "state_db": "../logs/smart_selling.sqlite3",
+    "order_status_topic": "order-status",
+    "trading_volume_topic": "trading-volume",
+    "quote_max_age": 10,
+    "trade_max_age": 15,
+    "account_max_age": 60,
+    "participation_percentages": {
+      "patient": "3",
+      "normal": "6",
+      "urgent": "10"
+    },
+    "instrument_defaults": {
+      "tick_size": "0.01",
+      "quantity_step": "1",
+      "min_quantity": "1",
+      "min_notional": "0"
+    },
+    "instruments": {}
+  },
+  "fast_trading": {
+    "aggression_levels": {
+      "1": {
+        "book_levels": 2,
+        "cycle_seconds": 30
+      },
+      "2": {
+        "book_levels": 3,
+        "cycle_seconds": 20
+      },
+      "3": {
+        "book_levels": 5,
+        "cycle_seconds": 10
+      }
+    },
+    "minimum_cycle_seconds_by_medium": {
+      "API": 3,
+      "WEB": 30,
+      "WINDOWS": 40,
+      "EMULATOR": 40
+    }
+  },
+  "persistence": {
+    "order_archive": {
+      "enabled": true,
+      "dir": "~/Reports",
+      "timezone": "America/New_York",
+      "daily_at": "17:00",
+      "topic": "order-status",
+      "read_timeout_seconds": 180
+    },
+    "account_snapshots": {
+      "enabled": true,
+      "dir": "../snapshots",
+      "interval_seconds": 60,
+      "formats": [
+        "jsonl",
+        "sqlite"
+      ],
+      "timezone": "America/New_York"
+    }
+  }
+}

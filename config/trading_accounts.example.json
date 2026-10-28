@@ -1,0 +1,257 @@
+{
+  "accounts": [
+    {
+      "ip_address": "172.232.237.184",
+      "machine_alias": "Linode-Jakarta1",
+      "numeric_id": 1,
+      "string_id": "BITGET_LYJ",
+      "owner_type": "individual",
+      "broker": "Bitget",
+      "trading_medium": "API"
+    },
+    {
+      "ip_address": "172.235.244.20",
+      "machine_alias": "Linode-Jakarta2",
+      "numeric_id": 2,
+      "string_id": "BITGET_DENGLEI",
+      "owner_type": "individual",
+      "broker": "Bitget",
+      "trading_medium": "API"
+    },
+    {
+      "ip_address": "45.76.93.115",
+      "machine_alias": "Vultr-BareMetal-DE",
+      "operating_system": "linux",
+      "numeric_id": 3,
+      "string_id": "GIGA-HWK",
+      "owner_type": "individual",
+      "broker": "GigaMoney",
+      "trading_medium": "EMULATOR",
+      "monitor": true
+    },
+    {
+      "ip_address": "172.105.216.196",
+      "machine_alias": "Vultr-Tokyo1",
+      "numeric_id": 4,
+      "string_id": "BITGET_HTF",
+      "owner_type": "individual",
+      "broker": "Bitget",
+      "trading_medium": "API"
+    },
+    {
+      "ip_address": "139.162.101.228",
+      "machine_alias": "Vultr-Tokyo2",
+      "numeric_id": 5,
+      "string_id": "BITGET_HUANGFANG",
+      "owner_type": "individual",
+      "broker": "Bitget",
+      "trading_medium": "API"
+    },
+    {
+      "ip_address": "43.163.104.109",
+      "machine_alias": "Tencent-SG",
+      "numeric_id": 6,
+      "string_id": "BITGET_WXL",
+      "owner_type": "individual",
+      "broker": "Bitget",
+      "trading_medium": "API"
+    },
+    {
+      "ip_address": "43.154.70.72",
+      "machine_alias": "Tencent-HK",
+      "numeric_id": 7,
+      "string_id": "TIGER_LONGXIANG",
+      "owner_type": "institution",
+      "broker": "Tiger",
+      "trading_medium": "API"
+    },
+    {
+      "ip_address": "101.34.159.235",
+      "machine_alias": "Tencent-Shanghai1",
+      "numeric_id": 8,
+      "string_id": "TIGER_YONGSHENG",
+      "owner_type": "institution",
+      "broker": "Tiger",
+      "trading_medium": "API"
+    },
+    {
+      "ip_address": "49.234.22.212",
+      "machine_alias": "Tencent-Shanghai2",
+      "numeric_id": 9,
+      "string_id": "NA-2",
+      "owner_type": "undefined",
+      "broker": "NA",
+      "trading_medium": "API",
+      "hidden": true
+    },
+    {
+      "ip_address": "209.250.240.250",
+      "machine_alias": "Vultr-BareMetal-NL2",
+      "numeric_id": 10,
+      "string_id": "ZR-WJY",
+      "owner_type": "individual",
+      "broker": "Zhuorui",
+      "trading_medium": "EMULATOR",
+      "monitor": true
+    },
+    {
+      "ip_address": "135.148.52.187",
+      "machine_alias": "OVH-BareMetal-NL",
+      "numeric_id": 11,
+      "string_id": "FANGDE-WJY",
+      "owner_type": "individual",
+      "broker": "Fangde",
+      "trading_medium": "WINDOWS"
+    },
+    {
+      "ip_address": "199.247.3.33",
+      "machine_alias": "Vultr-BareMetal-DE2",
+      "operating_system": "linux",
+      "numeric_id": 12,
+      "string_id": "GIGA-DENGLEI",
+      "owner_type": "individual",
+      "broker": "GigaMoney",
+      "trading_medium": "EMULATOR",
+      "monitor": true
+    },
+    {
+      "ip_address": "15.235.43.53",
+      "machine_alias": "OVH-BareMetal-Toronto1",
+      "numeric_id": 13,
+      "string_id": "FANGDE-WXL",
+      "owner_type": "individual",
+      "broker": "Fangde",
+      "trading_medium": "WINDOWS"
+    },
+    {
+      "ip_address": "148.113.213.109",
+      "machine_alias": "OVH-BareMetal-Toronto2",
+      "numeric_id": 14,
+      "string_id": "FANGDE-HKW",
+      "owner_type": "individual",
+      "broker": "Fangde",
+      "trading_medium": "WINDOWS"
+    },
+    {
+      "ip_address": "15.235.236.200",
+      "machine_alias": "OVH-BareMetal-SG1",
+      "operating_system": "linux",
+      "numeric_id": 15,
+      "string_id": "GIGA-WXL",
+      "owner_type": "individual",
+      "broker": "GigaMoney",
+      "trading_medium": "EMULATOR",
+      "monitor": true
+    },
+    {
+      "ip_address": "37.59.185.97",
+      "machine_alias": "OVH-BareMetal-FR1",
+      "operating_system": "linux",
+      "numeric_id": 16,
+      "string_id": "GIGA-WJY",
+      "owner_type": "individual",
+      "broker": "GigaMoney",
+      "trading_medium": "EMULATOR",
+      "monitor": true
+    },
+    {
+      "ip_address": "37.59.185.183",
+      "machine_alias": "OVH-BareMetal-FR2",
+      "operating_system": "linux",
+      "numeric_id": 17,
+      "string_id": "GIGA-YSY",
+      "owner_type": "individual",
+      "broker": "GigaMoney",
+      "trading_medium": "EMULATOR",
+      "monitor": true
+    },
+    {
+      "ip_address": "57.128.235.101",
+      "machine_alias": "OVH-BareMetal-PL1",
+      "numeric_id": 18,
+      "string_id": "ZR-HWK",
+      "owner_type": "individual",
+      "broker": "Zhuorui",
+      "trading_medium": "EMULATOR",
+      "monitor": true
+    },
+    {
+      "ip_address": "148.113.190.49",
+      "machine_alias": "OVH-BareMetal-Toronto3",
+      "numeric_id": 19,
+      "string_id": "GIGA-GAOYUE",
+      "owner_type": "individual",
+      "broker": "GigaMoney",
+      "trading_medium": "EMULATOR"
+    },
+    {
+      "ip_address": "139.162.185.38",
+      "machine_alias": "Linode-DE1",
+      "numeric_id": 20,
+      "string_id": "TIGER-WJY",
+      "owner_type": "individual",
+      "broker": "Tiger",
+      "trading_medium": "API"
+    },
+    {
+      "ip_address": "139.162.185.98",
+      "machine_alias": "Linode-DE2",
+      "numeric_id": 21,
+      "string_id": "LONGBRIDGE-JJH",
+      "owner_type": "individual",
+      "broker": "Longbridge",
+      "trading_medium": "API",
+      "hidden": true
+    },
+    {
+      "ip_address": "172.139.18.222",
+      "machine_alias": "Linode-FR1",
+      "numeric_id": 22,
+      "string_id": "LONGBRIDGE-JQN",
+      "owner_type": "individual",
+      "broker": "Longbridge",
+      "trading_medium": "API",
+      "hidden": true
+    },
+    {
+      "ip_address": "172.232.208.240",
+      "machine_alias": "Linode-IT1",
+      "numeric_id": 23,
+      "string_id": "LONGBRIDGE-JQY",
+      "owner_type": "individual",
+      "broker": "Longbridge",
+      "trading_medium": "API",
+      "hidden": true
+    },
+    {
+      "ip_address": "172.232.208.132",
+      "machine_alias": "Linode-IT2",
+      "numeric_id": 24,
+      "string_id": "LONGBRIDGE-JERRY",
+      "owner_type": "individual",
+      "broker": "Longbridge",
+      "trading_medium": "API",
+      "hidden": true
+    },
+    {
+      "ip_address": "172.139.18.230",
+      "machine_alias": "Linode-FR2",
+      "numeric_id": 25,
+      "string_id": "LONGBRIDGE-MANNING",
+      "owner_type": "individual",
+      "broker": "Longbridge",
+      "trading_medium": "API",
+      "hidden": true
+    },
+    {
+      "ip_address": "255.255.255.255",
+      "machine_alias": "Linode-255",
+      "numeric_id": 26,
+      "string_id": "LONGBRIDGE-YUHANG",
+      "owner_type": "individual",
+      "broker": "Longbridge",
+      "trading_medium": "API",
+      "hidden": true
+    }
+  ]
+}
