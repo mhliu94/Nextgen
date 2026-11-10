@@ -62,7 +62,11 @@ private:
 
 class SmartSellingConsumer {
 public:
-    SmartSellingConsumer(const AppConfig& config, smart::SmartSellingRuntime& runtime);
+    // The feeds of one Smart controller: `settings` is the controller's own section (smart_selling
+    // for mode G, smart_buying for mode H).
+    SmartSellingConsumer(const AppConfig& config, const SmartSellingConfig& settings, smart::SmartSellingRuntime& runtime);
+    SmartSellingConsumer(const AppConfig& config, smart::SmartSellingRuntime& runtime)
+        : SmartSellingConsumer(config, config.smart_selling, runtime) {}
     void start();
     void stop();
     SmartSellingFeed& orders() { return *orders_; }

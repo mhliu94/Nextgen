@@ -8,6 +8,8 @@
 #include <string_view>
 #include <vector>
 
+#include "core/json.h"
+
 struct sqlite3;
 struct sqlite3_stmt;
 
@@ -48,6 +50,10 @@ public:
     double column_double(int column) const;
     std::optional<std::string> column_optional_text(int column) const;
     int column_count() const;
+    std::string column_name(int column) const;
+    // The current row as a JSON object keyed by column name (INTEGER, REAL, TEXT and NULL map to
+    // their JSON counterparts), like Python's dict(sqlite3.Row).
+    json row_json() const;
 
 private:
     Sqlite& db_;
@@ -56,13 +62,22 @@ private:
 
 class Sqlite {
 public:
-    explicit Sqlite(const std::string& path);
+    enum class Mode {
+        ReadWriteCreate,  // default: create the file when missing
+        ReadWrite,        // the file must exist
+        ReadOnly,         // the file must exist; no write is possible through this connection
+    };
+    explicit Sqlite(const std::string& path, Mode mode = Mode::ReadWriteCreate, int busy_timeout_ms = 5000);
     ~Sqlite();
     Sqlite(const Sqlite&) = delete;
     Sqlite& operator=(const Sqlite&) = delete;
 
     void exec(std::string_view sql);
     void begin_immediate();
+    // Plain deferred BEGIN (a consistent read snapshot in WAL mode once the first read runs).
+    void begin();
+    // Online copy of this database into `target` (sqlite3_backup), like Python's Connection.backup().
+    void backup_to(Sqlite& target);
     void commit();
     void rollback();
     bool in_transaction() const { return in_transaction_; }

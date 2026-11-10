@@ -58,7 +58,7 @@ const std::vector<int>& book_level_choices() {
     return v;
 }
 const std::vector<int>& target_percentage_choices() {
-    static const std::vector<int> v = {10, 20, 30, 40, 50, 60, 70, 80, 90, 100};
+    static const std::vector<int> v(std::begin(orders::kFastTargetPercentageChoices), std::end(orders::kFastTargetPercentageChoices));
     return v;
 }
 const std::vector<int>& cycle_seconds_choices() {
@@ -87,6 +87,26 @@ long long symbol_position_qty(const AccountSnapshot& snapshot, const std::string
         if (std::isfinite(value)) qty += value;
     }
     return static_cast<long long>(std::floor(std::max(0.0, qty)));
+}
+
+// Sum of actual holdings for every participant, independent of sellable quantity; nullopt when any
+// participant has no snapshot or reports a non-finite quantity.
+std::optional<double> total_position(const std::vector<std::string>& account_ids, const std::string& symbol,
+                                     const std::map<std::string, AccountSnapshot>* snapshots) {
+    if (!snapshots) return std::nullopt;
+    std::string target = normalize_symbol(symbol);
+    double total = 0.0;
+    for (const auto& account_id : account_ids) {
+        auto it = snapshots->find(account_id);
+        if (it == snapshots->end()) return std::nullopt;
+        for (const auto& position : it->second.positions) {
+            if (normalize_symbol(position.symbol) != target) continue;
+            if (!std::isfinite(position.qty)) return std::nullopt;
+            total += position.qty;
+        }
+    }
+    if (!std::isfinite(total)) return std::nullopt;
+    return total;
 }
 
 long long account_capacity(const std::string& account_id, const std::string& mode, const std::string& symbol,
@@ -247,6 +267,9 @@ json CycleResult::to_json() const {
     out["commands"] = static_cast<long long>(commands.size());
     out["capacity_noop"] = capacity_noop;
     out["reason"] = reason;
+    out["total_position"] = total_position ? json(*total_position) : json(nullptr);
+    out["total_target_position"] = total_target_position ? json(*total_target_position) : json(nullptr);
+    out["target_position_reached"] = target_position_reached;
     return out;
 }
 
@@ -262,6 +285,9 @@ CycleResult build_fast_trading_cycle_commands(const CycleInputs& in) {
     json target_pct_json = in.target_percentage;
     int book_levels = selected_int(&book_levels_json, book_level_choices(), "fast trading book levels");
     int target_percentage = selected_int(&target_pct_json, target_percentage_choices(), "fast trading target percentage");
+    if (in.total_target_position && (*in.total_target_position < 0 || *in.total_target_position > 9007199254740991LL)) {
+        throw std::invalid_argument(orders::kFastTotalTargetPositionError);
+    }
     std::vector<std::string> account_ids = deduplicated_account_ids(in.account_ids);
     if (account_ids.empty()) throw std::invalid_argument("fast trading account_ids must be non-empty");
     if (!in.account_metas) throw std::invalid_argument("account metadata is required");
@@ -275,6 +301,21 @@ CycleResult build_fast_trading_cycle_commands(const CycleInputs& in) {
     result.order_side = mode == "E" ? "BUY" : "SELL";
     result.book_levels = book_levels;
     result.target_percentage = target_percentage;
+    result.total_target_position = in.total_target_position;
+    if (in.total_target_position) {
+        result.total_position = total_position(account_ids, symbol, in.account_snapshots);
+        if (!result.total_position) {
+            // An incomplete total must not trigger a stop or allow new orders.
+            result.reason = "total_position_unavailable";
+            return result;
+        }
+        double target = static_cast<double>(*in.total_target_position);
+        result.target_position_reached = mode == "E" ? *result.total_position >= target : *result.total_position < target;
+        if (result.target_position_reached) {
+            result.reason = kStopReasonTargetPosition;
+            return result;
+        }
+    }
     if (in.book.error) {
         result.reason = *in.book.error;
         return result;
@@ -344,6 +385,7 @@ CycleResult build_fast_trading_cycle_commands(const CycleInputs& in) {
         cmd["fast_trading_target_qty"] = result.target_quantity;
         cmd["fast_trading_book_levels"] = book_levels;
         cmd["fast_trading_price_limit"] = in.price_limit;
+        if (in.total_target_position) cmd["fast_trading_total_target_position"] = *in.total_target_position;
         result.commands.push_back(std::move(cmd));
     }
     return result;
@@ -355,14 +397,17 @@ CycleResult build_fast_trading_cycle_commands(const CycleInputs& in) {
 
 StrategyManager::StrategyManager(MarketDataStore& market_data, MetasProvider metas, PublishCommand publish,
                                  SnapshotsProvider snapshots, OperationsLog* operations_log, const RuntimeSettings& settings,
-                                 Clock monotonic)
+                                 Clock monotonic, reporting::SessionReporter* reporting, OwnsAccount smart_owns_account)
     : market_data_(market_data),
       metas_(std::move(metas)),
       snapshots_(std::move(snapshots)),
       publish_(std::move(publish)),
       operations_log_(operations_log),
       settings_(settings),
-      monotonic_(monotonic ? std::move(monotonic) : Clock(&mono_now)) {
+      monotonic_(monotonic ? std::move(monotonic) : Clock(&mono_now)),
+      reporting_(reporting),
+      // Smart selling/buying (modes G/H) sessions own accounts too; no account may be in two sessions.
+      smart_owns_account_(smart_owns_account ? std::move(smart_owns_account) : OwnsAccount([](const std::string&) { return false; })) {
     for (int level : {1, 2, 3}) {
         if (!settings_.aggression_levels.count(level)) {
             throw std::invalid_argument("fast trading aggression level " + std::to_string(level) + " is missing");
@@ -387,8 +432,10 @@ StrategyManager::~StrategyManager() {
         std::lock_guard lock(mutex_);
         for (auto& [k, s] : strategies_) remaining.push_back(s);
         for (auto& [k, s] : stopping_strategies_) remaining.push_back(s);
+        for (auto& s : finished_) remaining.push_back(s);
         strategies_.clear();
         stopping_strategies_.clear();
+        finished_.clear();
     }
     for (auto& s : remaining) {
         request_stop(*s);
@@ -404,21 +451,22 @@ std::set<std::string> StrategyManager::strategy_accounts(const json& command) {
     const json* raw = json_find(command, "fast_trading_account_ids");
     if (!raw || !raw->is_array()) return {};
     std::vector<std::string> ids;
-    for (const auto& v : *raw) ids.push_back(json_to_string(&v).value_or(""));
+    for (const auto& v : *raw) ids.push_back(json_python_truthy(&v) ? json_to_string(&v).value_or("") : "");
     auto dedup = deduplicated_account_ids(ids);
     return std::set<std::string>(dedup.begin(), dedup.end());
 }
 
-bool StrategyManager::has_strategy(const std::string& account_id, const std::string& symbol) const {
-    std::string target = normalize_symbol(symbol);
-    std::lock_guard lock(mutex_);
-    auto matches = [&](const std::shared_ptr<Strategy>& s) {
-        return normalize_symbol(json_to_string(json_find(s->command, "symbol")).value_or("")) == target &&
-               strategy_accounts(s->command).count(account_id);
-    };
-    for (auto& [k, s] : strategies_) if (matches(s)) return true;
-    for (auto& [k, s] : stopping_strategies_) if (matches(s)) return true;
-    return inflight_account_ids_.count(account_id) > 0;
+std::string StrategyManager::command_session_id(const json& command) {
+    return json_to_string(json_find(command, "command_id")).value_or("");
+}
+
+void StrategyManager::report(const char* method, const std::function<void(reporting::SessionReporter&)>& call) const {
+    if (!reporting_) return;
+    try {
+        call(*reporting_);
+    } catch (const std::exception& e) {
+        NG_LOG_ERROR(kLog, "Failed updating algorithm reporting method={}: {}", method, e.what());
+    }
 }
 
 bool StrategyManager::has_active_session() const {
@@ -434,7 +482,17 @@ bool StrategyManager::owns_account(const std::string& account_id) const {
     return false;
 }
 
+void StrategyManager::require_accounts_available(const std::vector<std::string>& account_ids) const {
+    // Stopping sessions and in-flight handoffs keep their accounts reserved.
+    std::vector<std::string> owned;
+    for (const auto& account_id : account_ids) {
+        if (owns_account(account_id) || smart_owns_account_(account_id)) owned.push_back(account_id);
+    }
+    if (!owned.empty()) throw std::invalid_argument(orders::algo_account_conflict_error(owned));
+}
+
 bool StrategyManager::has_running_strategy(const std::string& account_id, const std::string& symbol) const {
+    // Only a running worker may hand off a new order after a stop request.
     std::lock_guard lock(mutex_);
     for (auto& [k, s] : strategies_) {
         if (!s->stop_requested.load() &&
@@ -456,7 +514,7 @@ StrategyManager::ValidatedValues StrategyManager::validated_strategy_values(cons
     const json* raw_accounts = json_find(command, "fast_trading_account_ids");
     if (!raw_accounts || !raw_accounts->is_array()) throw std::invalid_argument("fast trading strategy requires account ids");
     std::vector<std::string> ids;
-    for (const auto& a : *raw_accounts) ids.push_back(json_to_string(&a).value_or(""));
+    for (const auto& a : *raw_accounts) ids.push_back(json_python_truthy(&a) ? json_to_string(&a).value_or("") : "");
     v.account_ids = deduplicated_account_ids(ids);
     if (v.account_ids.empty()) throw std::invalid_argument("fast trading strategy requires account ids");
     v.book_levels = selected_int(json_find(command, "fast_trading_book_levels"), book_level_choices(), "fast trading book levels");
@@ -464,48 +522,97 @@ StrategyManager::ValidatedValues StrategyManager::validated_strategy_values(cons
                                        "fast trading target percentage");
     v.cycle_seconds = selected_int(json_find(command, "fast_trading_cycle_seconds"), cycle_seconds_choices(),
                                    "fast trading cycle seconds");
+    const json* target = json_find(command, "fast_trading_total_target_position");
+    v.total_target_position = orders::parse_total_target_position(target ? *target : json(nullptr));
     return v;
 }
 
+void StrategyManager::reap_finished() {
+    std::vector<std::shared_ptr<Strategy>> finished;
+    {
+        std::lock_guard lock(mutex_);
+        for (auto it = finished_.begin(); it != finished_.end();) {
+            if ((*it)->thread.get_id() == std::this_thread::get_id()) {
+                ++it;  // a worker cannot join itself; a later caller reaps it
+            } else {
+                finished.push_back(*it);
+                it = finished_.erase(it);
+            }
+        }
+    }
+    for (auto& s : finished) {
+        if (s->thread.joinable()) s->thread.join();
+    }
+}
+
 std::string StrategyManager::start_strategy(const json& start_command) {
+    reap_finished();
     ValidatedValues v = validated_strategy_values(start_command);
+    json strategy_command = start_command;
+    if (v.total_target_position) strategy_command["fast_trading_total_target_position"] = *v.total_target_position;
+    // The start command id identifies the session here, in reports and in logs.
+    if (!json_python_truthy(json_find(strategy_command, "command_id"))) strategy_command["command_id"] = uuid4_hex();
+    std::string session_id = command_session_id(strategy_command);
     std::string key = strategy_key(v.mode, v.symbol);
+
     auto strategy = std::make_shared<Strategy>();
     strategy->key = key;
-    strategy->command = start_command;
+    strategy->session_id = session_id;
+    strategy->command = strategy_command;
     strategy->started_at = iso_utc_now();
     {
         std::lock_guard lock(mutex_);
-        if (has_active_session()) throw std::invalid_argument("Stop the existing algorithm session before starting another");
-        strategies_[key] = strategy;
+        if (strategies_.count(session_id) || stopping_strategies_.count(session_id)) {
+            throw std::invalid_argument("An algorithm session with this command id is already active");
+        }
+        require_accounts_available(v.account_ids);
+        strategies_[session_id] = strategy;
+        auto accounts = strategy_accounts(strategy->command);
+        std::vector<std::string> sorted_accounts(accounts.begin(), accounts.end());
+        report("start_session", [&](reporting::SessionReporter& r) {
+            r.start_session(session_id, strategy->command, sorted_accounts, strategy->started_at);
+        });
         record_started(*strategy);
         try {
-            strategy->thread = std::thread([this, strategy] { run_strategy(strategy); });
+            std::function<void()> body = [this, strategy] { run_strategy(strategy); };
+            strategy->thread = worker_spawner_ ? worker_spawner_(std::move(body)) : std::thread(std::move(body));
         } catch (...) {
-            strategies_.erase(key);
+            strategies_.erase(session_id);
+            report("end_session", [&](reporting::SessionReporter& r) {
+                r.end_session(session_id, "failed", std::string("Strategy worker failed to start"));
+            });
             throw;
         }
     }
     NG_LOG_INFO(kLog,
                 "Algo trading started successfully mode={} symbol={} key={} command_id={} book_levels={} target_percentage={} "
-                "cycle_seconds={} test_mode={}",
-                v.mode, v.symbol, key, json_to_string(json_find(start_command, "command_id")).value_or(""), v.book_levels,
-                v.target_percentage, v.cycle_seconds, json_truthy(json_find(start_command, "fast_trading_test_mode")));
+                "cycle_seconds={} total_target_position={} test_mode={}",
+                v.mode, v.symbol, key, session_id, v.book_levels, v.target_percentage, v.cycle_seconds,
+                v.total_target_position ? std::to_string(*v.total_target_position) : "None",
+                json_truthy(json_find(strategy_command, "fast_trading_test_mode")));
     return key;
 }
 
 int StrategyManager::stop_strategy(const std::string& trading_mode, const std::string& symbol) {
-    return stop_keys({strategy_key(trading_mode, symbol)}, kStopReasonManual);
+    std::string key = strategy_key(trading_mode, symbol);
+    std::vector<std::string> session_ids;
+    {
+        std::lock_guard lock(mutex_);
+        for (auto& [session_id, s] : strategies_) {
+            if (s->key == key) session_ids.push_back(session_id);
+        }
+    }
+    return stop_sessions(session_ids, kStopReasonManual);
 }
 
 int StrategyManager::stop_matching(const std::string& trading_mode, const std::vector<std::string>& account_ids) {
     std::string mode = to_upper(trim(trading_mode));
     auto filter_vec = deduplicated_account_ids(account_ids);
     std::set<std::string> filter(filter_vec.begin(), filter_vec.end());
-    std::vector<std::string> keys;
+    std::vector<std::string> session_ids;
     {
         std::lock_guard lock(mutex_);
-        for (auto& [key, s] : strategies_) {
+        for (auto& [session_id, s] : strategies_) {
             if (to_upper(trim(json_to_string(json_find(s->command, "trading_mode")).value_or(""))) != mode) continue;
             if (!filter.empty()) {
                 auto accounts = strategy_accounts(s->command);
@@ -513,19 +620,19 @@ int StrategyManager::stop_matching(const std::string& trading_mode, const std::v
                 for (auto& a : accounts) if (filter.count(a)) intersects = true;
                 if (!intersects) continue;
             }
-            keys.push_back(key);
+            session_ids.push_back(session_id);
         }
     }
-    return stop_keys(keys, kStopReasonManual);
+    return stop_sessions(session_ids, kStopReasonManual);
 }
 
 int StrategyManager::stop_all() {
-    std::vector<std::string> keys;
+    std::vector<std::string> session_ids;
     {
         std::lock_guard lock(mutex_);
-        for (auto& [key, s] : strategies_) keys.push_back(key);
+        for (auto& [session_id, s] : strategies_) session_ids.push_back(session_id);
     }
-    return stop_keys(keys, kStopReasonManual);
+    return stop_sessions(session_ids, kStopReasonManual);
 }
 
 void StrategyManager::request_stop(Strategy& strategy) {
@@ -536,46 +643,34 @@ void StrategyManager::request_stop(Strategy& strategy) {
     strategy.wait_cv.notify_all();
 }
 
-int StrategyManager::stop_keys(const std::vector<std::string>& keys, const std::string& reason) {
+int StrategyManager::stop_sessions(const std::vector<std::string>& session_ids, const std::string& reason) {
     std::vector<std::shared_ptr<Strategy>> stopped;
     {
         std::lock_guard lock(mutex_);
-        for (const auto& key : keys) {
-            auto it = strategies_.find(key);
+        for (const auto& session_id : session_ids) {
+            auto it = strategies_.find(session_id);
             if (it == strategies_.end()) continue;
             auto strategy = it->second;
             strategies_.erase(it);
             strategy->last_reason = reason;
             request_stop(*strategy);
-            stopping_strategies_[key] = strategy;
+            stopping_strategies_[session_id] = strategy;
+            report("heartbeat_session", [&](reporting::SessionReporter& r) { r.heartbeat_session(session_id, "stopping"); });
             stopped.push_back(strategy);
         }
     }
     for (auto& strategy : stopped) {
-        if (strategy->thread.joinable() && strategy->thread.get_id() != std::this_thread::get_id()) {
-            // Wait up to two seconds for the worker to exit, like the Python join(timeout=2.0).
-            auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
-            while (std::chrono::steady_clock::now() < deadline) {
-                {
-                    std::lock_guard lock(mutex_);
-                    if (!stopping_strategies_.count(strategy->key)) break;
-                }
-                std::this_thread::sleep_for(std::chrono::milliseconds(5));
-            }
-        }
-        {
-            std::lock_guard lock(mutex_);
-            // The worker removes itself from stopping_strategies_ when it exits; if it already did, join it.
-            if (!stopping_strategies_.count(strategy->key) && strategy->thread.joinable() &&
-                strategy->thread.get_id() != std::this_thread::get_id()) {
-                strategy->thread.join();
-            }
+        if (strategy->thread.get_id() != std::this_thread::get_id()) {
+            // Wait up to two seconds for the worker to finish, like the Python join(timeout=2.0). A worker
+            // still blocked in a publish keeps its accounts reserved until its handoff returns.
+            std::unique_lock lock(strategy->wait_mutex);
+            strategy->wait_cv.wait_for(lock, std::chrono::seconds(2), [&] { return strategy->finished; });
         }
         NG_LOG_INFO(kLog, "Algo trading stopped mode={} symbol={} key={} command_id={} reason={}",
                     json_to_string(json_find(strategy->command, "trading_mode")).value_or(""),
-                    json_to_string(json_find(strategy->command, "symbol")).value_or(""), strategy->key,
-                    json_to_string(json_find(strategy->command, "command_id")).value_or(""), reason);
+                    json_to_string(json_find(strategy->command, "symbol")).value_or(""), strategy->key, strategy->session_id, reason);
     }
+    reap_finished();
     return static_cast<int>(stopped.size());
 }
 
@@ -599,15 +694,49 @@ void StrategyManager::record_ended(const Strategy& strategy, const std::string& 
     }
 }
 
+void StrategyManager::set_worker_spawner_for_test(WorkerSpawner spawner) {
+    std::lock_guard lock(mutex_);
+    worker_spawner_ = std::move(spawner);
+}
+
+void StrategyManager::set_cycle_waiter_for_test(CycleWaiter waiter) {
+    std::lock_guard lock(mutex_);
+    cycle_waiter_ = std::move(waiter);
+}
+
+bool StrategyManager::wait_for_cycle(Strategy& strategy, double seconds) {
+    CycleWaiter simulated;
+    {
+        std::lock_guard lock(mutex_);
+        simulated = cycle_waiter_;
+    }
+    auto wait_stop = [&](double timeout) {
+        if (simulated) return simulated(timeout) || strategy.stop_requested.load();
+        std::unique_lock lock(strategy.wait_mutex);
+        return strategy.wait_cv.wait_for(lock, std::chrono::duration<double>(std::max(0.0, timeout)),
+                                         [&] { return strategy.stop_requested.load(); });
+    };
+    if (!reporting_) return wait_stop(seconds);
+    double deadline = monotonic_() + seconds;
+    while (!strategy.stop_requested.load()) {
+        double remaining = deadline - monotonic_();
+        if (remaining <= 0) return false;
+        report("heartbeat_session", [&](reporting::SessionReporter& r) { r.heartbeat_session(strategy.session_id); });
+        if (wait_stop(std::min(10.0, remaining))) return true;
+    }
+    return true;
+}
+
 void StrategyManager::run_strategy(std::shared_ptr<Strategy> strategy) {
     try {
         ValidatedValues v = validated_strategy_values(strategy->command);
         while (!strategy->stop_requested.load()) {
+            report("heartbeat_session", [&](reporting::SessionReporter& r) { r.heartbeat_session(strategy->session_id); });
             double cycle_start = monotonic_();
             CycleResult result = run_cycle(strategy->command);
             bool test_mode = json_truthy(json_find(strategy->command, "fast_trading_test_mode"));
             long long published_count = test_mode ? 0 : static_cast<long long>(result.commands.size());
-            bool reached_noop_limit = false;
+            std::string auto_stop_reason;
             {
                 std::lock_guard lock(mutex_);
                 strategy->cycles += 1;
@@ -615,28 +744,28 @@ void StrategyManager::run_strategy(std::shared_ptr<Strategy> strategy) {
                 strategy->last_cycle = result.to_json();
                 if (!result.commands.empty()) strategy->consecutive_capacity_noops = 0;
                 else if (result.capacity_noop) strategy->consecutive_capacity_noops += 1;
+                // A cycle may finish after stop; retain the stop reason.
                 if (!strategy->stop_requested.load()) {
-                    if (strategy->consecutive_capacity_noops >= kMaxConsecutiveCapacityNoops) {
+                    if (result.target_position_reached) {
+                        strategy->last_reason = kStopReasonTargetPosition;
+                        auto_stop_reason = strategy->last_reason;
+                    } else if (strategy->consecutive_capacity_noops >= kMaxConsecutiveCapacityNoops) {
                         strategy->last_reason = kStopReasonCapacityNoops;
-                        reached_noop_limit = true;
+                        auto_stop_reason = strategy->last_reason;
                     } else {
                         strategy->last_reason = result.reason;
                     }
                 }
             }
-            if (reached_noop_limit) {
+            if (!auto_stop_reason.empty()) {
                 NG_LOG_INFO(kLog, "Algo trading automatically stopped mode={} symbol={} key={} command_id={} reason={}",
                             json_to_string(json_find(strategy->command, "trading_mode")).value_or(""),
                             json_to_string(json_find(strategy->command, "symbol")).value_or(""), strategy->key,
-                            json_to_string(json_find(strategy->command, "command_id")).value_or(""), kStopReasonCapacityNoops);
+                            strategy->session_id, auto_stop_reason);
                 break;
             }
             double elapsed = monotonic_() - cycle_start;
-            double wait_seconds = std::max(0.0, static_cast<double>(v.cycle_seconds) - elapsed);
-            std::unique_lock lock(strategy->wait_mutex);
-            bool stopped = strategy->wait_cv.wait_for(lock, std::chrono::duration<double>(wait_seconds),
-                                                      [&] { return strategy->stop_requested.load(); });
-            if (stopped) break;
+            if (wait_for_cycle(*strategy, std::max(0.0, static_cast<double>(v.cycle_seconds) - elapsed))) break;
         }
     } catch (const std::exception& e) {
         {
@@ -649,16 +778,24 @@ void StrategyManager::run_strategy(std::shared_ptr<Strategy> strategy) {
     long long cycles, published;
     {
         std::lock_guard lock(mutex_);
-        auto it = strategies_.find(strategy->key);
+        auto it = strategies_.find(strategy->session_id);
         if (it != strategies_.end() && it->second == strategy) strategies_.erase(it);
-        auto sit = stopping_strategies_.find(strategy->key);
+        auto sit = stopping_strategies_.find(strategy->session_id);
         if (sit != stopping_strategies_.end() && sit->second == strategy) stopping_strategies_.erase(sit);
         reason = strategy->last_reason.empty() ? "Strategy stopped" : strategy->last_reason;
         cycles = strategy->cycles;
         published = strategy->published_commands;
-        strategy->thread.detach();  // the manager no longer needs to join this worker
+        finished_.push_back(strategy);  // joined by the next manager call (never by the worker itself)
     }
     record_ended(*strategy, reason, cycles, published);
+    report("end_session", [&](reporting::SessionReporter& r) {
+        r.end_session(strategy->session_id, reason == "Strategy error" ? "failed" : "stopped", reason);
+    });
+    {
+        std::lock_guard lock(strategy->wait_mutex);
+        strategy->finished = true;
+    }
+    strategy->wait_cv.notify_all();
 }
 
 CycleResult StrategyManager::run_cycle(const json& command) {
@@ -671,6 +808,8 @@ CycleResult StrategyManager::run_cycle(const json& command) {
     CycleResult result;
     std::set<std::string> reserved;
     {
+        // Build and reserve accounts atomically so simultaneous E/F or multi-symbol sessions cannot
+        // both use the same account while a command is still being handed to the publisher.
         std::lock_guard lock(mutex_);
         std::map<std::string, double> effective = last_action_monotonic_by_account_;
         for (const auto& id : inflight_account_ids_) effective[id] = now;
@@ -682,6 +821,7 @@ CycleResult StrategyManager::run_cycle(const json& command) {
         inputs.account_ids = v.account_ids;
         inputs.book_levels = v.book_levels;
         inputs.target_percentage = v.target_percentage;
+        inputs.total_target_position = v.total_target_position;
         inputs.account_metas = &metas;
         inputs.account_snapshots = snapshots ? &*snapshots : nullptr;
         inputs.minimum_cycle_seconds_by_medium = &settings_.minimum_cycle_seconds_by_medium;
@@ -695,6 +835,8 @@ CycleResult StrategyManager::run_cycle(const json& command) {
         inflight_account_ids_.insert(reserved.begin(), reserved.end());
     }
     bool test_mode = json_truthy(json_find(command, "fast_trading_test_mode"));
+    bool has_session = json_python_truthy(json_find(command, "command_id"));
+    std::string session_id = command_session_id(command);
     try {
         for (auto& cmd : result.commands) {
             cmd["fast_trading_cycle_seconds"] = v.cycle_seconds;
@@ -705,6 +847,9 @@ CycleResult StrategyManager::run_cycle(const json& command) {
                 NG_LOG_INFO(kLog, "Fast trading TEST MODE logged command without Kafka publish key={} command={}", key,
                             command_json(cmd));
             } else {
+                if (has_session) {
+                    report("register_command", [&](reporting::SessionReporter& r) { r.register_command(session_id, cmd); });
+                }
                 NG_LOG_INFO(kLog, "Publishing fast trading command key={} command={}", key, command_json(cmd));
                 publish_(cmd, key);
             }
@@ -715,6 +860,8 @@ CycleResult StrategyManager::run_cycle(const json& command) {
             }
         }
     } catch (...) {
+        // A failed publish is not an account action. Release it (and any later commands that were
+        // never attempted) without a cooldown.
         std::lock_guard lock(mutex_);
         for (const auto& id : reserved) inflight_account_ids_.erase(id);
         throw;
@@ -725,11 +872,13 @@ CycleResult StrategyManager::run_cycle(const json& command) {
     }
     NG_LOG_INFO(kLog,
                 "Fast trading cycle mode={} symbol={} resting_side={} book_levels={} target_percentage={} total_qty={} "
-                "target_qty={} allocated_qty={} price={} commands={} capacity_noop={} reason={}",
+                "target_qty={} allocated_qty={} price={} commands={} capacity_noop={} total_position={} "
+                "total_target_position={} reason={}",
                 result.trading_mode, result.symbol, result.resting_side, v.book_levels, v.target_percentage,
                 result.total_resting_qty, result.target_quantity, result.allocated_quantity,
                 result.limit_price ? format_double(*result.limit_price) : "None", result.commands.size(), result.capacity_noop,
-                result.reason);
+                result.total_position ? format_double(*result.total_position) : "None",
+                result.total_target_position ? std::to_string(*result.total_target_position) : "None", result.reason);
     return result;
 }
 
@@ -739,6 +888,7 @@ std::vector<StrategyStatus> StrategyManager::statuses() const {
     auto add = [&](const std::shared_ptr<Strategy>& s, bool stopping) {
         StrategyStatus st;
         st.key = s->key;
+        st.session_id = s->session_id;
         st.command = s->command;
         st.started_at = s->started_at;
         st.cycles = s->cycles;
@@ -751,6 +901,7 @@ std::vector<StrategyStatus> StrategyManager::statuses() const {
     };
     for (auto& [k, s] : strategies_) add(s, false);
     for (auto& [k, s] : stopping_strategies_) add(s, true);
+    std::sort(out.begin(), out.end(), [](const StrategyStatus& a, const StrategyStatus& b) { return a.started_at < b.started_at; });
     return out;
 }
 

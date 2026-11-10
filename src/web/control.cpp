@@ -168,7 +168,6 @@ ControlCenter::ControlCenter(AppConfig config, AccountDirectory accounts, std::v
     : config_(std::move(config)),
       accounts_(std::move(accounts)),
       symbols_(std::move(symbols)),
-      historical_(std::make_unique<HistoricalCloseStore>(config_.market_data.historical_prices_csv)),
       started_at_(wall_now()) {
     account_store_.add_listener([this] { notify_hub(kTopicAccounts); });
     market_store_.add_quote_listener([this](const std::string&) { notify_hub(kTopicQuotes | kTopicAccounts); });
@@ -181,6 +180,22 @@ void ControlCenter::set_command_sink(std::unique_ptr<CommandSink> sink) { sink_ 
 
 void ControlCenter::set_operations_log(std::unique_ptr<OperationsLog> log) { operations_log_ = std::move(log); }
 
+void ControlCenter::create_reporting(const std::string& db_path) {
+    reporting_ = std::make_unique<reporting::ActivityReporting>(db_path);
+    market_activity_ = std::make_unique<reporting::MarketActivity>(db_path);
+    // Our traded volume covers all visible configured accounts; its fills are attributed in New York time.
+    market_order_store_ = std::make_unique<order_ui::OrderStore>(
+        accounts_, reporting::MarketActivity::kMarketZone, nullptr,
+        [this](const orders::OrderEvent& event) { market_activity_->record_order(event); });
+}
+
+std::vector<smart::SmartSellingRuntime*> ControlCenter::smart_managers() const {
+    std::vector<smart::SmartSellingRuntime*> managers;
+    if (smart_) managers.push_back(smart_.get());
+    if (buying_) managers.push_back(buying_.get());
+    return managers;
+}
+
 void ControlCenter::create_fast_trading_manager() {
     fast::RuntimeSettings settings;
     for (auto& [level, cfg] : config_.fast_trading.aggression_levels) settings.aggression_levels[level] = {cfg.book_levels, cfg.cycle_seconds};
@@ -188,15 +203,34 @@ void ControlCenter::create_fast_trading_manager() {
     fast_ = std::make_unique<fast::StrategyManager>(
         market_store_, [this]() -> const AccountDirectory& { return accounts_; },
         [this](const json& command, const std::string& key) { publish_fast_trading_command(command, key); },
-        [this] { return served_snapshots(); }, operations_log_.get(), settings);
+        [this] { return served_snapshots(); }, operations_log_.get(), settings, nullptr, reporting_.get(),
+        [this](const std::string& account) {
+            for (auto* manager : smart_managers()) {
+                if (manager->owns_account(account)) return true;
+            }
+            return false;
+        });
 }
 
 void ControlCenter::create_smart_selling_runtime(std::shared_ptr<smart::SmartSellingEngine> engine) {
     smart_ = std::make_unique<smart::SmartSellingRuntime>(
         config_.smart_selling, [this]() -> const AccountDirectory& { return accounts_; }, [this] { return served_snapshots(); },
         [this](const json& command, const std::string& key) { publish_trading_command(command, key); },
-        [this](const std::string& account, const std::string& symbol) { return fast_ && fast_->has_strategy(account, symbol); },
-        [this] { return fast_ && fast_->has_active_session(); }, std::move(engine));
+        [this](const std::string& account) {
+            return (fast_ && fast_->owns_account(account)) || (buying_ && buying_->owns_account(account));
+        },
+        std::move(engine), nullptr, nullptr, reporting_.get());
+}
+
+void ControlCenter::create_smart_buying_runtime(std::shared_ptr<smart::SmartBuyingEngine> engine) {
+    buying_ = std::make_unique<smart::SmartBuyingRuntime>(
+        config_.smart_buying, market_store_, [this]() -> const AccountDirectory& { return accounts_; },
+        [this] { return served_snapshots(); },
+        [this](const json& command, const std::string& key) { publish_trading_command(command, key); },
+        [this](const std::string& account) {
+            return (fast_ && fast_->owns_account(account)) || (smart_ && smart_->owns_account(account));
+        },
+        std::move(engine), nullptr, nullptr, reporting_.get());
 }
 
 void ControlCenter::set_feed_health_providers(FeedHealthProviders providers) { feed_health_ = std::move(providers); }
@@ -208,6 +242,7 @@ unsigned housekeeping_ticks = 0;
 void ControlCenter::start_background() {
     if (background_started_.exchange(true)) return;
     if (smart_) smart_->start();
+    if (buying_) buying_->start();
     // Periodic status refresh for the browser: algorithm/smart/feed status changes are not store
     // mutations, so push them on a 1 Hz cadence (clients coalesce).
     status_thread_ = std::thread([this] {
@@ -223,8 +258,19 @@ void ControlCenter::shutdown() {
     if (stop_.exchange(true)) return;
     hub_.shutdown();
     if (status_thread_.joinable()) status_thread_.join();
-    if (fast_) fast_->stop_all();
-    if (smart_) smart_->close();
+    // Also used after partial startup. One failing service must not strand the others.
+    auto guarded = [](const char* what, const std::function<void()>& call) {
+        try {
+            call();
+        } catch (const std::exception& e) {
+            NG_LOG_ERROR(kLog, "Failed shutting down {}: {}", what, e.what());
+        }
+    };
+    if (fast_) guarded("fast trading", [this] { fast_->stop_all(); });
+    if (smart_) guarded("Smart selling", [this] { smart_->close(); });
+    if (buying_) guarded("Smart buying", [this] { buying_->close(); });
+    if (reporting_) guarded("activity reporting", [this] { reporting_->close(); });
+    if (market_activity_) guarded("market activity", [this] { market_activity_->close(); });
 }
 
 std::map<std::string, AccountSnapshot> ControlCenter::served_snapshots() const {
@@ -244,7 +290,9 @@ std::optional<double> ControlCenter::market_last(const std::string& symbol) cons
 
 bool ControlCenter::owned_by_algorithm(const std::string& account_id) const {
     if (fast_ && fast_->owns_account(account_id)) return true;
-    if (smart_ && smart_->owns_account(account_id)) return true;
+    for (auto* manager : smart_managers()) {
+        if (manager->owns_account(account_id)) return true;
+    }
     return false;
 }
 
@@ -260,9 +308,10 @@ void ControlCenter::publish_fast_trading_command(const json& command, const std:
     std::string account = json_to_string(json_find(command, "account_id")).value_or("");
     std::string symbol = json_to_string(json_find(command, "symbol")).value_or("");
     if (!fast_ || !fast_->has_running_strategy(account, symbol)) return;
-    if (smart_) {
-        if (smart_->has_active_session()) throw std::invalid_argument("Stop Smart selling before starting another algorithm");
-        smart_->track_external_order(command);
+    for (auto* manager : smart_managers()) {
+        // Sessions never share an account.
+        if (manager->owns_account(account)) throw std::invalid_argument(orders::algo_account_conflict_error({account}));
+        manager->track_external_order(command);
     }
     publish_trading_command(command, key);
 }
@@ -278,20 +327,14 @@ void ControlCenter::publish_control_command(const json& command, const std::stri
                 "An algorithm session owns this account; stop it and await outstanding order confirmations first");
         }
     }
-    if (smart_ && places_order) smart_->track_external_order(command);
-    publish_trading_command(command, key);
-}
-
-void ControlCenter::require_idle_algorithms() const {
-    if ((fast_ && fast_->has_active_session()) || (smart_ && smart_->has_active_session())) {
-        throw std::invalid_argument(
-            "Stop the existing algorithm session and await outstanding order confirmations before starting another");
+    if (places_order) {
+        for (auto* manager : smart_managers()) manager->track_external_order(command);
     }
+    publish_trading_command(command, key);
 }
 
 std::string ControlCenter::start_fast_strategy(const json& command) {
     std::lock_guard lock(algo_lock_);
-    require_idle_algorithms();
     if (!fast_) throw std::runtime_error("The algorithm trading manager is unavailable");
     std::string key = fast_->start_strategy(command);
     notify_hub(kTopicAlgo);
@@ -300,7 +343,6 @@ std::string ControlCenter::start_fast_strategy(const json& command) {
 
 json ControlCenter::start_smart_parent(const json& settings) {
     std::lock_guard lock(algo_lock_);
-    require_idle_algorithms();
     if (!smart_) throw std::runtime_error("Smart selling is unavailable");
     json parent = smart_->start_parent(settings);
     notify_hub(kTopicSmart | kTopicAlgo);
@@ -315,12 +357,33 @@ json ControlCenter::stop_smart_parent(const std::string& parent_id) {
     return result;
 }
 
+json ControlCenter::start_smart_buying_parent(const json& settings) {
+    std::lock_guard lock(algo_lock_);
+    if (!buying_) throw std::runtime_error("Smart buying is unavailable");
+    json parent = buying_->start_parent(settings);
+    notify_hub(kTopicSmart | kTopicAlgo);
+    return parent;
+}
+
+json ControlCenter::stop_smart_buying_parent(const std::string& parent_id) {
+    std::lock_guard lock(algo_lock_);
+    if (!buying_) throw std::runtime_error("Smart buying is unavailable");
+    json result = buying_->stop_parent(parent_id);
+    notify_hub(kTopicSmart | kTopicAlgo);
+    return result;
+}
+
 StopAllResult ControlCenter::stop_all_algorithms(const std::optional<std::string>& reason) {
+    // Scope comes from the server, never from submitted mode/account fields. Stop local strategies
+    // first even if Kafka is unavailable, and keep new starts behind the stop notification.
     std::lock_guard lock(algo_lock_);
     StopAllResult result;
-    if (!fast_ && !smart_) throw std::runtime_error("The algorithm trading manager is unavailable; stopping could not be confirmed.");
+    if (!fast_ && smart_managers().empty()) {
+        throw std::runtime_error("The algorithm trading manager is unavailable; stopping could not be confirmed.");
+    }
     result.fast_stopped = fast_ ? fast_->stop_all() : 0;
     result.smart_stopped = smart_ ? smart_->stop_all() : 0;
+    result.buying_stopped = buying_ ? buying_->stop_all() : 0;
     result.notification = orders::build_algo_stop_command(reason);
     try {
         if (!sink_) throw std::runtime_error("Kafka producer is unavailable");
@@ -335,7 +398,11 @@ StopAllResult ControlCenter::stop_all_algorithms(const std::optional<std::string
 }
 
 bool ControlCenter::any_algorithm_active() const {
-    return (fast_ && fast_->has_active_session()) || (smart_ && smart_->has_active_session());
+    if (fast_ && fast_->has_active_session()) return true;
+    for (auto* manager : smart_managers()) {
+        if (manager->has_active_session()) return true;
+    }
+    return false;
 }
 
 namespace {
@@ -373,9 +440,9 @@ std::shared_ptr<const std::string> ControlCenter::accounts_view_text(const std::
     return cached_text("view:" + lang, key, [&] { return accounts_view(lang); });
 }
 
-std::shared_ptr<const std::string> ControlCenter::market_payload_text() const {
+std::shared_ptr<const std::string> ControlCenter::quotes_payload_text() const {
     std::uint64_t key = mix(market_store_.quotes_version(), time_bucket(1.0));
-    return cached_text("market", key, [&] { return market_payload(std::nullopt); });
+    return cached_text("quotes", key, [&] { return quotes_payload(std::nullopt); });
 }
 
 std::shared_ptr<const std::string> ControlCenter::insights_payload_text(const std::string& symbol, int depth) const {
@@ -385,6 +452,11 @@ std::shared_ptr<const std::string> ControlCenter::insights_payload_text(const st
 
 std::shared_ptr<const std::string> ControlCenter::smart_status_text() const {
     return cached_text("smart", mix(status_generation_.load(std::memory_order_relaxed), time_bucket(0.25)), [&] { return smart_status(); });
+}
+
+std::shared_ptr<const std::string> ControlCenter::smart_buying_status_text() const {
+    return cached_text("buying", mix(status_generation_.load(std::memory_order_relaxed), time_bucket(0.25)),
+                       [&] { return smart_buying_status(); });
 }
 
 std::shared_ptr<const std::string> ControlCenter::algo_status_text() const {
@@ -468,27 +540,30 @@ json ControlCenter::accounts_view(const std::string& lang) const {
 }
 
 json ControlCenter::market_rows(const std::vector<std::string>& symbols) const {
-    auto rows = market_store_.get_for_symbols(symbols);
+    // Complete trade snapshots: last price, previous close and daily volume from the live quote feed.
     json out = json::object();
-    for (auto& [symbol, row] : rows) {
-        QuoteRow enriched = row;
-        enriched.prev_close = historical_->get_prev_close(symbol);
-        if (enriched.prev_close && row.last) {
-            enriched.change = *row.last - *enriched.prev_close;
-            if (*enriched.prev_close != 0) enriched.change_pct = (*enriched.change / *enriched.prev_close) * 100.0;
-        }
-        out[symbol] = enriched.to_json();
-    }
+    for (auto& [symbol, row] : market_store_.get_market_rows(symbols)) out[symbol] = row.to_json();
     return out;
 }
 
-json ControlCenter::market_payload(const std::optional<std::string>& symbol) const {
+json ControlCenter::quotes_payload(const std::optional<std::string>& symbol) const {
     std::vector<std::string> requested;
     std::string clean = symbol ? to_upper(trim(*symbol)) : "";
     if (!clean.empty()) requested = {clean};
-    else requested = symbols_;
+    else requested = config_.market_data_symbols();
     json out;
     out["rows"] = market_rows(requested);
+    return out;
+}
+
+json ControlCenter::market_activity_payload(const std::string& symbol) const {
+    if (!market_activity_ || !market_order_store_) throw std::runtime_error("market activity is unavailable");
+    json feed = market_order_store_->feed_status();
+    // Skipped invalid messages make our figures incomplete even while the feed is live.
+    std::string state = feed.at("invalid_messages").get<long long>() ? std::string("incomplete") : feed.at("state").get<std::string>();
+    json out = market_activity_->snapshot(symbol, accounts_, state);
+    out["ok"] = true;
+    out["symbols"] = config_.market_data_symbols();
     return out;
 }
 
@@ -521,6 +596,20 @@ json ControlCenter::smart_status() const {
     return out;
 }
 
+json ControlCenter::smart_buying_status() const {
+    json out;
+    out["ok"] = true;
+    out["parents"] = json::array();
+    if (buying_) {
+        for (auto& p : buying_->list_parents()) out["parents"].push_back(p);
+        json feeds = json::object();
+        for (auto& [k, v] : buying_->feed_states()) feeds[k] = v;
+        out["feeds"] = feeds;
+    }
+    out["available"] = buying_ != nullptr;
+    return out;
+}
+
 json ControlCenter::algo_status() const {
     json out;
     out["fast"] = json::array();
@@ -528,6 +617,7 @@ json ControlCenter::algo_status() const {
         for (auto& s : fast_->statuses()) {
             json st;
             st["key"] = s.key;
+            st["session_id"] = s.session_id;
             st["command"] = s.command;
             st["started_at"] = s.started_at;
             st["cycles"] = s.cycles;
@@ -540,6 +630,7 @@ json ControlCenter::algo_status() const {
         }
     }
     out["smart"] = smart_status();
+    out["buying"] = smart_buying_status();
     out["active"] = any_algorithm_active();
     return out;
 }
@@ -550,6 +641,9 @@ json ControlCenter::feeds_health() const {
     out["market"] = feed_health_.market ? feed_health_.market() : json(nullptr);
     out["orders"] = feed_health_.orders ? feed_health_.orders() : json(nullptr);
     out["volume"] = feed_health_.volume ? feed_health_.volume() : json(nullptr);
+    out["buying_orders"] = feed_health_.buying_orders ? feed_health_.buying_orders() : json(nullptr);
+    out["buying_volume"] = feed_health_.buying_volume ? feed_health_.buying_volume() : json(nullptr);
+    out["own_orders"] = market_order_store_ ? market_order_store_->feed_status() : json(nullptr);
     auto last_account = account_store_.kafka_last_seen();
     out["account_store_last_update"] = last_account ? json(iso_utc(*last_account)) : json(nullptr);
     auto last_market = market_store_.last_update_wall();
@@ -600,16 +694,21 @@ json ControlCenter::bootstrap(const std::string& lang, const std::string& user) 
     out["user"] = user;
     out["lang"] = lang;
     out["privileged"] = config_.is_privileged(user);
-    out["can_convert_currency"] = config_.is_privileged(user);
+    out["can_access_admin_control"] = config_.can_access_admin_control(user);
+    out["can_access_market_data"] = config_.can_access_market_data(user);
     out["can_manage_trading"] = config_.is_privileged(user);
     out["symbols"] = symbols_;
+    out["market_data_symbols"] = config_.market_data_symbols();
+    out["broker_orders_today"] = orders::broker_orders_today();
     out["accounts"] = json::array();
     for (const AccountMeta* meta : accounts_.by_num_id()) out["accounts"].push_back(account_meta_view(*meta));
     out["market_insights_max_levels"] = config_.market_data.market_insights_max_levels;
     out["smart_selling_available"] = smart_ != nullptr;
+    out["smart_buying_available"] = buying_ != nullptr;
     out["fast_trading"] = json::object();
     out["fast_trading"]["book_level_choices"] = json::array({1, 2, 3, 4, 5});
-    out["fast_trading"]["target_percentage_choices"] = json::array({10, 20, 30, 40, 50, 60, 70, 80, 90, 100});
+    out["fast_trading"]["target_percentage_choices"] = json::array();
+    for (int choice : orders::kFastTargetPercentageChoices) out["fast_trading"]["target_percentage_choices"].push_back(choice);
     out["fast_trading"]["cycle_seconds_choices"] = json::array({5, 10, 15, 30, 60});
     out["fast_trading"]["minimum_cycle_seconds_by_medium"] = config_.fast_trading.minimum_cycle_seconds_by_medium;
     out["limit_share_shortcuts"] = json::array({3000, 5000, 10000, 20000, 30000, 50000});

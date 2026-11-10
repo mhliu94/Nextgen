@@ -1,5 +1,6 @@
-// Market data: price-book derived quotes, level-2 books, last-trade stock quotes and
-// the historical close CSV, plus the thread-safe store that serves them.
+// Market data: price-book derived quotes, level-2 books and last-trade stock quotes (with the
+// previous close and daily volume from the same live snapshot), plus the thread-safe store that
+// serves them.
 #pragma once
 
 #include <cstdint>
@@ -36,6 +37,11 @@ struct StockQuote {
     std::optional<bool> is_delayed;
     std::optional<bool> is_halted;
     std::optional<std::string> error;
+    // Reference close, cumulative daily volume and last trade size from the same live snapshot;
+    // optional fields never invalidate an otherwise valid trade.
+    std::optional<double> prev_close;
+    std::optional<long long> volume;
+    std::optional<long long> last_size;
     bool usable() const;  // last present, finite, positive and no error
 };
 
@@ -76,6 +82,10 @@ public:
     std::vector<std::string> get_book_symbols() const;
     std::map<std::string, StockQuote> get_stock_quotes(const std::vector<std::string>& symbols) const;
     std::map<std::string, StockQuote> get_all_stock_quotes() const;
+    // Quote rows for trading forms and price lookups, built from complete trade snapshots only:
+    // "no live quote yet" without a quote, "quote feed is stale" after `max_age_seconds`.
+    std::map<std::string, QuoteRow> get_market_rows(const std::vector<std::string>& symbols, double max_age_seconds = 30,
+                                                    std::optional<double> now = std::nullopt) const;
 
     // Monotonic change counters for cheap change detection.
     std::uint64_t quotes_version() const;
@@ -100,28 +110,6 @@ private:
     std::mutex listeners_mutex_;
     std::vector<Listener> quote_listeners_;
     std::vector<Listener> book_listeners_;
-};
-
-// Latest close per symbol from historical_prices.csv (symbol,trade_date,close); reloads on mtime change.
-class HistoricalCloseStore {
-public:
-    explicit HistoricalCloseStore(std::string csv_path);
-    std::optional<double> get_prev_close(const std::string& symbol) const;
-    std::map<std::string, double> all() const;
-    const std::string& path() const { return path_; }
-
-private:
-    struct Row {
-        std::string trade_date;
-        double close;
-    };
-    void reload_if_needed() const;
-    std::map<std::string, Row> load_latest_rows() const;
-
-    std::string path_;
-    mutable std::mutex mutex_;
-    mutable std::optional<std::int64_t> mtime_ns_;
-    mutable std::map<std::string, Row> rows_;
 };
 
 }  // namespace ng

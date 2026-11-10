@@ -4,8 +4,11 @@
 
 namespace ng {
 
-Sqlite::Sqlite(const std::string& path) {
-    int flags = SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_FULLMUTEX;
+Sqlite::Sqlite(const std::string& path, Mode mode, int busy_timeout_ms) {
+    int flags = SQLITE_OPEN_FULLMUTEX;
+    if (mode == Mode::ReadOnly) flags |= SQLITE_OPEN_READONLY;
+    else if (mode == Mode::ReadWrite) flags |= SQLITE_OPEN_READWRITE;
+    else flags |= SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE;
     if (path == ":memory:") flags |= SQLITE_OPEN_MEMORY;
     int rc = sqlite3_open_v2(path.c_str(), &db_, flags, nullptr);
     if (rc != SQLITE_OK) {
@@ -14,7 +17,7 @@ Sqlite::Sqlite(const std::string& path) {
         db_ = nullptr;
         throw SqliteError("sqlite open failed for " + path + ": " + message);
     }
-    sqlite3_busy_timeout(db_, 5000);
+    sqlite3_busy_timeout(db_, busy_timeout_ms);
 }
 
 Sqlite::~Sqlite() { close(); }
@@ -43,6 +46,24 @@ void Sqlite::exec(std::string_view sql) {
 void Sqlite::begin_immediate() {
     exec("BEGIN IMMEDIATE");
     in_transaction_ = true;
+}
+
+void Sqlite::begin() {
+    exec("BEGIN");
+    in_transaction_ = true;
+}
+
+void Sqlite::backup_to(Sqlite& target) {
+    if (!db_ || !target.db_) throw SqliteError("database closed");
+    sqlite3_backup* backup = sqlite3_backup_init(target.db_, "main", db_, "main");
+    if (!backup) throw SqliteError("sqlite backup failed: " + target.error_message());
+    int rc;
+    do {
+        rc = sqlite3_backup_step(backup, 256);
+        if (rc == SQLITE_BUSY || rc == SQLITE_LOCKED) sqlite3_sleep(25);
+    } while (rc == SQLITE_OK || rc == SQLITE_BUSY || rc == SQLITE_LOCKED);
+    sqlite3_backup_finish(backup);
+    if (rc != SQLITE_DONE) throw SqliteError("sqlite backup failed: " + target.error_message());
 }
 
 void Sqlite::commit() {
@@ -135,5 +156,24 @@ long long Statement::column_int(int column) const { return sqlite3_column_int64(
 double Statement::column_double(int column) const { return sqlite3_column_double(stmt_, column); }
 
 int Statement::column_count() const { return sqlite3_column_count(stmt_); }
+
+std::string Statement::column_name(int column) const {
+    const char* name = sqlite3_column_name(stmt_, column);
+    return name ? name : "";
+}
+
+json Statement::row_json() const {
+    json row = json::object();
+    int count = column_count();
+    for (int i = 0; i < count; ++i) {
+        switch (sqlite3_column_type(stmt_, i)) {
+            case SQLITE_INTEGER: row[column_name(i)] = column_int(i); break;
+            case SQLITE_FLOAT: row[column_name(i)] = column_double(i); break;
+            case SQLITE_NULL: row[column_name(i)] = nullptr; break;
+            default: row[column_name(i)] = column_text(i); break;
+        }
+    }
+    return row;
+}
 
 }  // namespace ng

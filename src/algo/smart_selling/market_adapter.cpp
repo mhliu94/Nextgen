@@ -68,6 +68,22 @@ std::pair<std::optional<Decimal>, Decimal> best_level(const json* side, bool bid
     return {best, total};
 }
 
+std::vector<Decimal> displayed_prices(const json* side) {
+    std::vector<Decimal> prices;
+    if (!side || !side->is_object()) return prices;
+    const json* levels = json_find(*side, "levels");
+    if (!levels || !levels->is_array()) return prices;
+    for (const auto& level : *levels) {
+        if (!level.is_object()) continue;
+        auto price = market_decimal(json_first_present(level, "prc", "price", "Price"));
+        auto quantity = market_decimal(json_first_present(level, "qty", "total_qty", "quantity", "TotalSize"));
+        if (price && price->is_positive() && quantity && quantity->is_positive()) prices.push_back(*price);
+    }
+    std::sort(prices.begin(), prices.end());
+    prices.erase(std::unique(prices.begin(), prices.end()), prices.end());
+    return prices;
+}
+
 SmartSellingMarketAdapter::SmartSellingMarketAdapter(SmartSellingEngine& engine, Clock clock, Clock wall_clock,
                                                      double max_source_age, double rate_window_seconds, int max_observations,
                                                      double resume_cooldown_seconds)
@@ -318,7 +334,6 @@ bool SmartSellingMarketAdapter::apply_price_book(const json& payload, const std:
     bool recovering = state.reset_quote || state.quote_gap;
     auto [bid, bid_size] = best_level(json_find(payload, "bid_side"), true);
     auto [ask, ask_size] = best_level(json_find(payload, "offer_side"), false);
-    (void)ask_size;
     const json* healthy_flag = json_find(payload, "healthy");
     bool payload_healthy = !(healthy_flag && healthy_flag->is_boolean() && !healthy_flag->get<bool>());
     bool quote_healthy = fresh(book_time) && !gap && payload_healthy && bid && ask && bid_size.is_positive() && *ask >= *bid;
@@ -331,6 +346,14 @@ bool SmartSellingMarketAdapter::apply_price_book(const json& payload, const std:
     update.bid = bid ? json(bid->str()) : json(nullptr);
     update.ask = ask ? json(ask->str()) : json(nullptr);
     update.bid_size = json(bid_size.str());
+    update.ask_size = json(ask_size.str());
+    auto level_list = [](const std::vector<Decimal>& prices) {
+        std::vector<json> out;
+        for (const Decimal& price : prices) out.push_back(json(price.str()));
+        return out;
+    };
+    update.bid_prices = level_list(displayed_prices(json_find(payload, "bid_side")));
+    update.ask_prices = level_list(displayed_prices(json_find(payload, "offer_side")));
     update.source_time = book_time ? json(*book_time) : json(nullptr);
     update.sequence = strict_sequence;
     update.healthy = state.quote_healthy && volume_is_healthy(state);

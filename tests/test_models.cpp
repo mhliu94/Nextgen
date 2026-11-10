@@ -147,15 +147,3 @@ TEST_CASE("stock quote parsing and ordering") {
     store.upsert_stock_quote(*quote);  // older observation cannot restore it
     CHECK_FALSE(store.get_stock_quotes({"AAPL"}).at("AAPL").usable());
 }
-
-TEST_CASE("historical close store picks the latest date and reloads on change") {
-    ngtest::TempDir dir("hist");
-    std::string path = dir.file("hist.csv");
-    ngtest::write_file(path, "symbol,trade_date,close\naapl,2026-10-01,100\nAAPL,2026-10-02,101.5\nmsft,2026-10-02,x\n");
-    ng::HistoricalCloseStore store(path);
-    CHECK(store.get_prev_close("AAPL") == 101.5);
-    CHECK_FALSE(store.get_prev_close("MSFT"));
-    CHECK_FALSE(store.get_prev_close("NONE"));
-    ng::HistoricalCloseStore missing(dir.file("none.csv"));
-    CHECK_FALSE(missing.get_prev_close("AAPL"));
-}

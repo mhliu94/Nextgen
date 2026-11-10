@@ -63,8 +63,9 @@ void SmartSellingFeedback::validate_owned_snapshot(const json& payload, const js
         canonical_order_symbol(context.at("symbol").get<std::string>())) {
         throw std::invalid_argument("Order snapshot symbol does not match the owned child");
     }
-    if (payload.at("side").get<std::string>() != "SELL" || payload.at("order_type").get<std::string>() != "LIMIT") {
-        throw std::invalid_argument("Smart selling feedback requires the owned ordinary sell limit");
+    std::string owned_side = context.contains("side") ? context.at("side").get<std::string>() : std::string("SELL");
+    if (payload.at("side").get<std::string>() != owned_side || payload.at("order_type").get<std::string>() != "LIMIT") {
+        throw std::invalid_argument("Smart order feedback requires the owned side and ordinary limit");
     }
     const json& quantity = payload.at("quantity");
     Decimal expected_quantity = parse_decimal(context.at("quantity"));

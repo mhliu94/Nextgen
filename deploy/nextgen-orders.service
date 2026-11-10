@@ -1,0 +1,31 @@
+# systemd unit for the KTrader order monitor (nextgen-orders, the C++ order_ui).
+#
+#   sudo cp deploy/nextgen-orders.service /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now nextgen-orders
+#   journalctl -u nextgen-orders -f
+#
+# Adjust User/WorkingDirectory to the account and checkout that owns the build, and put
+# environment overrides (ORDER_UI_*, ACCOUNT_DASHBOARD_CONFIG) in /etc/nextgen-orders.env.
+# The monitor only reads Kafka and the shared report database, so it can be restarted at any
+# time without affecting trading.
+[Unit]
+Description=KTrader order monitor
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/home/ubuntu/nextgen-gui
+EnvironmentFile=-/etc/nextgen-orders.env
+ExecStart=/home/ubuntu/nextgen-gui/scripts/start_nextgen_orders.sh --foreground
+Restart=always
+RestartSec=3
+KillSignal=SIGTERM
+TimeoutStopSec=20
+LimitNOFILE=65536
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

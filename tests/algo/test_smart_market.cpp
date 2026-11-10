@@ -80,11 +80,11 @@ TEST_CASE_FIXTURE(MarketFixture, "first snapshot baseline and exact deltas with 
     now = 1;
     json batch = volume(2, "12445.6");
     CHECK(market->apply_volume(batch));
-    CHECK(earned() == Dec("10.05"));
+    CHECK(earned() == Dec("20.100"));
     CHECK_FALSE(market->apply_volume(batch));
     now = 2;
     CHECK_FALSE(market->apply_volume(volume(1, "90000")));
-    CHECK(earned() == Dec("10.05"));
+    CHECK(earned() == Dec("20.100"));
 }
 
 TEST_CASE_FIXTURE(MarketFixture, "straddling batch is excluded only for new parent") {
@@ -94,12 +94,12 @@ TEST_CASE_FIXTURE(MarketFixture, "straddling batch is excluded only for new pare
                                                        {"tick_size", ".01"}, {"quantity_step", 1}, {"min_quantity", 1}})["parent_id"].get<std::string>();
     now = 1;
     market->apply_volume(volume(2, 1100));
-    CHECK(earned() == Dec(10));
+    CHECK(earned() == Dec(20));
     CHECK(earned(new_parent) == Dec(0));
     now = 2;
     market->apply_volume(volume(3, 1200));
-    CHECK(earned() == Dec(20));
-    CHECK(earned(new_parent) == Dec(10));
+    CHECK(earned() == Dec(40));
+    CHECK(earned(new_parent) == Dec(20));
 }
 
 TEST_CASE_FIXTURE(MarketFixture, "sequence gap discards uncertain volume and resumes after baseline") {
@@ -109,7 +109,7 @@ TEST_CASE_FIXTURE(MarketFixture, "sequence gap discards uncertain volume and res
     CHECK(earned() == Dec(0));
     now = 2;
     market->apply_volume(volume(4, 100100));
-    CHECK(earned() == Dec(10));
+    CHECK(earned() == Dec(20));
 }
 
 TEST_CASE_FIXTURE(MarketFixture, "stale future and long intervals never create catch-up credit") {
@@ -125,10 +125,10 @@ TEST_CASE_FIXTURE(MarketFixture, "stale future and long intervals never create c
     CHECK(earned() == Dec(0));
     now = 41;
     market->apply_volume(volume(6, 100100));
-    CHECK(earned() == Dec(10));
+    CHECK(earned() == Dec(20));
     now = 60;
     market->apply_volume(volume(7, 999999));
-    CHECK(earned() == Dec(10));
+    CHECK(earned() == Dec(20));
 }
 
 TEST_CASE_FIXTURE(MarketFixture, "volume disconnect blocks saved credit despite fresh quote") {
@@ -136,7 +136,7 @@ TEST_CASE_FIXTURE(MarketFixture, "volume disconnect blocks saved credit despite 
     market->apply_volume(volume(1, 1000));
     now = 1;
     market->apply_volume(volume(2, 2000));
-    CHECK(earned() == Dec(100));
+    CHECK(earned() == Dec(200));
     market->set_volume_connected(false);
     now = 2;
     market->apply_price_book(book());
@@ -144,10 +144,10 @@ TEST_CASE_FIXTURE(MarketFixture, "volume disconnect blocks saved credit despite 
     CHECK(engine->get_parent(parent)["state"] == "HOLD");
     market->set_volume_connected(true);
     market->apply_volume(volume(10, 20000));
-    CHECK(earned() == Dec(100));
+    CHECK(earned() == Dec(200));
     now = 3;
     market->apply_volume(volume(11, 20100));
-    CHECK(earned() == Dec(110));
+    CHECK(earned() == Dec(220));
 }
 
 TEST_CASE_FIXTURE(MarketFixture, "unhealthy observation and session or feed changes reset baseline") {
@@ -158,12 +158,12 @@ TEST_CASE_FIXTURE(MarketFixture, "unhealthy observation and session or feed chan
     market->apply_volume(volume(3, 100000));
     now = 3;
     market->apply_volume(volume(4, 100100));
-    CHECK(earned() == Dec(10));
+    CHECK(earned() == Dec(20));
     now = 4;
     market->apply_volume(volume(5, 10, {{"session", "2027-01-16"}}));
     now = 5;
     market->apply_volume(volume(1, 20, {{"session", "2027-01-16"}, {"feed_id", "feed-b"}}));
-    CHECK(earned() == Dec(10));
+    CHECK(earned() == Dec(20));
     CHECK(reason().find("correction") == std::string::npos);
 }
 
@@ -194,13 +194,13 @@ TEST_CASE_FIXTURE(MarketFixture, "cumulative decrease across sequence gap still 
 
 TEST_CASE_FIXTURE(MarketFixture, "genuine trade ids and corrections are used without cumulative double credit") {
     market->apply_volume(volume(1, 1000000, {{"trades", json::array({{{"event_id", "trade-1"}, {"quantity", "100.5"}, {"source_time", iso()}}})}}));
-    CHECK(earned() == Dec("10.05"));
+    CHECK(earned() == Dec("20.100"));
     now = 1;
     market->apply_volume(volume(2, 2000000, {{"trades", json::array({{{"event_id", "trade-1"}, {"quantity", "100.5"}, {"source_time", iso()}}})}}));
-    CHECK(earned() == Dec("10.05"));
+    CHECK(earned() == Dec("20.100"));
     now = 2;
     market->apply_volume(volume(3, 2000000, {{"trades", json::array({{{"event_id", "correct-1"}, {"quantity", "-20.5"}, {"correction_of", "trade-1"}, {"source_time", iso(30)}}})}}));
-    CHECK(earned() == Dec("8.00"));
+    CHECK(earned() == Dec("16.000"));
 }
 
 TEST_CASE_FIXTURE(MarketFixture, "raw book sequence gaps do not invent provider gaps") {
@@ -253,7 +253,7 @@ TEST_CASE_FIXTURE(MarketFixture, "kafka offsets are deduplicated per topic parti
     now = 1;
     CHECK_FALSE(market->apply_volume(volume(2, 2000), std::string("trading-volume"), 0, 4));
     CHECK(market->apply_volume(volume(2, 1100), std::string("trading-volume"), 0, 5));
-    CHECK(earned() == Dec(10));
+    CHECK(earned() == Dec(20));
 }
 
 TEST_CASE_FIXTURE(MarketFixture, "forecast rate is bounded fresh and counts zero volume intervals") {
@@ -282,17 +282,17 @@ TEST_CASE_FIXTURE(MarketFixture, "new adapter after restart discards first cumul
     auto restarted = fresh_adapter();
     now = 2;
     restarted->apply_volume(volume(50, 99999));
-    CHECK(earned() == Dec(10));
+    CHECK(earned() == Dec(20));
     now = 3;
     restarted->apply_volume(volume(51, 100099));
-    CHECK(earned() == Dec(20));
+    CHECK(earned() == Dec(40));
 }
 
 TEST_CASE_FIXTURE(MarketFixture, "reconnect or restart cannot hide same session volume correction") {
     market->apply_volume(volume(1, 1000));
     now = 1;
     market->apply_volume(volume(2, 2000));
-    CHECK(earned() == Dec(100));
+    CHECK(earned() == Dec(200));
     market->set_volume_connected(false);
     now = 2;
     market->set_volume_connected(true);
@@ -319,7 +319,7 @@ TEST_CASE_FIXTURE(MarketFixture, "unknown or delayed flags do not earn credit") 
     CHECK(earned() == Dec(0));
     now = 4;
     market->apply_volume(volume(5, 4100));
-    CHECK(earned() == Dec(10));
+    CHECK(earned() == Dec(20));
 }
 
 TEST_CASE_FIXTURE(MarketFixture, "halt requests cancel without releasing partial fill reservation") {
@@ -347,7 +347,7 @@ TEST_CASE_FIXTURE(MarketFixture, "halt requests cancel without releasing partial
     r.cumulative_filled = 30;
     engine->on_order_report(S(submit["client_order_id"]), r);
     CHECK(Dec(engine->get_parent(parent)["reserved"]) == Dec(70));
-    CHECK(earned() == Dec(100));
+    CHECK(earned() == Dec(200));
 }
 
 TEST_CASE_FIXTURE(MarketFixture, "reopening discards auction and waits for cooldown and fresh book") {
@@ -373,7 +373,7 @@ TEST_CASE_FIXTURE(MarketFixture, "reopening discards auction and waits for coold
     CHECK(earned() == Dec(0));
     now = 14;
     market->apply_volume(volume(15, 120100));
-    CHECK(earned() == Dec(10));
+    CHECK(earned() == Dec(20));
     CHECK(engine->get_parent(parent)["deadline"] == original_deadline);
 }
 
@@ -428,5 +428,5 @@ TEST_CASE_FIXTURE(MarketFixture, "malformed trade correction holds even while ha
     market->apply_volume(volume(2, nullptr, {{"is_halted", true}, {"healthy", false},
                                              {"trades", json::array({{{"event_id", "broken-correction"}, {"quantity", "NaN"}, {"correction_of", "trade-1"}}})}}));
     CHECK(reason().find("unknown tape correction") != std::string::npos);
-    CHECK(earned() == Dec(10));
+    CHECK(earned() == Dec(20));
 }

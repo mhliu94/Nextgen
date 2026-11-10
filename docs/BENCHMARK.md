@@ -109,6 +109,26 @@ also stayed error-free (p99 1–12 ms) at 4 % of a core — the difference at th
 update rate of the live pages (1.6 vs 5.9 events per client per second) and headroom, not
 correctness.
 
+## After the upstream catch-up (November 2026)
+
+The measurements above were taken before the port caught up with KTrader `fec87a3`; some of
+the rules they mention changed since (several algorithm sessions may now run on disjoint
+accounts, and currency conversion was replaced by Admin Control). Two checks were repeated
+with Release builds on the same box:
+
+* **Kafka burst.** Four feeders publishing ~9,800 messages/s for 15 s (books at 400 Hz,
+  account snapshots at 40 Hz and 1,000 stock quotes/s in total): the October build used 37 %
+  of one core, the current build 46 %. The difference is the new per-quote work upstream
+  added — every quote is also stored in the report database for the Market Data windows (one
+  SQLite WAL transaction each, roughly 90 µs) — plus the Smart buying feeds and the
+  market-data order consumer. At the production quote rate (a few per second) the extra cost
+  is below 0.1 % of a core.
+* **Order monitor.** `GET /api/orders` with 373 orders, 3 algorithm sessions, a tag report and
+  the unreconciled view (a 200 KB document assembled from the order store, the report
+  database and four read-only controller databases): 6.5 ms for a single request, 351
+  requests/s at 8 connections (p50 23 ms, p99 41 ms), 44 MB resident. With the default 2 s
+  polling each open browser costs about 0.5 % of a core.
+
 ## Rerunning
 
 ```bash

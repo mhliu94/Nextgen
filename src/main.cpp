@@ -6,10 +6,17 @@
 #include <filesystem>
 #include <iostream>
 #include <string>
+#include <vector>
+
+#include <fstream>
+#include <map>
+#include <sstream>
 
 #include "app.h"
 #include "core/config.h"
 #include "core/logging.h"
+#include "ops/reconcile.h"
+#include "order_ui/config.h"
 
 namespace {
 
@@ -35,7 +42,81 @@ void usage() {
         "  --persist-orders         Archive one trading day's orders from the retained order-status topic and exit\n"
         "  --date YYYY-MM-DD        Day to archive with --persist-orders (default: today in persistence.order_archive.timezone)\n"
         "  --version                Print version and exit\n"
-        "  -h, --help               Show this help\n");
+        "  -h, --help               Show this help\n"
+        "\n"
+        "Operator utilities (preview by default; nothing is published, cancelled or restarted):\n"
+        "  nextgen-gui reconcile-prior-day --config PATH --reason TEXT [--apply --backup-dir DIR]\n"
+        "      Mark Smart selling/buying external orders and commands dated before today's trading day\n"
+        "      as reconciled. --apply backs the stores up into DIR (which must not exist) first.\n"
+        "  nextgen-gui reconcile-stopped-child --state-db PATH --feedback-db PATH --client-order-id ID\n"
+        "                                      --snapshot-file FILE --source REF [--apply]\n"
+        "      Resolve the outstanding child of a stopped Smart session against a reviewed final\n"
+        "      order-status snapshot (JSON file) that is already the latest durable broker feedback.\n");
+}
+
+// Parses "--name value" pairs and bare flags for the operator utilities.
+struct UtilityArgs {
+    std::map<std::string, std::string> values;
+    bool apply = false;
+};
+
+UtilityArgs parse_utility_args(int argc, char** argv, const std::vector<std::string>& names) {
+    UtilityArgs args;
+    for (int i = 2; i < argc; ++i) {
+        std::string arg = argv[i];
+        if (arg == "--apply") {
+            args.apply = true;
+            continue;
+        }
+        bool known = false;
+        for (const auto& name : names) known = known || arg == "--" + name;
+        if (!known) {
+            std::fprintf(stderr, "unknown option: %s\n", arg.c_str());
+            std::exit(2);
+        }
+        if (i + 1 >= argc) {
+            std::fprintf(stderr, "%s requires a value\n", arg.c_str());
+            std::exit(2);
+        }
+        args.values[arg.substr(2)] = argv[++i];
+    }
+    return args;
+}
+
+std::string required(const UtilityArgs& args, const char* name) {
+    auto it = args.values.find(name);
+    if (it == args.values.end() || it->second.empty()) {
+        std::fprintf(stderr, "--%s is required\n", name);
+        std::exit(2);
+    }
+    return it->second;
+}
+
+int reconcile_prior_day_command(int argc, char** argv) {
+    UtilityArgs args = parse_utility_args(argc, argv, {"config", "reason", "backup-dir"});
+    // The same configuration as the running servers: journal locations and the trading-day zone.
+    ng::order_ui::OrderUiConfig config = ng::order_ui::load_config(required(args, "config"));
+    std::vector<ng::ops::ReconcileSource> sources;
+    for (const auto& source : config.reconciliation_sources) sources.push_back({source.mode, source.state_db});
+    std::optional<std::string> backup_dir;
+    if (auto it = args.values.find("backup-dir"); it != args.values.end()) backup_dir = it->second;
+    ng::json result = ng::ops::reconcile_prior_day(sources, config.timezone, required(args, "reason"), backup_dir, args.apply);
+    std::printf("%s\n", result.dump(2).c_str());
+    return 0;
+}
+
+int reconcile_stopped_child_command(int argc, char** argv) {
+    UtilityArgs args = parse_utility_args(argc, argv, {"state-db", "feedback-db", "client-order-id", "snapshot-file", "source"});
+    std::ifstream in(required(args, "snapshot-file"), std::ios::binary);
+    if (!in) throw std::runtime_error("cannot read the snapshot file");
+    std::stringstream buffer;
+    buffer << in.rdbuf();
+    ng::json snapshot = ng::json::parse(buffer.str());
+    ng::json result = ng::ops::reconcile_stopped_child(required(args, "state-db"), required(args, "feedback-db"),
+                                                      required(args, "client-order-id"), snapshot, required(args, "source"),
+                                                      args.apply);
+    std::printf("%s\n", result.dump(2).c_str());
+    return 0;
 }
 
 bool parse_int(const char* text, int& out) {
@@ -57,6 +138,15 @@ int main(int argc, char** argv) {
     // each grow their own arena and inflate resident memory for the lifetime of the process.
     mallopt(M_ARENA_MAX, 4);
     ng::log::configure_from_env();
+    if (argc > 1 && (std::strcmp(argv[1], "reconcile-prior-day") == 0 || std::strcmp(argv[1], "reconcile-stopped-child") == 0)) {
+        try {
+            return std::strcmp(argv[1], "reconcile-prior-day") == 0 ? reconcile_prior_day_command(argc, argv)
+                                                                    : reconcile_stopped_child_command(argc, argv);
+        } catch (const std::exception& e) {
+            std::fprintf(stderr, "error: %s\n", e.what());
+            return 1;
+        }
+    }
     ng::AppOptions options;
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];

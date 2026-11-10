@@ -21,6 +21,11 @@ inline bool is_feedback_terminal(const std::string& status) {
 // Upper-cased symbol without US./HK./CN./SH./SZ. prefix and without a '/' suffix.
 std::string canonical_order_symbol(const std::string& value);
 
+// Operator reconciliation is separate from broker-reported terminal status. The trigger also
+// protects already-running consumers: an explicit watermark takes effect without a restart, so a
+// replayed snapshot at or below a reconciled sequence cannot reopen the order.
+extern const char* const kReconciliationSchema;
+
 struct FeedbackRow {
     std::string account_id, order_id, symbol, side, status;
     long long sequence = 0;

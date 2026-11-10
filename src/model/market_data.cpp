@@ -174,6 +174,22 @@ std::optional<StockQuote> stock_quote_from_payload(const json& payload) {
     quote.last = last;
     quote.trade_time = trade_time;
     quote.error.reset();
+    if (const json* previous = json_find(payload, "prev_close"); previous && !previous->is_boolean()) {
+        std::optional<double> close;
+        if (previous->is_number()) close = previous->get<double>();
+        else if (previous->is_string()) close = python_float(previous->get<std::string>());
+        if (close && std::isfinite(*close) && *close > 0) quote.prev_close = close;
+    }
+    auto whole_number = [&](const char* key) -> std::optional<long long> {
+        const json* value = json_find(payload, key);
+        if (!value || !(value->is_number_integer() || value->is_number_unsigned())) return std::nullopt;
+        if (value->is_number_unsigned() && value->get<unsigned long long>() > 9223372036854775807ULL) return std::nullopt;
+        long long number = value->get<long long>();
+        if (number < 0) return std::nullopt;
+        return number;
+    };
+    quote.volume = whole_number("volume");
+    quote.last_size = whole_number("last_size");
     return quote;
 }
 
@@ -314,6 +330,38 @@ std::map<std::string, StockQuote> MarketDataStore::get_all_stock_quotes() const 
     return stock_quotes_;
 }
 
+std::map<std::string, QuoteRow> MarketDataStore::get_market_rows(const std::vector<std::string>& symbols, double max_age_seconds,
+                                                                 std::optional<double> now_in) const {
+    double now = now_in ? *now_in : wall_now();
+    auto quotes = get_stock_quotes(symbols);
+    std::map<std::string, QuoteRow> rows;
+    for (const auto& symbol : symbols) {
+        QuoteRow row;
+        row.symbol = symbol;
+        auto it = quotes.find(symbol);
+        if (it == quotes.end()) {
+            row.error = "no live quote yet";
+        } else {
+            const StockQuote& quote = it->second;
+            row.error = quote.error;
+            if (now - quote.observed_at > max_age_seconds) row.error = "quote feed is stale";
+            bool usable = !row.error || row.error->empty();
+            if (usable) {
+                row.last = quote.last;
+                row.prev_close = quote.prev_close;
+                row.volume = quote.volume;
+                if (row.last && row.prev_close) {
+                    row.change = *row.last - *row.prev_close;
+                    row.change_pct = *row.change / *row.prev_close * 100;
+                }
+            }
+            row.asof_epoch = static_cast<long long>(quote.observed_at);
+        }
+        rows[symbol] = row;
+    }
+    return rows;
+}
+
 std::uint64_t MarketDataStore::quotes_version() const {
     std::shared_lock lock(mutex_);
     return quotes_version_;
@@ -343,84 +391,6 @@ void MarketDataStore::add_quote_listener(Listener listener) {
 void MarketDataStore::add_book_listener(Listener listener) {
     std::lock_guard lock(listeners_mutex_);
     book_listeners_.push_back(std::move(listener));
-}
-
-// ---------------------------------------------------------------------------
-// HistoricalCloseStore
-// ---------------------------------------------------------------------------
-
-HistoricalCloseStore::HistoricalCloseStore(std::string csv_path) : path_(std::move(csv_path)) {}
-
-std::optional<double> HistoricalCloseStore::get_prev_close(const std::string& symbol) const {
-    reload_if_needed();
-    std::string norm = to_upper(trim(symbol));
-    std::lock_guard lock(mutex_);
-    auto it = rows_.find(norm);
-    if (it == rows_.end()) return std::nullopt;
-    return it->second.close;
-}
-
-std::map<std::string, double> HistoricalCloseStore::all() const {
-    reload_if_needed();
-    std::lock_guard lock(mutex_);
-    std::map<std::string, double> out;
-    for (auto& [k, v] : rows_) out[k] = v.close;
-    return out;
-}
-
-void HistoricalCloseStore::reload_if_needed() const {
-    struct stat st{};
-    if (::stat(path_.c_str(), &st) != 0) {
-        std::lock_guard lock(mutex_);
-        mtime_ns_.reset();
-        rows_.clear();
-        return;
-    }
-    std::int64_t mtime_ns = static_cast<std::int64_t>(st.st_mtim.tv_sec) * 1000000000LL + st.st_mtim.tv_nsec;
-    {
-        std::lock_guard lock(mutex_);
-        if (mtime_ns_ && *mtime_ns_ == mtime_ns) return;
-    }
-    auto loaded = load_latest_rows();
-    std::lock_guard lock(mutex_);
-    rows_ = std::move(loaded);
-    mtime_ns_ = mtime_ns;
-}
-
-std::map<std::string, HistoricalCloseStore::Row> HistoricalCloseStore::load_latest_rows() const {
-    std::map<std::string, Row> out;
-    std::ifstream in(path_);
-    if (!in) return out;
-    std::string line;
-    if (!std::getline(in, line)) return out;
-    if (!line.empty() && line.back() == '\r') line.pop_back();
-    if (!line.empty() && static_cast<unsigned char>(line[0]) == 0xEF && line.size() >= 3) line.erase(0, 3);  // BOM
-    auto headers = split(line, ',');
-    int symbol_col = -1, date_col = -1, close_col = -1;
-    for (std::size_t i = 0; i < headers.size(); ++i) {
-        std::string h = to_lower(trim(headers[i]));
-        if (h == "symbol") symbol_col = static_cast<int>(i);
-        else if (h == "trade_date") date_col = static_cast<int>(i);
-        else if (h == "close") close_col = static_cast<int>(i);
-    }
-    if (symbol_col < 0 || date_col < 0 || close_col < 0) return out;
-    while (std::getline(in, line)) {
-        if (!line.empty() && line.back() == '\r') line.pop_back();
-        if (line.empty()) continue;
-        auto cols = split(line, ',');
-        int needed = std::max({symbol_col, date_col, close_col});
-        if (static_cast<int>(cols.size()) <= needed) continue;
-        std::string symbol = to_upper(trim(cols[static_cast<std::size_t>(symbol_col)]));
-        std::string trade_date = trim(cols[static_cast<std::size_t>(date_col)]);
-        if (symbol.empty() || trade_date.empty()) continue;
-        std::string close_raw = trim(cols[static_cast<std::size_t>(close_col)]);
-        char* end = nullptr;
-        double close = std::strtod(close_raw.c_str(), &end);
-        if (close_raw.empty() || end == close_raw.c_str() || *end != '\0') continue;
-        auto it = out.find(symbol);
-        if (it == out.end() || trade_date > it->second.trade_date) out[symbol] = Row{trade_date, close};
-    }
-    return out;
 }
 
 }  // namespace ng

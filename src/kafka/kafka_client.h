@@ -23,10 +23,15 @@ public:
     using std::runtime_error::runtime_error;
 };
 
+// Logical offsets understood by librdkafka.
+inline constexpr long long kOffsetBeginning = -2;  // RD_KAFKA_OFFSET_BEGINNING
+inline constexpr long long kOffsetEnd = -1;        // RD_KAFKA_OFFSET_END
+inline constexpr long long kOffsetInvalid = -1001; // RD_KAFKA_OFFSET_INVALID
+
 struct TopicPartition {
     std::string topic;
     int partition = 0;
-    long long offset = -1001;  // RD_KAFKA_OFFSET_INVALID
+    long long offset = kOffsetInvalid;
 };
 
 struct Message {
@@ -82,6 +87,13 @@ public:
     // Returns nullopt on timeout; EOF and errors are reported as messages with flags set.
     std::optional<Message> poll(int timeout_ms);
     std::vector<TopicPartition> assignment() const;
+    // Low and high watermark of a partition, asked from the broker ("high" is the offset after the
+    // latest record). nullopt when the broker did not answer in time. Usable from on_assign.
+    std::optional<std::pair<long long, long long>> query_watermark_offsets(const std::string& topic, int partition,
+                                                                          int timeout_ms);
+    // Earliest offset whose timestamp is >= `timestamp_ms` (kOffsetEnd when the partition has no such
+    // record). nullopt when the lookup failed. Usable from on_assign.
+    std::optional<long long> offset_for_time(const std::string& topic, int partition, long long timestamp_ms, int timeout_ms);
     void close();
     std::string name() const;
 

@@ -109,7 +109,7 @@ TEST_CASE_FIXTURE(FeedbackFixture, "partial fill during cancel only final cumula
     apply(snapshot({{"sequence", 3}, {"status", "CANCELED"}, {"filled_quantity", 60}}));
     CHECK(Dec(status()["filled"]) == Dec("60"));
     CHECK(Dec(status()["reserved"]) == Dec("0"));
-    CHECK(Dec(status()["free_credit"]) == Dec(40));
+    CHECK(Dec(status()["free_credit"]) == Dec(140));
 }
 
 TEST_CASE_FIXTURE(FeedbackFixture, "duplicate and reordered snapshots do not double count") {
@@ -121,7 +121,7 @@ TEST_CASE_FIXTURE(FeedbackFixture, "duplicate and reordered snapshots do not dou
     json terminal = snapshot({{"sequence", 3}, {"status", "CANCELED"}, {"filled_quantity", 40}});
     apply(terminal);
     apply(terminal);
-    CHECK(Dec(status()["free_credit"]) == Dec(60));
+    CHECK(Dec(status()["free_credit"]) == Dec(160));
     CHECK(Dec(status()["reserved"]) == Dec("0"));
 }
 

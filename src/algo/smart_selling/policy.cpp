@@ -1,5 +1,6 @@
 #include "algo/smart_selling/policy.h"
 
+#include <algorithm>
 #include <cmath>
 #include <stdexcept>
 
@@ -9,16 +10,39 @@
 namespace ng::smart {
 
 const std::map<std::string, Decimal>& participation_percentages() {
-    static const std::map<std::string, Decimal> table = {
-        {"patient", Decimal::parse("3")}, {"normal", Decimal::parse("6")}, {"urgent", Decimal::parse("10")}};
+    static const std::map<std::string, Decimal> table = {{"patient", Decimal::parse("6")},
+                                                         {"normal", Decimal::parse("12")},
+                                                         {"urgent", Decimal::parse("20")},
+                                                         {"ultra", Decimal::parse("30")}};
     return table;
+}
+
+const std::vector<std::string>& participation_modes() {
+    static const std::vector<std::string> modes = {"patient", "normal", "urgent", "ultra"};
+    return modes;
+}
+
+const std::map<std::string, Decimal>& buying_participation_percentages() {
+    static const std::map<std::string, Decimal> table = {
+        {"patient", Decimal::parse("5")}, {"normal", Decimal::parse("8")}, {"urgent", Decimal::parse("15")}};
+    return table;
+}
+
+const std::vector<std::string>& buying_participation_modes() {
+    static const std::vector<std::string> modes = {"patient", "normal", "urgent"};
+    return modes;
+}
+
+const Decimal& min_order_quantity() {
+    static const Decimal minimum(100);
+    return minimum;
 }
 
 namespace {
 
 std::string python_str(const json& value) {
     if (value.is_string()) return value.get<std::string>();
-    if (value.is_number_float()) return format_double(value.get<double>());
+    if (value.is_number_float()) return python_float_repr(value.get<double>());
     if (value.is_number_integer()) return std::to_string(value.get<long long>());
     if (value.is_number_unsigned()) return std::to_string(value.get<unsigned long long>());
     if (value.is_null()) return "None";
@@ -93,9 +117,35 @@ std::optional<std::string> utc_timestamp_string(const std::optional<double>& val
 }
 
 bool meets_order_minimum(const json& parent, const Decimal& quantity, const Decimal& price) {
-    Decimal min_quantity = parse_decimal(parent.at("min_quantity"));
+    // Both quantity and notional rules must hold after downward sizing.
+    Decimal min_quantity = Decimal::max(min_order_quantity(), parse_decimal(parent.at("min_quantity")));
     Decimal min_notional = parse_decimal(parent.at("min_notional"));
     return quantity >= min_quantity && quantity * price >= min_notional;
+}
+
+std::string price_distance_reason(const json& parent, const QuoteState& quote, const std::string& side) {
+    bool selling = side == "SELL";
+    const json* raw_bound = json_find(parent, selling ? "minimum_price" : "maximum_price");
+    if (!raw_bound || raw_bound->is_null()) return "";
+    Decimal bound = parse_decimal(*raw_bound);
+    const Decimal& best = selling ? quote.bid : quote.ask;
+    if ((selling && bound <= best) || (!selling && bound >= best)) return "";
+    // Displayed prices beyond the best executable price, ordered toward the bound.
+    std::vector<Decimal> prices;
+    for (const Decimal& price : selling ? quote.ask_prices : quote.bid_prices) {
+        if (selling ? price > best : price < best) prices.push_back(price);
+    }
+    std::sort(prices.begin(), prices.end(), [&](const Decimal& a, const Decimal& b) { return selling ? a < b : a > b; });
+    prices.erase(std::unique(prices.begin(), prices.end()), prices.end());
+    int crossed = 0;
+    for (const Decimal& price : prices) {
+        if (selling ? price <= bound : price >= bound) ++crossed;
+    }
+    if (crossed >= 5) return "user price limit is at least five displayed levels away";
+    if (prices.empty() || (selling ? bound > prices.back() : bound < prices.back())) {
+        return "waiting for displayed depth to locate user price limit";
+    }
+    return "";
 }
 
 ChildPlan plan_child_order(const json& parent, const QuoteState& quote, double now) {
@@ -106,9 +156,13 @@ ChildPlan plan_child_order(const json& parent, const QuoteState& quote, double n
     Decimal child_cap = parse_decimal(parent.at("child_cap"));
     Decimal quantity_step = parse_decimal(parent.at("quantity_step"));
     Decimal remaining = parent_quantity - filled - reserved;
-    Decimal depth_budget = Decimal::max(Decimal::zero(), quote.bid_size - quote.consumed) * Decimal::parse(".10");
-    bool depth_limited = depth_budget < Decimal::min(child_cap, remaining);
-    Decimal ready_quantity = Decimal::min(Decimal::min(child_cap, remaining), depth_budget).round_down_to_step(quantity_step);
+    // The 10% displayed-size rule is not enforced for Smart selling.
+    bool disable_child_cap = parent.value("disable_child_cap", false);
+    Decimal size_cap = disable_child_cap ? remaining : child_cap;
+    Decimal continuation = parent.contains("slice_remaining") ? parse_decimal(parent.at("slice_remaining")) : Decimal::zero();
+    if (!continuation.is_zero()) size_cap = Decimal::min(size_cap, continuation);
+    bool depth_limited = false;
+    Decimal ready_quantity = Decimal::min(size_cap, remaining).round_down_to_step(quantity_step);
 
     bool behind_schedule = false;
     const json& deadline_mono = parent.at("deadline_mono");
@@ -122,7 +176,7 @@ ChildPlan plan_child_order(const json& parent, const QuoteState& quote, double n
     std::string mode = parent.at("mode").get<std::string>();
     bool fallback = parent.value("fallback", false);
     bool imminent = parent.value("imminent_event", false);
-    bool aggressive = mode == "urgent" || fallback || behind_schedule || imminent;
+    bool aggressive = mode == "urgent" || mode == "ultra" || fallback || behind_schedule || imminent;
     Decimal selected_price;
     if (aggressive) selected_price = quote.bid;
     else if (mode == "patient") selected_price = quote.ask;
@@ -140,11 +194,11 @@ ChildPlan plan_child_order(const json& parent, const QuoteState& quote, double n
                         .round_up_to_step(parse_decimal(parent.at("tick_size")));
 
     if (!meets_order_minimum(parent, ready_quantity, price)) {
-        return ChildPlan{std::nullopt, price, aggressive, depth_limited, "depth or residual quantity below broker minimum"};
+        return ChildPlan{std::nullopt, price, aggressive, depth_limited, "residual quantity below broker minimum"};
     }
     const json& last_send = parent.at("last_send");
     double flush_since = last_send.is_null() ? parent.at("start_mono").get<double>() : last_send.get<double>();
-    if (credit < ready_quantity && now - flush_since < 30) {
+    if (!disable_child_cap && credit < ready_quantity && now - flush_since < 30) {
         return ChildPlan{std::nullopt, price, aggressive, depth_limited, "earning volume credit"};
     }
     Decimal quantity = Decimal::min(ready_quantity, Decimal::max(Decimal::zero(), credit)).round_down_to_step(quantity_step);
@@ -152,6 +206,24 @@ ChildPlan plan_child_order(const json& parent, const QuoteState& quote, double n
         return ChildPlan{std::nullopt, price, aggressive, depth_limited, "earned credit below broker minimum"};
     }
     return ChildPlan{quantity, price, aggressive, depth_limited, ""};
+}
+
+ChildPlan plan_buy(const json& parent, const QuoteState& quote, double now) {
+    (void)now;
+    Decimal price = quote.ask.round_up_to_step(parse_decimal(parent.at("tick_size")));
+    const json& ceiling = parent.at("maximum_price");
+    if (!ceiling.is_null() && price > parse_decimal(ceiling)) {
+        return ChildPlan{std::nullopt, price, true, false, "best ask exceeds maximum price"};
+    }
+    Decimal remaining = parse_decimal(parent.at("quantity")) - parse_decimal(parent.at("F")) - parse_decimal(parent.at("R"));
+    Decimal depth = Decimal::max(Decimal::zero(), quote.ask_size - quote.consumed);
+    Decimal credit = Decimal::max(Decimal::zero(), parse_decimal(parent.at("C")));
+    Decimal quantity = Decimal::min(Decimal::min(remaining, depth), credit).round_down_to_step(parse_decimal(parent.at("quantity_step")));
+    if (!meets_order_minimum(parent, quantity, price)) {
+        return ChildPlan{std::nullopt, price, true, depth < Decimal(100),
+                         "waiting for volume credit and at least 100 shares of liquidity"};
+    }
+    return ChildPlan{quantity, price, true, depth < remaining, ""};
 }
 
 }  // namespace ng::smart

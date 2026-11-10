@@ -3,11 +3,13 @@
 
 #include <doctest.h>
 
+#include <functional>
 #include <memory>
 #include <string>
 #include <vector>
 
 #include "core/decimal.h"
+#include "core/sqlite.h"
 #include "core/time_util.h"
 #include "algo/smart_selling/engine.h"
 #include "test_helpers.h"
@@ -78,7 +80,25 @@ struct EngineFixture {
         if (overrides.contains("reset_sequence")) u.reset_sequence = overrides.at("reset_sequence").get<bool>();
         if (overrides.contains("preserve_consumption")) u.preserve_consumption = overrides.at("preserve_consumption").get<bool>();
         if (overrides.contains("healthy")) u.healthy = overrides.at("healthy").get<bool>();
+        if (overrides.contains("ask_size")) u.ask_size = overrides.at("ask_size");
+        if (overrides.contains("bid_prices")) u.bid_prices = overrides.at("bid_prices").get<std::vector<json>>();
+        if (overrides.contains("ask_prices")) u.ask_prices = overrides.at("ask_prices").get<std::vector<json>>();
         engine->on_quote("XYZ", u);
+    }
+
+    // Rewrites the persisted parent document directly (bypassing the ledger checks), like the Python
+    // tests that patch a stored row to model legacy or externally modified journals.
+    void patch_stored_parent(const std::function<void(json&)>& change) {
+        ng::Sqlite db(path);
+        ng::Statement select(db, "SELECT data FROM smart_parents WHERE id=?");
+        select.bind(1, parent);
+        REQUIRE(select.step());
+        json stored = json::parse(select.column_text(0));
+        change(stored);
+        ng::Statement update(db, "UPDATE smart_parents SET data=? WHERE id=?");
+        update.bind(1, stored.dump());
+        update.bind(2, parent);
+        update.exec();
     }
 
     void tape(const std::string& quantity = "1000", const std::string& event_id = "trade-1", json extra = json::object()) {

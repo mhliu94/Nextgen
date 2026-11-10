@@ -68,14 +68,25 @@ class PriceBookConsumer {
 public:
     using PayloadCallback = std::function<void(const json& payload, const std::string& topic, int partition, long long offset)>;
     using HealthCallback = std::function<void(bool healthy)>;
+    using QuoteCallback = std::function<void(const StockQuote& quote)>;
 
+    // `quote_callback` receives every parsed stock quote (market-activity history). With
+    // `quote_history_seconds` > 0 the stock-quotes partitions are replayed from that long ago on each
+    // assignment (by Kafka timestamp); price books replay at most kafka.market_data_replay_records.
     PriceBookConsumer(const KafkaConfig& kafka, MarketDataStore& store, PayloadCallback payload_callback = nullptr,
-                      HealthCallback health_callback = nullptr);
+                      HealthCallback health_callback = nullptr, QuoteCallback quote_callback = nullptr,
+                      double quote_history_seconds = 0);
     ~PriceBookConsumer();
     void start();
     void stop();
     FeedHealth health() const { return health_.snapshot(); }
     void handle_payload(const json& payload, const std::string& topic, int partition, long long offset);
+    // Start offset for one assigned partition (exposed for tests): `watermarks` and `offset_for_time`
+    // stand in for the broker lookups.
+    using WatermarkLookup = std::function<std::optional<std::pair<long long, long long>>(const std::string&, int)>;
+    using TimeLookup = std::function<std::optional<long long>(const std::string&, int, long long timestamp_ms)>;
+    long long start_offset(const std::string& topic, int partition, double now_wall, const WatermarkLookup& watermarks,
+                           const TimeLookup& offset_for_time) const;
 
 private:
     void run();
@@ -84,6 +95,8 @@ private:
     MarketDataStore& store_;
     PayloadCallback payload_callback_;
     HealthCallback health_callback_;
+    QuoteCallback quote_callback_;
+    double quote_history_seconds_ = 0;
     std::unique_ptr<Consumer> consumer_;
     std::thread thread_;
     std::atomic<bool> stop_{false};

@@ -5,14 +5,22 @@
 #include <map>
 #include <optional>
 #include <string>
+#include <vector>
 
 #include "core/decimal.h"
 #include "core/json.h"
 
 namespace ng::smart {
 
-// Percentage units: patient 3%, normal 6%, urgent 10%.
+// Smart selling percentage units: patient 6%, normal 12%, urgent 20%, ultra 30%.
 const std::map<std::string, Decimal>& participation_percentages();
+// Mode names in their declaration order (error messages list them like Python's dict keys).
+const std::vector<std::string>& participation_modes();
+// Smart buying (mode H): patient 5%, normal 8%, urgent 15%.
+const std::map<std::string, Decimal>& buying_participation_percentages();
+const std::vector<std::string>& buying_participation_modes();
+// Every child needs at least 100 shares, or the larger configured broker minimum.
+const Decimal& min_order_quantity();
 
 struct Defaults {
     static constexpr double horizon_seconds = 7200;
@@ -43,6 +51,10 @@ struct QuoteState {
     Decimal bid;
     Decimal ask;
     Decimal bid_size;
+    Decimal ask_size;
+    // Distinct displayed prices with positive size: bids descending, asks ascending.
+    std::vector<Decimal> bid_prices;
+    std::vector<Decimal> ask_prices;
     Decimal consumed;
     std::optional<double> consumed_wall;
     double received_at = 0.0;
@@ -63,5 +75,12 @@ struct ChildPlan {
 };
 
 ChildPlan plan_child_order(const json& parent, const QuoteState& quote, double now);
+// Smart buying: a best-ask limit within the optional ceiling, sized by earned credit, displayed ask
+// liquidity and the remaining target (smart_buying.plan_buy).
+ChildPlan plan_buy(const json& parent, const QuoteState& quote, double now);
+// Counts distinct displayed prices from the executable side toward the user's price bound
+// (minimum_price when selling, maximum_price when buying). Returns "" when trading may proceed, or
+// the reason to pause: the bound is five or more displayed levels away, or beyond the displayed depth.
+std::string price_distance_reason(const json& parent, const QuoteState& quote, const std::string& side);
 
 }  // namespace ng::smart

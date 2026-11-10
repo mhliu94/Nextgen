@@ -2,7 +2,6 @@
 
 #include <algorithm>
 #include <cmath>
-#include <random>
 #include <set>
 
 #include "core/logging.h"
@@ -30,17 +29,7 @@ std::optional<long long> opt_int(const json& value) {
     return value.get<long long>();
 }
 
-std::string uuid_hex() {
-    static thread_local std::mt19937_64 rng{std::random_device{}()};
-    static const char* hex = "0123456789abcdef";
-    std::string out;
-    out.reserve(32);
-    for (int i = 0; i < 4; ++i) {
-        std::uint64_t v = rng();
-        for (int j = 0; j < 16; ++j) out.push_back(hex[(v >> (j * 4)) & 15]);
-    }
-    return out;
-}
+std::string uuid_hex() { return uuid4_hex(); }
 
 bool is_blank(const json& value) {
     return value.is_null() || (value.is_string() && value.get<std::string>().empty());
@@ -79,6 +68,12 @@ auto SmartSellingEngine::transaction(Fn&& fn) -> decltype(fn()) {
 }
 
 SmartSellingEngine::SmartSellingEngine(const std::string& db_path, Clock clock, Clock wall_clock, int max_active_parents)
+    : SmartSellingEngine(db_path, std::move(clock), std::move(wall_clock), max_active_parents, DeferRecovery{}) {
+    recover();
+}
+
+SmartSellingEngine::SmartSellingEngine(const std::string& db_path, Clock clock, Clock wall_clock, int max_active_parents,
+                                       DeferRecovery)
     : clock_(clock ? std::move(clock) : Clock(&mono_now)),
       wall_clock_(wall_clock ? std::move(wall_clock) : Clock(&wall_now)),
       max_active_parents_(max_active_parents),
@@ -107,6 +102,9 @@ SmartSellingEngine::SmartSellingEngine(const std::string& db_path, Clock clock, 
             id INTEGER PRIMARY KEY AUTOINCREMENT, data TEXT NOT NULL,
             dispatched INTEGER NOT NULL DEFAULT 0);
     )SQL");
+}
+
+void SmartSellingEngine::recover() {
     transaction([&] {
         // A persisted intent may have reached the broker even if dispatch was interrupted.
         // Never replay a submit after process restart.
@@ -172,6 +170,12 @@ json SmartSellingEngine::upgrade_parent(json parent) {
     }
     if (!parent.contains("next_account_index")) parent["next_account_index"] = 0;
     if (!parent.contains("slice_remaining")) parent["slice_remaining"] = "0";
+    if (!parent.contains("disable_child_cap")) parent["disable_child_cap"] = false;
+    // Every child needs at least 100 shares (or the larger configured minimum) on the quantity grid.
+    Decimal minimum = Decimal::max(min_order_quantity(), D(parent, "min_quantity")).round_up_to_step(D(parent, "quantity_step"));
+    parent["min_quantity"] = S(minimum);
+    if (!parent.contains("base_child_cap")) parent["base_child_cap"] = parent.at("child_cap");
+    for (const char* key : {"child_cap", "base_child_cap"}) parent[key] = S(Decimal::max(minimum, D(parent, key)));
     if (!parent.at("order").is_null() && !parent["order"].contains("account_id")) parent["order"]["account_id"] = account;
     return parent;
 }
@@ -228,7 +232,9 @@ void SmartSellingEngine::event(const json& parent, const std::string& kind, json
 }
 
 void SmartSellingEngine::trim(json& parent) {
-    Decimal excess = Decimal::max(Decimal::zero(), D(parent, "C") - Decimal(2) * D(parent, "child_cap"));
+    Decimal credit_cap = parent.at("disable_child_cap").get<bool>() ? D(parent, "quantity") - D(parent, "F") - D(parent, "R")
+                                                                    : Decimal(2) * D(parent, "child_cap");
+    Decimal excess = Decimal::max(Decimal::zero(), D(parent, "C") - credit_cap);
     if (!excess.is_zero()) {
         parent["C"] = S(D(parent, "C") - excess);
         parent["D"] = S(D(parent, "D") + excess);
@@ -258,13 +264,13 @@ json SmartSellingEngine::start_parent(const json& settings) {
     if (mode == "1") mode = "patient";
     else if (mode == "2") mode = "normal";
     else if (mode == "3") mode = "urgent";
-    if (!participation_percentages().count(mode)) throw ValueError("mode must be patient, normal, or urgent");
-    json percentage_raw = settings.contains("participation_percentage") && !settings.at("participation_percentage").is_null()
-                              ? settings.at("participation_percentage")
-                              : json(participation_percentages().at(mode).str());
-    if (settings.contains("participation_percentage") && settings.at("participation_percentage").is_null()) {
-        percentage_raw = settings.at("participation_percentage");
-    }
+    else if (mode == "4") mode = "ultra";
+    if (!mode_percentages().count(mode)) throw ValueError("mode must be one of: " + join(mode_names(), ", "));
+    json disable_child_cap = settings.value("disable_child_cap", json(false));
+    if (!disable_child_cap.is_boolean()) throw ValueError("disable_child_cap must be a boolean");
+    // An explicit participation_percentage (even null) replaces the mode's default.
+    json percentage_raw = settings.contains("participation_percentage") ? settings.at("participation_percentage")
+                                                                        : json(mode_percentages().at(mode).str());
     Decimal percentage = parse_participation_percentage(percentage_raw);
     Decimal participation = percentage.scaleb(-2);
     const json& rules = (settings.contains("instrument_rules") && settings.at("instrument_rules").is_object())
@@ -273,7 +279,7 @@ json SmartSellingEngine::start_parent(const json& settings) {
     Decimal quantity_step = parse_input_decimal(rules.value("quantity_step", json(nullptr)), "quantity_step", true);
     Decimal tick_size = parse_input_decimal(rules.value("tick_size", json(nullptr)), "tick_size", true);
     Decimal minimum_quantity = parse_input_decimal(rules.value("min_quantity", json(nullptr)), "min_quantity", true);
-    minimum_quantity = minimum_quantity.round_up_to_step(quantity_step);
+    minimum_quantity = Decimal::max(min_order_quantity(), minimum_quantity).round_up_to_step(quantity_step);
     Decimal min_notional = parse_input_decimal(rules.value("min_notional", json(0)), "min_notional", false, true);
     if (quantity != quantity.round_down_to_step(quantity_step) || quantity < minimum_quantity) {
         throw ValueError("quantity must satisfy the instrument minimum and quantity step");
@@ -339,6 +345,7 @@ json SmartSellingEngine::start_parent(const json& settings) {
     parent["minimum_price"] = minimum_price;
     parent["child_cap"] = S(child_cap);
     parent["base_child_cap"] = S(child_cap);
+    parent["disable_child_cap"] = disable_child_cap.get<bool>();
     parent["tick_size"] = S(tick_size);
     parent["quantity_step"] = S(quantity_step);
     parent["min_quantity"] = S(minimum_quantity);
@@ -357,7 +364,7 @@ json SmartSellingEngine::start_parent(const json& settings) {
     parent["D"] = "0";
     parent["order"] = nullptr;
     parent["fallback"] = false;
-    parent["imminent_event"] = settings.contains("imminent_event") && json_truthy(&settings.at("imminent_event"));
+    parent["imminent_event"] = settings.contains("imminent_event") && json_python_truthy(&settings.at("imminent_event"));
     parent["active"] = true;
     parent["stop_requested"] = false;
     parent["stop_reason"] = "";
@@ -376,8 +383,88 @@ json SmartSellingEngine::start_parent(const json& settings) {
     parent["last_tick"] = nullptr;
     parent["latencies"] = json::object();
     if (tif != "DAY" && tif != "GTC") throw ValueError("Smart selling requires ordinary DAY or GTC limits");
+    configure_parent(parent, settings);
     register_parent(parent);
     return make_public(parent);
+}
+
+void SmartSellingEngine::configure_parent(json& parent, const json& settings) {
+    json empty = json::object();
+    const json* costs = json_find(settings, "account_average_costs");
+    if (!costs) costs = &empty;
+    for (auto it = parent["accounts"].begin(); it != parent["accounts"].end(); ++it) {
+        const json* value = json_find(*costs, it.key());
+        if (value && !value->is_null()) it.value()["average_cost"] = S(parse_decimal(*value, "average cost", false, true));
+        else it.value()["average_cost"] = nullptr;
+    }
+}
+
+void SmartSellingEngine::set_account_costs(const std::string& parent_id, const std::map<std::string, std::optional<Decimal>>& costs) {
+    transaction([&] {
+        json parent = load(parent_id);
+        bool changed = false;
+        for (auto it = parent["accounts"].begin(); it != parent["accounts"].end(); ++it) {
+            json value = nullptr;
+            auto found = costs.find(it.key());
+            if (found != costs.end() && found->second) {
+                if (found->second->is_negative()) throw ValueError("invalid average cost");
+                value = S(*found->second);
+            }
+            if (it.value().value("average_cost", json(nullptr)) != value) {
+                it.value()["average_cost"] = value;
+                changed = true;
+            }
+        }
+        if (changed) save(parent);
+    });
+}
+
+std::optional<Decimal> SmartSellingEngine::depth_budget(const QuoteState&) const {
+    // The 10% displayed-size rule is not enforced for Smart selling.
+    return std::nullopt;
+}
+
+std::pair<Decimal, bool> SmartSellingEngine::dispatch_price(const json& parent, const json& order, const QuoteState& quote) const {
+    Decimal floor = is_blank(parent.at("minimum_price")) ? Decimal::zero() : D(parent, "minimum_price");
+    Decimal price = Decimal::max(Decimal::max(D(order, "limit_price"), quote.bid), floor).round_up_to_step(D(parent, "tick_size"));
+    return {price, order.at("aggressive").get<bool>() || D(order, "limit_price") <= quote.bid};
+}
+
+Decimal SmartSellingEngine::account_capacity(const json& parent, const std::string& account_id, const Decimal&,
+                                             bool include_order) const {
+    const json& account = parent.at("accounts").at(account_id);
+    Decimal available = D(account, "quantity") - D(account, "F") - D(account, "R");
+    const json& order = parent.at("order");
+    if (include_order && !order.is_null() && order.at("account_id").get<std::string>() == account_id) {
+        available += D(order, "quantity");
+    }
+    return available;
+}
+
+std::vector<std::size_t> SmartSellingEngine::account_selection_indices(const json& parent) const {
+    std::vector<std::string> accounts = parent.at("account_ids").get<std::vector<std::string>>();
+    std::size_t start = static_cast<std::size_t>(parent.at("next_account_index").get<long long>());
+    std::vector<std::size_t> indices;
+    for (std::size_t offset = 0; offset < accounts.size(); ++offset) indices.push_back((start + offset) % accounts.size());
+    if (std::string(side()) == "SELL") {
+        // Sell first from the account whose average holding cost is closest to the live midpoint.
+        // Distances are compared doubled (|2*cost - (bid + ask)|) to stay exact; the stable sort
+        // rotates ties in distance and accounts with unknown costs.
+        const QuoteState& quote = quotes_.at(parent.at("symbol").get<std::string>());
+        Decimal doubled_mid = quote.bid + quote.ask;
+        auto priority = [&](std::size_t index) -> std::pair<bool, Decimal> {
+            const json& account = parent.at("accounts").at(accounts[index]);
+            const json* cost = json_find(account, "average_cost");
+            if (!cost || cost->is_null()) return {true, Decimal::zero()};
+            return {false, (Decimal(2) * parse_decimal(*cost) - doubled_mid).abs()};
+        };
+        std::stable_sort(indices.begin(), indices.end(), [&](std::size_t a, std::size_t b) {
+            auto pa = priority(a), pb = priority(b);
+            if (pa.first != pb.first) return !pa.first;
+            return pa.second < pb.second;
+        });
+    }
+    return indices;
 }
 
 void SmartSellingEngine::register_parent(const json& parent) {
@@ -428,21 +515,42 @@ void SmartSellingEngine::on_quote(const std::string& symbol_in, const QuoteUpdat
             if (old->sequence_gap) healthy = false;
         }
         Decimal bid, ask, size;
+        std::vector<Decimal> bid_levels, ask_levels;
         try {
             bid = parse_input_decimal(update.bid, "bid", true);
             ask = parse_input_decimal(update.ask, "ask", true);
             size = parse_input_decimal(update.bid_size, "bid_size", false, true);
+            if (update.bid_prices) {
+                for (const json& level : *update.bid_prices) bid_levels.push_back(parse_input_decimal(level, "bid level", true));
+            } else {
+                bid_levels.push_back(bid);
+            }
+            if (update.ask_prices) {
+                for (const json& level : *update.ask_prices) ask_levels.push_back(parse_input_decimal(level, "ask level", true));
+            } else {
+                ask_levels.push_back(ask);
+            }
+            std::sort(bid_levels.begin(), bid_levels.end(), [](const Decimal& a, const Decimal& b) { return a > b; });
+            bid_levels.erase(std::unique(bid_levels.begin(), bid_levels.end()), bid_levels.end());
+            std::sort(ask_levels.begin(), ask_levels.end());
+            ask_levels.erase(std::unique(ask_levels.begin(), ask_levels.end()), ask_levels.end());
             if (ask < bid) healthy = false;
         } catch (const ValueError&) {
             bid = Decimal::zero();
             ask = Decimal::zero();
             size = Decimal::zero();
+            bid_levels.clear();
+            ask_levels.clear();
             healthy = false;
         }
         std::optional<double> source = parse_timestamp(update.source_time);
         Decimal consumed;
         std::optional<double> consumed_wall;
-        if (old && old->bid == bid && old->consumed_wall) {
+        const Decimal& liquidity_price = liquidity_is_ask() ? ask : bid;
+        // A missing, empty or zero ask size counts as no displayed size; a negative one is an error.
+        Decimal ask_size = json_python_truthy(&update.ask_size) ? parse_decimal(update.ask_size, "ask_size", false, true)
+                                                                : Decimal::zero();
+        if (old && (liquidity_is_ask() ? old->ask : old->bid) == liquidity_price && old->consumed_wall) {
             if (update.preserve_consumption || !source || *source <= *old->consumed_wall) {
                 consumed = old->consumed;
                 consumed_wall = old->consumed_wall;
@@ -452,6 +560,9 @@ void SmartSellingEngine::on_quote(const std::string& symbol_in, const QuoteUpdat
         state.bid = bid;
         state.ask = ask;
         state.bid_size = size;
+        state.ask_size = ask_size;
+        state.bid_prices = std::move(bid_levels);
+        state.ask_prices = std::move(ask_levels);
         state.consumed = consumed;
         state.consumed_wall = consumed_wall;
         state.received_at = now;
@@ -648,7 +759,7 @@ json SmartSellingEngine::action_dict(const json& parent, const std::string& kind
     if (kind == "submit") {
         action["quantity"] = order.at("quantity");
         action["limit_price"] = order.at("limit_price");
-        action["side"] = "SELL";
+        action["side"] = side();
         action["order_type"] = "LIMIT";
         action["time_in_force"] = parent.at("time_in_force");
         action["send_time"] = iso_utc(order.at("send_wall").get<double>());
@@ -697,25 +808,25 @@ std::optional<json> SmartSellingEngine::prepare_dispatch(const std::string& clie
             if (reason.empty()) reason = quote_reason(parent, now);
         }
         if (reason.empty() && D(parent, "C").is_negative()) reason = "negative credit before dispatch";
+        if (reason.empty()) reason = price_distance_reason(parent, quotes_.at(parent.at("symbol").get<std::string>()), side());
         if (reason.empty()) {
             const QuoteState& quote = quotes_.at(parent.at("symbol").get<std::string>());
             Decimal old_quantity = D(order, "quantity");
             Decimal step = D(parent, "quantity_step");
             Decimal other_reserved = D(parent, "R") - old_quantity;
             Decimal remaining = D(parent, "quantity") - D(parent, "F") - other_reserved;
-            Decimal depth = Decimal::max(Decimal::zero(), quote.bid_size - quote.consumed) * Decimal::parse(".10");
-            json& account = parent["accounts"][order.at("account_id").get<std::string>()];
-            Decimal account_remaining = D(account, "quantity") - D(account, "F") - D(account, "R") + old_quantity;
-            Decimal quantity = Decimal::min(Decimal::min(Decimal::min(old_quantity, D(parent, "child_cap")), remaining),
-                                            Decimal::min(account_remaining, depth))
+            std::optional<Decimal> depth = depth_budget(quote);
+            auto [price, aggressive] = dispatch_price(parent, order, quote);
+            std::string order_account = order.at("account_id").get<std::string>();
+            json& account = parent["accounts"][order_account];
+            Decimal account_remaining = account_capacity(parent, order_account, price, true);
+            Decimal size_cap = parent.at("disable_child_cap").get<bool>() ? remaining : D(parent, "child_cap");
+            Decimal quantity = Decimal::min(Decimal::min(Decimal::min(old_quantity, size_cap), remaining),
+                                            Decimal::min(account_remaining, depth ? *depth : remaining))
                                    .round_down_to_step(step);
-            Decimal floor = parent.at("minimum_price").is_null() ? Decimal::zero() : D(parent, "minimum_price");
-            Decimal price = Decimal::max(Decimal::max(D(order, "limit_price"), quote.bid), floor)
-                                .round_up_to_step(D(parent, "tick_size"));
-            bool aggressive = order.at("aggressive").get<bool>() || D(order, "limit_price") <= quote.bid;
             int age_limit = aggressive ? 2 : 5;
             if (!meets_order_minimum(parent, quantity, price)) {
-                reason = "refreshed depth below broker minimum before dispatch";
+                reason = "available quantity below broker minimum before dispatch";
             } else if (now - order.at("send_mono").get<double>() >= age_limit) {
                 reason = "submission queue exceeded child cancellation age";
             } else {
@@ -962,7 +1073,9 @@ void SmartSellingEngine::book_cumulative_fill(json& parent, json& order, const D
         parent["fills_after_cancel"] = S(D(parent, "fills_after_cancel") + delta);
     }
     auto it = quotes_.find(parent.at("symbol").get<std::string>());
-    if (it != quotes_.end() && order.at("aggressive").get<bool>() && it->second.bid == D(order, "quote_bid")) {
+    bool ask_side = liquidity_is_ask();
+    if (it != quotes_.end() && order.at("aggressive").get<bool>() &&
+        (ask_side ? it->second.ask : it->second.bid) == D(order, ask_side ? "quote_ask" : "quote_bid")) {
         it->second.consumed += delta;
         it->second.consumed_wall = wall_clock_();
     }
@@ -1234,6 +1347,7 @@ std::optional<ChildPlan> SmartSellingEngine::plan_child(json& parent, double now
     }
     std::string reason = parent.at("hold").get<std::string>();
     if (reason.empty()) reason = quote_reason(parent, now);
+    if (reason.empty()) reason = price_distance_reason(parent, quotes_.at(parent.at("symbol").get<std::string>()), side());
     if (!reason.empty() || D(parent, "C").is_negative()) {
         parent["state"] = "HOLD";
         parent["reason"] = reason.empty() ? "negative credit after tape correction" : reason;
@@ -1250,13 +1364,15 @@ std::optional<ChildPlan> SmartSellingEngine::plan_child(json& parent, double now
     if (!continuation.is_zero()) {
         json sizing = parent;
         sizing["child_cap"] = S(Decimal::min(continuation, D(parent, "child_cap")));
-        plan = plan_child_order(sizing, quote, now);
+        plan = child_policy(sizing, quote, now);
         if (!meets_order_minimum(parent, continuation, plan.limit_price)) {
+            // A split remainder below the broker minimum joins future volume credit; it must never
+            // become an illegal child on another account.
             parent["slice_remaining"] = "0";
-            plan = plan_child_order(parent, quote, now);
+            plan = child_policy(parent, quote, now);
         }
     } else {
-        plan = plan_child_order(parent, quote, now);
+        plan = child_policy(parent, quote, now);
     }
     if (plan.depth_limited) parent["depth_cap_count"] = parent.at("depth_cap_count").get<long long>() + 1;
     if (!plan.quantity) {
@@ -1274,12 +1390,10 @@ void SmartSellingEngine::reserve_child(json& parent, const ChildPlan& plan, doub
     std::string account_id;
     Decimal allocated;
     bool found = false;
-    std::size_t start_index = static_cast<std::size_t>(parent.at("next_account_index").get<long long>());
-    for (std::size_t offset = 0; offset < account_ids.size(); ++offset) {
-        index = (start_index + offset) % account_ids.size();
+    for (std::size_t candidate : account_selection_indices(parent)) {
+        index = candidate;
         account_id = account_ids[index];
-        const json& account = parent.at("accounts").at(account_id);
-        Decimal available = D(account, "quantity") - D(account, "F") - D(account, "R");
+        Decimal available = account_capacity(parent, account_id, plan.limit_price);
         allocated = Decimal::min(quantity, available).round_down_to_step(D(parent, "quantity_step"));
         if (meets_order_minimum(parent, allocated, plan.limit_price)) {
             found = true;
@@ -1334,7 +1448,9 @@ void SmartSellingEngine::reserve_child(json& parent, const ChildPlan& plan, doub
     order["quote_source_time"] = opt_json(quote.source_time);
     order["quote_received_at"] = quote.received_at;
     parent["order"] = order;
-    if (plan.aggressive && plan.limit_price > quote.bid) parent["reason"] = "minimum price blocks immediate execution";
+    if (std::string(side()) == "SELL" && plan.aggressive && plan.limit_price > quote.bid) {
+        parent["reason"] = "minimum price blocks immediate execution";
+    }
     else if (plan.aggressive) parent["reason"] = "aggressive child submitted";
     else parent["reason"] = "passive child submitted";
     save(parent);
@@ -1351,6 +1467,7 @@ json SmartSellingEngine::make_public(json parent) {
     for (auto it = parent.at("accounts").begin(); it != parent.at("accounts").end(); ++it) {
         const json& a = it.value();
         accounts[it.key()] = json{{"quantity", a.at("quantity")},
+                                  {"average_cost", a.value("average_cost", json(nullptr))},
                                   {"filled", a.at("F")},
                                   {"reserved", a.at("R")},
                                   {"remaining", S(D(a, "quantity") - D(a, "F"))},
@@ -1376,7 +1493,8 @@ json SmartSellingEngine::make_public(json parent) {
     auto deadline = utc_timestamp_string(opt_double(parent.at("deadline_wall")));
     out["deadline"] = deadline ? json(*deadline) : json(nullptr);
     out["minimum_price"] = parent.at("minimum_price");
-    out["child_cap"] = parent.at("child_cap");
+    out["child_cap"] = parent.at("disable_child_cap").get<bool>() ? json(nullptr) : parent.at("child_cap");
+    out["disable_child_cap"] = parent.at("disable_child_cap");
     out["fallback"] = parent.at("fallback");
     out["active_order"] = parent.at("order");
     out["order_state"] = parent.at("order").is_null() ? json("IDLE") : parent.at("order").at("state");
@@ -1430,6 +1548,7 @@ std::optional<json> SmartSellingEngine::get_order_context(const std::string& cli
     out["parent_id"] = parent.at("parent_id");
     out["account_id"] = order.value("account_id", parent.at("account_id"));
     out["symbol"] = parent.at("symbol");
+    out["side"] = side();
     out["quantity"] = order.at("quantity");
     out["limit_price"] = order.at("limit_price");
     out["broker_order_id"] = order.at("broker_order_id");

@@ -36,6 +36,10 @@ struct QuoteUpdate {
     json ask;
     json bid_size;
     json source_time = nullptr;  // epoch number, ISO string with offset, or null
+    json ask_size = nullptr;     // displayed size at the best ask (required by Smart buying)
+    // Distinct displayed price levels with positive size; when absent only the best price is known.
+    std::optional<std::vector<json>> bid_prices;
+    std::optional<std::vector<json>> ask_prices;
     std::optional<long long> sequence;
     bool healthy = true;
     bool accessible = true;
@@ -71,11 +75,17 @@ public:
 
     explicit SmartSellingEngine(const std::string& db_path, Clock clock = nullptr, Clock wall_clock = nullptr,
                                 int max_active_parents = 100);
-    ~SmartSellingEngine();
+    virtual ~SmartSellingEngine();
     void close();
 
+    // "SELL" for Smart selling (mode G), "BUY" for Smart buying (mode H).
+    virtual const char* side() const { return "SELL"; }
+
     json start_parent(const json& settings);
-    void on_quote(const std::string& symbol, const QuoteUpdate& update);
+    virtual void on_quote(const std::string& symbol, const QuoteUpdate& update);
+    // Refreshes the per-account average holding costs used to pick the selling account, without
+    // changing an outstanding child's account. A missing or null cost is unknown, never zero.
+    void set_account_costs(const std::string& parent_id, const std::map<std::string, std::optional<Decimal>>& costs);
     void set_feed_health(const std::string& symbol, bool healthy, const std::string& reason = "", bool reset_sequence = false);
     void on_trade(const std::string& symbol, const TradeUpdate& trade);
     std::optional<json> prepare_dispatch(const std::string& client_order_id);
@@ -101,14 +111,43 @@ public:
     // Exposed for tests.
     const std::map<std::string, QuoteState>& quotes_for_test() const { return quotes_; }
 
-private:
+protected:
+    // Subclasses finish construction themselves so restart recovery runs with their overrides.
+    struct DeferRecovery {};
+    SmartSellingEngine(const std::string& db_path, Clock clock, Clock wall_clock, int max_active_parents, DeferRecovery);
+    // Marks persisted intents as dispatched and puts every outstanding child into reconciliation.
+    void recover();
+
+    // --- side-specific policy (overridden by SmartBuyingEngine) ---------------------------------
+    // True when executable liquidity is the ask side (buying); consumption is tracked on that side.
+    virtual bool liquidity_is_ask() const { return false; }
+    virtual const std::map<std::string, Decimal>& mode_percentages() const { return participation_percentages(); }
+    virtual const std::vector<std::string>& mode_names() const { return participation_modes(); }
+    virtual ChildPlan child_policy(const json& parent, const QuoteState& quote, double now) const {
+        return plan_child_order(parent, quote, now);
+    }
+    // Side-specific budget settings are persisted before parent registration.
+    virtual void configure_parent(json& parent, const json& settings);
+    // Displayed-liquidity cap for one child; nullopt when the side has none.
+    virtual std::optional<Decimal> depth_budget(const QuoteState& quote) const;
+    // Limit price and aggressiveness to use at dispatch time.
+    virtual std::pair<Decimal, bool> dispatch_price(const json& parent, const json& order, const QuoteState& quote) const;
+    virtual Decimal account_capacity(const json& parent, const std::string& account_id, const Decimal& price,
+                                     bool include_order = false) const;
+    // Account indices in the order they should be tried for the next child.
+    std::vector<std::size_t> account_selection_indices(const json& parent) const;
+    virtual void save(const json& parent);
+    virtual void book_cumulative_fill(json& parent, json& order, const Decimal& cumulative);
+    virtual void finish_if_needed(json& parent, double now);
+    virtual json action_dict(const json& parent, const std::string& kind);
+    virtual json make_public(json parent);
+
     template <typename Fn>
     auto transaction(Fn&& fn) -> decltype(fn());
 
     std::vector<json> active(const std::optional<std::string>& symbol = std::nullopt);
     json load(const std::string& parent_id);
     static json upgrade_parent(json parent);
-    void save(const json& parent);
     void save_order(const std::string& parent_id, const json& order);
     void event(const json& parent, const std::string& kind, json detail = json::object());
     void trim(json& parent);
@@ -121,7 +160,6 @@ private:
                                            const Decimal& quantity);
     void credit_tape(json& parent, const std::string& event_id, const Decimal& quantity, const Decimal& rate,
                      const std::optional<std::string>& correction_of, const std::optional<double>& source, double now);
-    json action_dict(const json& parent, const std::string& kind);
     void action(json& parent, const std::string& kind);
     void abort_unsent(json& parent, json& order, const std::string& reason, double now, bool stop_parent = false);
     void query(json& parent, double now);
@@ -130,13 +168,11 @@ private:
                                const std::optional<long long>& sequence, bool authoritative);
     bool accept_cumulative_report(json& parent, json& order, const Decimal& cumulative,
                                   const std::optional<long long>& sequence);
-    void book_cumulative_fill(json& parent, json& order, const Decimal& cumulative);
     void acknowledge_order(json& parent, json& order, const std::string& status, const Decimal& cumulative, double now);
     void apply_terminal_report(json& parent, json& order, const std::string& status, const Decimal& cumulative, double now);
     void apply_working_report(json& parent, json& order, double now);
     void hold_conflict(json& parent, const std::string& reason);
     static bool deadline_reached(const json& parent, double now);
-    void finish_if_needed(json& parent, double now);
     std::string quote_reason(const json& parent, double now);
     static void latency(json& parent, const std::string& kind, double seconds);
     void diagnostic(json& parent, double now);
@@ -144,7 +180,6 @@ private:
     void service_working_order(json& parent, double now);
     std::optional<ChildPlan> plan_child(json& parent, double now);
     void reserve_child(json& parent, const ChildPlan& plan, double now);
-    json make_public(json parent);
 
     Clock clock_;
     Clock wall_clock_;

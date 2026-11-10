@@ -126,9 +126,10 @@ json OperationsLog::session_info(const json& command, const std::optional<std::s
         const json* v = json_find(command, key);
         out[key] = v ? *v : json(nullptr);
     }
-    if (const json* tm = json_find(command, "fast_trading_test_mode")) out["fast_trading_test_mode"] = json_truthy(tm);
+    if (const json* tm = json_find(command, "fast_trading_test_mode")) out["fast_trading_test_mode"] = json_python_truthy(tm);
     for (const char* key : {"fast_trading_price_limit", "fast_trading_account_ids", "fast_trading_book_levels",
-                            "fast_trading_target_percentage", "fast_trading_cycle_seconds"}) {
+                            "fast_trading_target_percentage", "fast_trading_cycle_seconds",
+                            "fast_trading_total_target_position"}) {
         if (const json* v = json_find(command, key)) out[key] = *v;
     }
     return out;

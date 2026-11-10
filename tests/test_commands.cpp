@@ -1,4 +1,6 @@
 #include <doctest.h>
+
+#include <set>
 #include "core/time_util.h"
 #include "core/strings.h"
 
@@ -173,4 +175,168 @@ TEST_CASE("fast trading configuration parsing") {
     json merged = extract_fast_trading_config(nested);
     CHECK(merged["price_limit"] == 3);
     CHECK(merged["account_ids"] == json::array({"A"}));
+}
+
+// tests/test_orders.py: optional total target position and the percentage choices.
+TEST_CASE("optional total target position is validated for both modes") {
+    auto dir = accounts();
+    AlgoMessages messages = am();
+    messages.fast_total_target_position_invalid = "invalid total target position";
+    json valid = {{"price_limit", 10}, {"account_ids", json::array({"A"})}, {"book_levels", 2}, {"target_percentage", 100},
+                  {"cycle_seconds", 30}};
+    for (const char* mode : {"E", "F"}) {
+        struct Accepted { json value; std::optional<long long> expected; };
+        for (const Accepted& item : {Accepted{0, 0}, Accepted{1000, 1000}, Accepted{1000.0, 1000}, Accepted{" 1000 ", 1000},
+                                     Accepted{nullptr, std::nullopt}, Accepted{"", std::nullopt}, Accepted{"  ", std::nullopt}}) {
+            CAPTURE(std::string(mode));
+            CAPTURE(item.value.dump());
+            json config = valid;
+            config["total_target_position"] = item.value;
+            auto v = validate_algo_start_inputs(mode, "AAPL", config, dir, messages);
+            REQUIRE(v.ok());
+            if (item.expected) CHECK((*v.command)["fast_trading_total_target_position"] == *item.expected);
+            else CHECK_FALSE(v.command->contains("fast_trading_total_target_position"));
+        }
+        const double two_pow_53 = 9007199254740992.0;
+        for (const json& invalid : {json(-1), json(1.5), json(true), json(false), json::array(), json::object(), json("bad"),
+                                    json("NaN"), json("Infinity"), json(two_pow_53)}) {
+            CAPTURE(std::string(mode));
+            CAPTURE(invalid.dump());
+            json config = valid;
+            config["total_target_position"] = invalid;
+            auto v = validate_algo_start_inputs(mode, "AAPL", config, dir, messages);
+            CHECK_FALSE(v.ok());
+            CHECK(v.error == "invalid total target position");
+        }
+    }
+    // The largest exactly representable share count is accepted.
+    json config = valid;
+    config["total_target_position"] = 9007199254740991LL;
+    CHECK(validate_algo_start_inputs("E", "AAPL", config, dir, messages).ok());
+    CHECK(parse_total_target_position(json("1e3")) == 1000);
+    CHECK_THROWS_WITH_AS(parse_total_target_position(json("1000.5")), kFastTotalTargetPositionError, std::invalid_argument);
+}
+
+TEST_CASE("fast settings accept every published choice and reject the rest") {
+    auto dir = accounts();
+    json valid = {{"price_limit", 10}, {"account_ids", json::array({"A"})}, {"book_levels", 2}, {"target_percentage", 100},
+                  {"cycle_seconds", 30}};
+    struct Field { const char* name; std::vector<json> invalid; const char* error; std::vector<int> choices; const char* command_key; };
+    for (const Field& field :
+         {Field{"book_levels", {0, 6, 1.5}, "levels", {1, 2, 3, 4, 5}, "fast_trading_book_levels"},
+          Field{"target_percentage", {0, 5, 25, 110, 130, 140, 151, 10.5, 120.5, 150.5}, "pct",
+                {10, 20, 30, 40, 50, 60, 70, 80, 90, 100, 120, 150}, "fast_trading_target_percentage"},
+          Field{"cycle_seconds", {0, 1, 20, 90, 5.5}, "cycle", {5, 10, 15, 30, 60}, "fast_trading_cycle_seconds"}}) {
+        json missing = valid;
+        missing.erase(field.name);
+        CHECK(validate_algo_start_inputs("E", "AAPL", missing, dir, am()).error == field.error);
+        for (const json& invalid : field.invalid) {
+            CAPTURE(std::string(field.name));
+            CAPTURE(invalid.dump());
+            json config = valid;
+            config[field.name] = invalid;
+            CHECK(validate_algo_start_inputs("E", "AAPL", config, dir, am()).error == field.error);
+        }
+        for (const char* mode : {"E", "F"}) {
+            for (int choice : field.choices) {
+                json config = valid;
+                config[field.name] = choice;
+                auto v = validate_algo_start_inputs(mode, "AAPL", config, dir, am());
+                REQUIRE(v.ok());
+                CHECK((*v.command)[field.command_key] == choice);
+            }
+        }
+    }
+    // Booleans are never numbers for these controls.
+    for (const char* name : {"price_limit", "book_levels", "target_percentage", "cycle_seconds"}) {
+        json config = valid;
+        config[name] = true;
+        CHECK_FALSE(validate_algo_start_inputs("E", "AAPL", config, dir, am()).ok());
+    }
+}
+
+// tests/test_admin_control.py: BrokerOrdersValidationTests.
+namespace {
+ng::AccountDirectory broker_metas() { return ngtest::directory({ngtest::meta("A", 2, "Tiger"), ngtest::meta("B", 1, "Other")}); }
+Validated validate_broker(const std::string& trading_date = "2026-11-01", std::vector<std::string> selected = {"A"},
+                          std::optional<ng::AccountDirectory> metas = std::nullopt) {
+    return validate_broker_orders_inputs(trading_date, selected, metas ? *metas : broker_metas(),
+                                         {"invalid date", "future date", "invalid account", "pick accounts"},
+                                         std::string("2026-11-09"));
+}
+}  // namespace
+
+TEST_CASE("broker orders contract deduplicates and orders the selected accounts") {
+    auto v = validate_broker("2026-11-01", {"A", "B", "A"});
+    REQUIRE(v.ok());
+    const json& command = *v.command;
+    std::set<std::string> keys;
+    for (auto it = command.begin(); it != command.end(); ++it) keys.insert(it.key());
+    CHECK(keys == std::set<std::string>{"type", "command_id", "ts", "trading_date", "timezone", "account_ids"});
+    CHECK(command["type"] == "GET_BROKER_ORDERS");
+    CHECK(command["account_ids"] == json::array({"B", "A"}));  // by numeric UI id
+    CHECK(command["trading_date"] == "2026-11-01");
+    CHECK(command["timezone"] == "America/New_York");
+    auto ts = ng::parse_iso8601(command["ts"].get<std::string>());
+    REQUIRE(ts);
+    CHECK(ts->has_offset);
+    std::string id = command["command_id"].get<std::string>();
+    CHECK(ng::starts_with(id, "broker_orders_"));
+    CHECK(id.size() == std::string("broker_orders_").size() + 32);
+    CHECK(validate_broker().command->at("command_id") != command["command_id"]);
+}
+
+TEST_CASE("broker orders all selection expands to configured accounts without a wildcard") {
+    for (const std::vector<std::string>& selected : {std::vector<std::string>{"__ALL__"}, std::vector<std::string>{"__ALL__", "A"}}) {
+        auto v = validate_broker("2026-11-01", selected);
+        REQUIRE(v.ok());
+        CHECK((*v.command)["account_ids"] == json::array({"B", "A"}));
+    }
+}
+
+TEST_CASE("broker orders reject invalid or future dates") {
+    for (const char* day : {"", "2026-02-29", "2026-11-31", "20261101", "2026-W45-1", "2026-1-1", "2026-11-01T00:00:00Z",
+                            " 2026-11-01", "2026-11-01 ", "0000-01-01", "2026-13-01", "2026-00-10", "2026-11-00"}) {
+        CAPTURE(std::string(day));
+        auto v = validate_broker(day);
+        CHECK_FALSE(v.ok());
+        CHECK(v.error == "invalid date");
+    }
+    auto future = validate_broker("2026-11-10");
+    CHECK_FALSE(future.ok());
+    CHECK(future.error == "future date");
+    CHECK(validate_broker("2024-02-29").ok());
+    CHECK(validate_broker("2026-11-09").ok());
+    CHECK(validate_broker("1999-12-31").ok());
+}
+
+TEST_CASE("broker orders with empty or unknown accounts never build a command") {
+    auto none = validate_broker("2026-11-01", {});
+    CHECK_FALSE(none.ok());
+    CHECK(none.error == "pick accounts");
+    auto empty_directory = validate_broker("2026-11-01", {"__ALL__"}, ng::AccountDirectory());
+    CHECK_FALSE(empty_directory.ok());
+    CHECK(empty_directory.error == "pick accounts");
+    for (const std::vector<std::string>& selected :
+         {std::vector<std::string>{"A", "unknown"}, std::vector<std::string>{"__ALL__", "unknown"}, std::vector<std::string>{""}}) {
+        auto v = validate_broker("2026-11-01", selected);
+        CHECK_FALSE(v.ok());
+        CHECK(v.error == "invalid account");
+    }
+}
+
+TEST_CASE("broker orders today follows the New York calendar") {
+    std::string today = broker_orders_today();
+    CHECK(today.size() == 10);
+    CHECK(today[4] == '-');
+    CHECK(today[7] == '-');
+    // Today is accepted, tomorrow is not (whatever the wall clock is).
+    CHECK(validate_broker_orders_inputs(today, {"A"}, broker_metas(), {"d", "f", "a", "p"}).ok());
+}
+
+TEST_CASE("algorithm account conflict message lists the accounts") {
+    CHECK(algo_account_conflict_error({"A"}) ==
+          "Account(s) A already belong to an algorithm session; stop it and await outstanding order confirmations before "
+          "starting another");
+    CHECK(algo_account_conflict_error({"B", "A"}).rfind("Account(s) B, A already belong", 0) == 0);
 }

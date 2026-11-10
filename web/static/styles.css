@@ -3,13 +3,13 @@
 @font-face {
   font-family: "KTrader CJK";
   src: url("/static/fonts/ktrader-cjk.woff2") format("woff2");
-  font-weight: 100 900;
+  font-weight: 400; /* one face: browsers synthesise bold for headings */
   font-display: block;
 }
 /* KTrader next-generation control center — design tokens and layout */
 :root {
   --font: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", "Noto Sans", "PingFang SC", "Microsoft YaHei", "Noto Sans CJK SC", "KTrader CJK", sans-serif;
-  --mono: ui-monospace, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
+  --mono: ui-monospace, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace, "PingFang SC", "Microsoft YaHei", "Noto Sans CJK SC", "KTrader CJK";
   --radius: 12px;
   --radius-sm: 8px;
   --gap: 14px;
@@ -175,9 +175,9 @@ input[type=text], input[type=number], input[type=password], input[type=datetime-
 }
 input:focus, select:focus, textarea:focus { border-color: var(--accent); box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 25%, transparent); }
 input:disabled, select:disabled, button:disabled { opacity: .5; cursor: not-allowed; }
-.help { font-size: 12px; color: var(--text-dim); }
-.warn { color: var(--red); font-size: 12.5px; font-weight: 600; min-height: 1em; }
-.ok-msg { color: var(--green); font-size: 12.5px; font-weight: 600; }
+.help { font-size: 12px; color: var(--text-dim); overflow-wrap: anywhere; }
+.warn { color: var(--red); font-size: 12.5px; font-weight: 600; min-height: 1em; overflow-wrap: anywhere; }
+.ok-msg { color: var(--green); font-size: 12.5px; font-weight: 600; overflow-wrap: anywhere; }
 .btn { display: inline-flex; align-items: center; justify-content: center; gap: 6px; padding: 8px 14px; border-radius: 10px; border: 1px solid transparent; font-weight: 700; cursor: pointer; width: fit-content; color: #fff; background: var(--blue); transition: filter .1s, transform .05s; }
 .btn:hover { filter: brightness(1.08); }
 .btn:active { transform: translateY(1px); }
@@ -270,10 +270,12 @@ details > summary { cursor: pointer; color: var(--text-dim); font-weight: 700; f
 .kbd-hint { color: var(--text-faint); font-size: 12px; }
 
 /* ---- responsive ------------------------------------------------------------- */
-@media (max-width: 1699px) {
+/* Six page tabs plus the feed pills need about 1,640 px on one row (measured in English with
+   lmh's full tab set); the feed states need another 100 px. */
+@media (max-width: 1799px) {
   .feed-pill .state { display: none; }
 }
-@media (max-width: 1399px) {
+@media (max-width: 1639px) {
   .topbar { grid-template-columns: auto minmax(0,1fr); grid-template-areas: "brand right" "tabs tabs"; gap: 8px 12px; padding: 8px 12px; }
   .topbar .tabs { margin: 0 -12px; padding: 0 12px; }
 }

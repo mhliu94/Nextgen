@@ -34,10 +34,11 @@
     "trading_commands_topic": "trading-commands",
     "market_data_topic": "price-books",
     "stock_quotes_topic": "stock-quotes",
+    "market_data_replay_records": 100,
     "group_id": "account-dashboard",
     "market_data_group_id": "market-data-dashboard",
     "auto_offset_reset": "latest",
-    "market_data_auto_offset_reset": "earliest",
+    "market_data_auto_offset_reset": "latest",
     "poll_timeout_sec": 1.0,
     "producer": {
       "acks": "all",
@@ -46,7 +47,6 @@
     }
   },
   "market_data": {
-    "historical_prices_csv": "./historical_prices.csv",
     "market_insights_max_levels": 20
   },
   "smart_selling": {
@@ -58,17 +58,37 @@
     "trade_max_age": 15,
     "account_max_age": 60,
     "participation_percentages": {
-      "patient": "3",
-      "normal": "6",
-      "urgent": "10"
+      "patient": "6",
+      "normal": "12",
+      "urgent": "20",
+      "ultra": "30"
     },
     "instrument_defaults": {
       "tick_size": "0.01",
       "quantity_step": "1",
-      "min_quantity": "1",
+      "min_quantity": "100",
       "min_notional": "0"
     },
     "instruments": {}
+  },
+  "smart_buying": {
+    "enabled": true,
+    "state_db": "../logs/smart_buying.sqlite3",
+    "order_status_topic": "order-status",
+    "trading_volume_topic": "trading-volume",
+    "quote_max_age": 10,
+    "trade_max_age": 15,
+    "account_max_age": 60,
+    "instrument_defaults": {
+      "tick_size": "0.01",
+      "quantity_step": "1",
+      "min_quantity": "100",
+      "min_notional": "0"
+    },
+    "instruments": {}
+  },
+  "reporting": {
+    "db_path": "../reports/activity.sqlite3"
   },
   "fast_trading": {
     "aggression_levels": {
@@ -110,6 +130,19 @@
         "sqlite"
       ],
       "timezone": "America/New_York"
+    }
+  },
+  "order_ui": {
+    "timezone": "America/New_York",
+    "refresh_interval_seconds": 2,
+    "server": {
+      "host": "0.0.0.0",
+      "port": 8030
+    },
+    "kafka": {
+      "topic": "order-status",
+      "group_id": "order-dashboard",
+      "poll_timeout_sec": 1.0
     }
   }
 }

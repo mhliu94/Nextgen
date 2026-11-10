@@ -39,10 +39,18 @@ struct TradingStatusMessages {
     std::string invalid_account, invalid_status;
 };
 
+inline constexpr const char* kFastTotalTargetPositionError = "Enter a whole number of shares (0 or more), or leave blank.";
+inline constexpr const char* kBrokerOrdersTimezone = "America/New_York";
+
 struct AlgoMessages {
     std::string invalid_mode, invalid_symbol, invalid_account, fast_config_required, fast_price_limit_positive,
         fast_accounts_required, fast_account_duplicate, fast_book_levels_invalid, fast_target_percentage_invalid,
         fast_cycle_seconds_invalid;
+    std::string fast_total_target_position_invalid = kFastTotalTargetPositionError;
+};
+
+struct BrokerOrdersMessages {
+    std::string invalid_date, future_date, invalid_account, accounts_required;
 };
 
 std::string iso_utc_now();
@@ -65,8 +73,22 @@ json build_currency_conversion_command(const std::string& account_id, const std:
 json build_trading_status_command(const std::string& account_id, bool trading_enabled, const AccountDirectory& accounts);
 json build_algo_start_command(const std::string& trading_mode, const std::string& symbol, double price_limit,
                               const std::vector<std::string>& account_ids, int book_levels, int target_percentage,
-                              int cycle_seconds, bool test_mode);
+                              int cycle_seconds, bool test_mode,
+                              std::optional<long long> total_target_position = std::nullopt);
 json build_algo_stop_command(const std::optional<std::string>& reason);
+// "Account(s) A, B already belong to an algorithm session; stop it and await outstanding order
+// confirmations before starting another": each account participates in at most one session (E, F, G or H).
+std::string algo_account_conflict_error(const std::vector<std::string>& account_ids);
+// Optional fast-trading position target: nullopt when absent/blank, else a whole number of shares in
+// [0, 2^53-1]. Throws std::invalid_argument(kFastTotalTargetPositionError) for anything else.
+std::optional<long long> parse_total_target_position(const json& value);
+// Today's calendar date ("YYYY-MM-DD") in America/New_York.
+std::string broker_orders_today();
+// One read-only, multi-account GET_BROKER_ORDERS request; the UI-only "__ALL__" selection expands to
+// every configured account. `today` overrides the New York date in tests.
+Validated validate_broker_orders_inputs(const std::string& trading_date_raw, const std::vector<std::string>& account_ids,
+                                        const AccountDirectory& accounts, const BrokerOrdersMessages& m,
+                                        const std::optional<std::string>& today = std::nullopt);
 
 // Validators (raw form/JSON text inputs). `*_raw` strings may be empty/absent.
 Validated validate_order_inputs(const std::string& account_id, const std::string& symbol, const std::string& side,
@@ -97,6 +119,7 @@ struct FastTradingSettings {
     int target_percentage = 0;
     int cycle_seconds = 0;
     bool test_mode = false;
+    std::optional<long long> total_target_position;
 };
 
 // `fast_trading_config_raw` is a JSON string (from a form) or a JSON object/other value (from the API);
@@ -115,6 +138,7 @@ std::optional<double> safe_float(const std::optional<std::string>& raw);
 std::optional<long long> safe_int(const std::optional<std::string>& raw);
 
 inline constexpr int kFastBookLevelChoices[] = {1, 2, 3, 4, 5};
+inline constexpr int kFastTargetPercentageChoices[] = {10, 20, 30, 40, 50, 60, 70, 80, 90, 100, 120, 150};
 inline constexpr int kFastCycleSecondsChoices[] = {5, 10, 15, 30, 60};
 
 }  // namespace ng::orders

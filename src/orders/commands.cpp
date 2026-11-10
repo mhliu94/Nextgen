@@ -1,10 +1,12 @@
 #include "orders/commands.h"
 
+#include <algorithm>
 #include <cmath>
 #include <set>
 
 #include "core/strings.h"
 #include "core/time_util.h"
+#include "core/time_zone.h"
 
 namespace ng::orders {
 
@@ -42,15 +44,9 @@ std::optional<double> safe_float(const std::optional<std::string>& raw) {
     if (!raw) return std::nullopt;
     std::string s = trim(*raw);
     if (s.empty()) return std::nullopt;
-    std::string lowered = to_lower(s);
-    if (lowered == "nan" || lowered == "inf" || lowered == "-inf" || lowered == "+inf" || lowered == "infinity" ||
-        lowered == "-infinity" || lowered == "+infinity") {
-        throw std::invalid_argument("number must be finite");
-    }
-    char* end = nullptr;
-    double value = std::strtod(s.c_str(), &end);
-    if (end == s.c_str() || *end != '\0') throw std::invalid_argument("invalid number");
-    if (!std::isfinite(value)) throw std::invalid_argument("number must be finite");
+    std::optional<double> value = python_float(s);
+    if (!value) throw std::invalid_argument("invalid number");
+    if (!std::isfinite(*value)) throw std::invalid_argument("number must be finite");
     return value;
 }
 
@@ -134,7 +130,7 @@ json build_trading_status_command(const std::string& account_id, bool trading_en
 
 json build_algo_start_command(const std::string& trading_mode, const std::string& symbol, double price_limit,
                               const std::vector<std::string>& account_ids, int book_levels, int target_percentage,
-                              int cycle_seconds, bool test_mode) {
+                              int cycle_seconds, bool test_mode, std::optional<long long> total_target_position) {
     if (trading_mode != "E" && trading_mode != "F") throw std::invalid_argument("Algorithmic trading mode must be E or F.");
     json cmd;
     cmd["type"] = "START_ALGO_TRADING";
@@ -148,7 +144,57 @@ json build_algo_start_command(const std::string& trading_mode, const std::string
     cmd["fast_trading_target_percentage"] = target_percentage;
     cmd["fast_trading_cycle_seconds"] = cycle_seconds;
     cmd["fast_trading_test_mode"] = test_mode;
+    if (total_target_position) cmd["fast_trading_total_target_position"] = *total_target_position;
     return cmd;
+}
+
+std::string algo_account_conflict_error(const std::vector<std::string>& account_ids) {
+    return "Account(s) " + join(account_ids, ", ") +
+           " already belong to an algorithm session; stop it and await outstanding order confirmations before starting another";
+}
+
+std::string broker_orders_today() {
+    return TimeZone::find(kBrokerOrdersTimezone)->date(wall_now());
+}
+
+Validated validate_broker_orders_inputs(const std::string& trading_date_raw, const std::vector<std::string>& account_ids,
+                                        const AccountDirectory& accounts, const BrokerOrdersMessages& m,
+                                        const std::optional<std::string>& today) {
+    // Strict YYYY-MM-DD: date.fromisoformat() accepts more spellings, which are then rejected by the
+    // isoformat() round-trip check.
+    int year = 0, month = 0, day = 0;
+    bool shaped = trading_date_raw.size() == 10 && trading_date_raw[4] == '-' && trading_date_raw[7] == '-';
+    for (std::size_t i = 0; shaped && i < trading_date_raw.size(); ++i) {
+        if (i != 4 && i != 7 && !std::isdigit(static_cast<unsigned char>(trading_date_raw[i]))) shaped = false;
+    }
+    if (!shaped || !parse_civil_date(trading_date_raw, year, month, day) || year < 1) return {std::nullopt, m.invalid_date};
+    if (trading_date_raw > today.value_or(broker_orders_today())) return {std::nullopt, m.future_date};
+    if (account_ids.empty()) return {std::nullopt, m.accounts_required};
+    bool all = false;
+    for (const auto& id : account_ids) {
+        if (id == "__ALL__") all = true;
+        else if (!accounts.contains(id)) return {std::nullopt, m.invalid_account};
+    }
+    std::set<std::string> selected;
+    if (all) {
+        for (const auto& meta : accounts.ordered()) selected.insert(meta.id);
+    } else {
+        selected.insert(account_ids.begin(), account_ids.end());
+    }
+    if (selected.empty()) return {std::nullopt, m.accounts_required};
+    std::vector<std::string> ordered(selected.begin(), selected.end());
+    std::stable_sort(ordered.begin(), ordered.end(), [&](const std::string& a, const std::string& b) {
+        int na = accounts.find(a)->num_id, nb = accounts.find(b)->num_id;
+        return na != nb ? na < nb : a < b;
+    });
+    json cmd;
+    cmd["type"] = "GET_BROKER_ORDERS";
+    cmd["command_id"] = "broker_orders_" + uuid4_hex();
+    cmd["ts"] = iso_utc_now();
+    cmd["trading_date"] = trading_date_raw;
+    cmd["timezone"] = kBrokerOrdersTimezone;
+    cmd["account_ids"] = ordered;
+    return {cmd, ""};
 }
 
 json build_algo_stop_command(const std::optional<std::string>& reason) {
@@ -308,11 +354,11 @@ std::variant<json, std::string> decode_fast_config(const json& raw, const std::s
     return raw;
 }
 
-std::optional<double> payload_float(const json& payload, const char* key) {
-    const json* v = json_find(payload, key);
+// safe_float(payload.get(key)): float(str(value)) for present values. Booleans stringify to
+// "True"/"False" and containers to their repr, neither of which float() accepts.
+std::optional<double> value_float(const json* v) {
     if (!v || v->is_null()) return std::nullopt;
-    if (v->is_boolean()) return v->get<bool>() ? 1.0 : 0.0;
-    if (v->is_number()) {
+    if (v->is_number() && !v->is_boolean()) {
         double d = v->get<double>();
         if (!std::isfinite(d)) throw std::invalid_argument("number must be finite");
         return d;
@@ -321,7 +367,23 @@ std::optional<double> payload_float(const json& payload, const char* key) {
     throw std::invalid_argument("invalid number");
 }
 
+std::optional<double> payload_float(const json& payload, const char* key) { return value_float(json_find(payload, key)); }
+
 }  // namespace
+
+std::optional<long long> parse_total_target_position(const json& value) {
+    std::optional<double> parsed;
+    try {
+        parsed = value_float(value.is_null() ? nullptr : &value);
+    } catch (const std::exception&) {
+        throw std::invalid_argument(kFastTotalTargetPositionError);
+    }
+    if (!parsed) return std::nullopt;
+    if (*parsed < 0 || std::floor(*parsed) != *parsed || *parsed > 9007199254740991.0) {
+        throw std::invalid_argument(kFastTotalTargetPositionError);
+    }
+    return static_cast<long long>(*parsed);
+}
 
 std::variant<FastTradingSettings, std::string> parse_fast_trading_settings(const json& raw,
                                                                             const AccountDirectory& accounts,
@@ -359,8 +421,7 @@ std::variant<FastTradingSettings, std::string> parse_fast_trading_settings(const
         const std::string* error;
         int* target;
     };
-    std::vector<int> pct_choices;
-    for (int p = 10; p <= 100; p += 10) pct_choices.push_back(p);
+    std::vector<int> pct_choices(std::begin(kFastTargetPercentageChoices), std::end(kFastTargetPercentageChoices));
     Choice fields[] = {
         {"book_levels", {1, 2, 3, 4, 5}, &m.fast_book_levels_invalid, &settings.book_levels},
         {"target_percentage", pct_choices, &m.fast_target_percentage_invalid, &settings.target_percentage},
@@ -385,6 +446,12 @@ std::variant<FastTradingSettings, std::string> parse_fast_trading_settings(const
         }
         if (!matched) return *field.error;
     }
+    try {
+        const json* target = json_find(payload, "total_target_position");
+        settings.total_target_position = parse_total_target_position(target ? *target : json(nullptr));
+    } catch (const std::invalid_argument&) {
+        return m.fast_total_target_position_invalid;
+    }
     settings.test_mode = json_truthy(json_find(payload, "test_mode"));
     return settings;
 }
@@ -399,7 +466,7 @@ Validated validate_algo_start_inputs(const std::string& trading_mode, const std:
     if (auto* err = std::get_if<std::string>(&parsed)) return {std::nullopt, *err};
     const auto& s = std::get<FastTradingSettings>(parsed);
     return {build_algo_start_command(trading_mode, sym, s.price_limit, s.account_ids, s.book_levels, s.target_percentage,
-                                     s.cycle_seconds, s.test_mode),
+                                     s.cycle_seconds, s.test_mode, s.total_target_position),
             ""};
 }
 
@@ -413,6 +480,7 @@ json extract_fast_trading_config(const json& body) {
         {"book_levels", {"fast_trading_book_levels", "book_levels"}},
         {"target_percentage", {"fast_trading_target_percentage", "target_percentage"}},
         {"cycle_seconds", {"fast_trading_cycle_seconds", "cycle_seconds"}},
+        {"total_target_position", {"fast_trading_total_target_position", "total_target_position"}},
         {"test_mode", {"fast_trading_test_mode", "test_mode"}},
     };
     bool found_alias = false;

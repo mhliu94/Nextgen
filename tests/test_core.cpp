@@ -114,8 +114,27 @@ TEST_CASE("json helpers mirror python conversions") {
     CHECK_FALSE(ng::json_finite_double(ng::json_find(doc, "f")));
     CHECK_FALSE(ng::json_to_int(ng::json_find(doc, "e")));
     CHECK(ng::json_to_string(ng::json_find(doc, "c")) == "True");
-    CHECK(ng::json_truthy(ng::json_find(doc, "g")));
+    // _truthy_bool(): booleans and numbers by value, strings only when they spell a truthy word; a
+    // list never does (str(list) is not one of them), unlike Python's plain bool().
+    CHECK_FALSE(ng::json_truthy(ng::json_find(doc, "g")));
+    CHECK(ng::json_python_truthy(ng::json_find(doc, "g")));
     CHECK_FALSE(ng::json_truthy(ng::json_find(doc, "d")));
+    CHECK(ng::json_truthy(ng::json_find(doc, "c")));
+    CHECK(ng::json_truthy(ng::json_find(doc, "b")));
+    CHECK_FALSE(ng::json_truthy(ng::json_find(doc, "a")));  // "12" is not a truthy word
+    CHECK(ng::json_python_truthy(ng::json_find(doc, "a")));
+    for (const char* word : {"1", "true", " YES ", "on", "y"}) {
+        ng::json value = word;
+        CHECK(ng::json_truthy(&value));
+    }
+    for (const char* word : {"", "0", "false", "no", "off", "n", "2"}) {
+        ng::json value = word;
+        CHECK_FALSE(ng::json_truthy(&value));
+    }
+    CHECK(ng::python_strip("\t \xC2\xA0 name \xE3\x80\x80\n") == "name");
+    CHECK(ng::python_strip("  ") == "");
+    CHECK(ng::contains_python_whitespace("A\xE2\x80\xA8" "B"));
+    CHECK_FALSE(ng::contains_python_whitespace("AB\xE8\xB4\xAD"));
     CHECK(ng::json_parse_bool(ng::json_find(doc, "a")) == false);
     ng::json on = "on";
     CHECK(ng::json_parse_bool(&on));
@@ -137,4 +156,102 @@ TEST_CASE("i18n tables stay in sync") {
     CHECK(ng::i18n::resolve_lang("", "zh") == "zh");
     CHECK(ng::i18n::resolve_lang("xx", "yy") == "en");
     CHECK(ng::i18n::format_named(ng::i18n::t("en", "fast_account_duplicate"), {{"account", "A"}}) == "Account A was selected more than once.");
+}
+
+// ---------------------------------------------------------------------------
+// Python-compatibility vectors (tools/vectors/gen_core_vectors.py)
+// ---------------------------------------------------------------------------
+#include <cmath>
+#include <cstring>
+
+namespace {
+#include "fixtures/core_vectors.inc"
+}  // namespace
+
+TEST_CASE("python float repr matches CPython") {
+    for (const auto& v : kFloatRepr) {
+        CAPTURE(v.repr);
+        CHECK(ng::python_float_repr(v.value) == v.repr);
+    }
+    CHECK(ng::python_float_repr(std::nan("")) == "nan");
+    CHECK(ng::python_float_repr(INFINITY) == "inf");
+    CHECK(ng::python_float_repr(-INFINITY) == "-inf");
+    CHECK(Decimal::from_python_float(100.0).str() == "100.0");
+    CHECK(Decimal::from_python_float(0.5).str() == "0.5");
+    CHECK(Decimal::from_double(100.0).str() == "100");
+}
+
+TEST_CASE("python float parsing matches CPython") {
+    for (const auto& v : kFloatParse) {
+        CAPTURE(v.text);
+        auto parsed = ng::python_float(v.text);
+        CHECK(parsed.has_value() == v.ok);
+        if (parsed && v.ok) {
+            if (std::isnan(v.value)) CHECK(std::isnan(*parsed));
+            else CHECK(*parsed == v.value);
+        }
+    }
+}
+
+TEST_CASE("decimal division matches the Python context") {
+    for (const auto& v : kDecimalDiv) {
+        CAPTURE(v.a);
+        CAPTURE(v.b);
+        CHECK(Decimal::python_div(Decimal::parse(v.a), Decimal::parse(v.b)).str() == v.quotient);
+    }
+    CHECK_THROWS_AS(Decimal::python_div(Decimal(1), Decimal::zero()), ng::DecimalError);
+}
+
+TEST_CASE("decimal context rounding matches Python") {
+    for (const auto& v : kDecimalRound) {
+        CAPTURE(v.value);
+        CAPTURE(v.precision);
+        CHECK(Decimal::parse(v.value).round_significant(v.precision).str() == v.rounded);
+    }
+}
+
+TEST_CASE("ISO timestamps parse to the same epoch as datetime.timestamp()") {
+    for (const auto& v : kIsoTimestamps) {
+        CAPTURE(v.text);
+        auto parsed = ng::parse_iso8601(v.text);
+        CHECK(parsed.has_value() == v.ok);
+        if (parsed && v.ok) {
+            CHECK(parsed->has_offset == v.has_offset);
+            CHECK(parsed->epoch_seconds == v.epoch);  // bit-exact
+        }
+    }
+    CHECK(ng::iso_utc_offset(1792785598.0) == "2026-10-23T19:59:58+00:00");
+    CHECK(ng::iso_utc_offset(1792785598.5) == "2026-10-23T19:59:58.500000+00:00");
+}
+
+TEST_CASE("uuid4 hex") {
+    std::string a = ng::uuid4_hex(), b = ng::uuid4_hex();
+    CHECK(a.size() == 32);
+    CHECK(a != b);
+    CHECK(a[12] == '4');
+    CHECK(std::strchr("89ab", a[16]) != nullptr);
+    for (char c : a) CHECK(std::strchr("0123456789abcdef", c) != nullptr);
+}
+
+TEST_CASE("step rounding keeps Python's digits") {
+    for (const auto& v : kStepRounding) {
+        CAPTURE(v.value);
+        CAPTURE(v.step);
+        CHECK(Decimal::parse(v.value).round_down_to_step(Decimal::parse(v.step)).str() == v.down);
+        CHECK(Decimal::parse(v.value).round_up_to_step(Decimal::parse(v.step)).str() == v.up);
+    }
+}
+
+TEST_CASE("iso timestamps reject impossible calendar values like datetime.fromisoformat") {
+    for (const char* invalid : {"2026-02-30T09:30:00Z", "2026-02-29T00:00:00Z", "2026-04-31", "2026-13-01", "2026-00-10", "2026-11-00",
+                                "0000-01-01T00:00:00Z", "2026-11-09T24:00:00Z", "2026-11-09T23:60:00Z", "2026-11-09T23:59:60Z",
+                                "2026-11-09T23:59:59+24:00", "2026-11-09T23:59", "2026-11-09T23:59:59.Z"}) {
+        CAPTURE(std::string(invalid));
+        bool rejected = !ng::parse_iso8601(invalid).has_value() || std::string(invalid) == "2026-11-09T23:59";
+        CHECK(rejected);
+    }
+    CHECK(ng::parse_iso8601("2024-02-29T23:59:59Z"));
+    CHECK(ng::parse_iso8601("2000-02-29T00:00:00+00:00"));
+    CHECK_FALSE(ng::parse_iso8601("1900-02-29T00:00:00Z"));
+    CHECK(ng::parse_iso8601("2026-12-31T23:59:59.999999-05:00"));
 }

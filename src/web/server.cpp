@@ -448,6 +448,7 @@ void Server::start() {
         m.fast_book_levels_invalid = i18n::t(lang, "fast_book_levels_invalid");
         m.fast_target_percentage_invalid = i18n::t(lang, "fast_target_percentage_invalid");
         m.fast_cycle_seconds_invalid = i18n::t(lang, "fast_cycle_seconds_invalid");
+        m.fast_total_target_position_invalid = i18n::t(lang, "fast_total_target_position_invalid");
         return m;
     };
 
@@ -540,15 +541,27 @@ void Server::start() {
         }
         return Outcome{true, i18n::t(lang, "cancel_orders_submitted") + " " + std::to_string(published) + ". " + i18n::t(lang, "published_cmd") + "=" + first_id};
     };
-    auto do_fx = [=, this](const RequestInput& in, const std::string& lang, const std::string& user) -> Outcome {
-        if (!control_.config().is_privileged(user)) return fail(i18n::t(lang, "conversion_forbidden"), 403);
-        orders::FxMessages m{i18n::t(lang, "invalid_account"), i18n::t(lang, "invalid_currency_pair"), i18n::t(lang, "same_currency"),
-                             i18n::t(lang, "conversion_amount_positive")};
-        orders::Validated v = orders::validate_currency_conversion_inputs(in.str_or("account_id", ""), in.str("source_currency"), in.str("target_currency"),
-                                                                          in.str("source_amount"), control_.accounts(), m);
+    // Admin Control: one read-only, multi-account request for a day's broker orders. Only the lmh
+    // account may use it; the request can be queued while algorithms own an account.
+    auto do_broker_orders = [=, this](const RequestInput& in, const std::string& lang, const std::string& user) -> Outcome {
+        if (!control_.config().can_access_admin_control(user)) return fail(i18n::t(lang, "admin_control_forbidden"), 403);
+        orders::BrokerOrdersMessages m{i18n::t(lang, "broker_orders_invalid_date"), i18n::t(lang, "broker_orders_future_date"),
+                                       i18n::t(lang, "invalid_account"), i18n::t(lang, "quick_pick_account")};
+        orders::Validated v = orders::validate_broker_orders_inputs(in.str_or("trading_date", ""), in.list("account_ids"), control_.accounts(), m);
         if (!v.ok()) return fail(v.error);
-        control_.publish_control_command(*v.command, v.command->value("account_id", std::string("CURRENCY_CONVERSION")));
-        return Outcome{true, i18n::t(lang, "conversion_submitted") + " " + i18n::t(lang, "published_cmd") + "=" + v.command->at("command_id").get<std::string>()};
+        try {
+            if (!control_.command_sink()) throw std::runtime_error("Trading command producer unavailable");
+            control_.publish_control_command(*v.command, "GET_BROKER_ORDERS");
+        } catch (const std::exception& e) {
+            NG_LOG_ERROR(kLog, "Failed to queue broker order history request: {}", e.what());
+            return fail(i18n::t(lang, "broker_orders_publish_failed"), 503);
+        }
+        std::string ok = i18n::format_named(i18n::t(lang, "broker_orders_queued"),
+                                            {{"date", v.command->at("trading_date").get<std::string>()},
+                                             {"count", std::to_string(v.command->at("account_ids").size())}});
+        Outcome out{true, ok + " " + i18n::t(lang, "published_cmd") + "=" + v.command->at("command_id").get<std::string>()};
+        out.extra["command"] = *v.command;
+        return out;
     };
     auto do_trading_status = [=, this](const RequestInput& in, const std::string& lang, const std::string& user) -> Outcome {
         if (!control_.config().is_privileged(user)) return fail(i18n::t(lang, "trading_status_forbidden"), 403);
@@ -588,6 +601,10 @@ void Server::start() {
             ok += lang == "zh" ? " 已请求停止 " + std::to_string(result.smart_stopped) + " 个智能卖出任务，等待订单终态确认。"
                                : " Stop requested for " + std::to_string(result.smart_stopped) + " Smart selling parent(s); awaiting final order confirmations.";
         }
+        if (result.buying_stopped) {
+            ok += lang == "zh" ? " 已请求停止 " + std::to_string(result.buying_stopped) + " 个智能买入任务，等待订单终态确认。"
+                               : " Stop requested for " + std::to_string(result.buying_stopped) + " Smart buying parent(s); awaiting final order confirmations.";
+        }
         Outcome out{true, ok};
         if (result.notification_published) {
             out.message += " " + i18n::t(lang, "published_cmd") + "=" + result.notification.at("command_id").get<std::string>();
@@ -596,6 +613,7 @@ void Server::start() {
         }
         out.extra["fast_stopped"] = result.fast_stopped;
         out.extra["smart_stopped"] = result.smart_stopped;
+        out.extra["buying_stopped"] = result.buying_stopped;
         return out;
     };
 
@@ -647,10 +665,31 @@ void Server::start() {
 
     // --- static & pages ----------------------------------------------------------------------
     svr.Get("/", [=, this](const Request&, Response& res) { redirect(res, "/account-details", 302); });
-    for (const char* page : {"/account-details", "/control-panel", "/market-data", "/market-insights", "/currency-conversion",
-                             "/trading-status", "/login"}) {
+    for (const char* page : {"/account-details", "/control-panel", "/market-insights", "/trading-status", "/login"}) {
         svr.Get(page, [serve_app](const Request&, Response& res) { serve_app(res); });
     }
+    // Admin Control and Market Data are only available to the lmh account: other signed-in users get
+    // HTTP 403, anonymous visitors get the app (which shows the sign-in form).
+    auto restricted_page = [=, this](const Request& req, Response& res, bool allowed, const char* message_key) {
+        auto user = current_user(req);
+        if (user && !allowed) {
+            res.status = 403;
+            res.set_header("Cache-Control", "no-store");
+            res.set_content(i18n::t(lang_of(req), message_key), "text/plain; charset=utf-8");
+            return;
+        }
+        serve_app(res);
+    };
+    svr.Get("/admin-control", [=, this](const Request& req, Response& res) {
+        auto user = current_user(req);
+        restricted_page(req, res, user && control_.config().can_access_admin_control(*user), "admin_control_forbidden");
+    });
+    svr.Get("/market-data", [=, this](const Request& req, Response& res) {
+        auto user = current_user(req);
+        restricted_page(req, res, user && control_.config().can_access_market_data(*user), "md_forbidden");
+    });
+    // The former Currency Conversion tab was replaced by Admin Control; its page and submission
+    // routes no longer exist (404).
     svr.Get("/favicon.svg", [serve_asset](const Request&, Response& res) { serve_asset("favicon.svg", res, false); });
     svr.Get("/favicon.ico", [serve_asset](const Request&, Response& res) { serve_asset("favicon.svg", res, false); });
     svr.Get(R"(/static/(.+))", [serve_asset](const Request& req, Response& res) {
@@ -708,6 +747,8 @@ void Server::start() {
         if (user) {
             out["user"] = *user;
             out["privileged"] = control_.config().is_privileged(*user);
+            out["can_access_admin_control"] = control_.config().can_access_admin_control(*user);
+            out["can_access_market_data"] = control_.config().can_access_market_data(*user);
         }
         json_response(res, out, user ? 200 : 401);
     });
@@ -731,12 +772,34 @@ void Server::start() {
         if (!require_api_user(req, res)) return;
         text_response(res, control_.accounts_view_text(lang_of(req)));
     });
+    // Five-minute market and own-volume windows for one publisher symbol (lmh only, never cached).
     svr.Get("/api/market-data", [=, this](const Request& req, Response& res) {
+        auto user = require_api_user(req, res);
+        if (!user) return;
+        std::string lang = lang_of(req);
+        if (!control_.config().can_access_market_data(*user)) {
+            api_error(res, i18n::t(lang, "md_forbidden"), 403);
+            return;
+        }
+        std::vector<std::string> symbols = control_.config().market_data_symbols();
+        std::string symbol = to_upper(trim(req.has_param("symbol") ? req.get_param_value("symbol") : (symbols.empty() ? "" : symbols.front())));
+        if (symbol.empty() || std::find(symbols.begin(), symbols.end(), symbol) == symbols.end()) {
+            api_error(res, i18n::t(lang, "invalid_symbol"), 400);
+            return;
+        }
+        if (!control_.market_activity() || !control_.market_order_store()) {
+            api_error(res, i18n::t(lang, "md_unavailable"), 503);
+            return;
+        }
+        json_response(res, control_.market_activity_payload(symbol));
+    });
+    // Live last-trade quotes with previous close and daily volume for trading forms and price lookups.
+    svr.Get("/api/quotes", [=, this](const Request& req, Response& res) {
         if (!require_api_user(req, res)) return;
         std::optional<std::string> symbol;
         if (req.has_param("symbol")) symbol = req.get_param_value("symbol");
-        if (symbol) json_response(res, control_.market_payload(symbol));
-        else text_response(res, control_.market_payload_text());
+        if (symbol && !trim(*symbol).empty()) json_response(res, control_.quotes_payload(symbol));
+        else text_response(res, control_.quotes_payload_text());
     });
     svr.Get("/api/market-insights", [=, this](const Request& req, Response& res) {
         if (!require_api_user(req, res)) return;
@@ -823,12 +886,12 @@ void Server::start() {
         std::string lang = lang_of(req);
         guarded(res, [=, this] { return do_cancel(in, lang); });
     });
-    svr.Post("/api/fx", [=, this](const Request& req, Response& res) {
+    svr.Post("/api/broker-orders", [=, this](const Request& req, Response& res) {
         auto user = require_api_user(req, res);
         if (!user) return;
         RequestInput in(req);
         std::string lang = lang_of(req);
-        guarded(res, [=, this] { return do_fx(in, lang, *user); });
+        guarded(res, [=, this] { return do_broker_orders(in, lang, *user); });
     });
     svr.Post("/api/trading-status", [=, this](const Request& req, Response& res) {
         auto user = require_api_user(req, res);
@@ -974,6 +1037,64 @@ void Server::start() {
         }
     });
 
+    svr.Get("/api/smart-buying", [=, this](const Request& req, Response& res) {
+        if (!require_api_user(req, res)) return;
+        text_response(res, control_.smart_buying_status_text());
+    });
+    svr.Get(R"(/api/smart-buying/([^/]+)/events)", [=, this](const Request& req, Response& res) {
+        if (!require_api_user(req, res)) return;
+        if (!control_.buying_runtime()) {
+            api_error(res, "Smart buying is unavailable", 503);
+            return;
+        }
+        int limit = 100;
+        if (req.has_param("limit")) {
+            try { limit = std::stoi(req.get_param_value("limit")); } catch (...) {}
+        }
+        try {
+            json out{{"ok", true}};
+            out["events"] = control_.buying_runtime()->engine().events(req.matches[1], limit);
+            json_response(res, out);
+        } catch (const std::exception& e) {
+            api_error(res, e.what(), 500);
+        }
+    });
+    svr.Post("/api/smart-buying", [=, this](const Request& req, Response& res) {
+        if (!require_api_user(req, res)) return;
+        if (!control_.buying_runtime()) {
+            api_error(res, "Smart buying is unavailable", 503);
+            return;
+        }
+        RequestInput in(req);
+        try {
+            json payload = in.has_json() ? in.body() : json::parse(req.body);
+            json parent = control_.start_smart_buying_parent(payload);
+            json_response(res, json{{"ok", true}, {"parent", parent}});
+        } catch (const std::invalid_argument& e) {
+            api_error(res, e.what(), 400);
+        } catch (const json::exception& e) {
+            api_error(res, e.what(), 400);
+        } catch (const DecimalError& e) {
+            api_error(res, e.what(), 400);
+        } catch (const std::exception& e) {
+            api_error(res, e.what(), 500);
+        }
+    });
+    svr.Post(R"(/api/smart-buying/([^/]+)/stop)", [=, this](const Request& req, Response& res) {
+        if (!require_api_user(req, res)) return;
+        if (!control_.buying_runtime()) {
+            api_error(res, "Smart buying is unavailable", 503);
+            return;
+        }
+        try {
+            json_response(res, json{{"ok", true}, {"parent", control_.stop_smart_buying_parent(req.matches[1])}});
+        } catch (const smart::KeyError&) {
+            api_error(res, "Unknown Smart buying parent", 404);
+        } catch (const std::exception& e) {
+            api_error(res, e.what(), 500);
+        }
+    });
+
     // --- legacy form endpoints (redirect flow) ------------------------------------------------
     svr.Post("/submit-order", [=, this](const Request& req, Response& res) {
         RequestInput in(req);
@@ -995,11 +1116,17 @@ void Server::start() {
         std::string lang = lang_of(req);
         legacy(req, res, "/control-panel", [=, this] { return do_cancel(in, lang); });
     });
-    svr.Post("/submit-currency-conversion", [=, this](const Request& req, Response& res) {
+    svr.Post("/submit-broker-orders", [=, this](const Request& req, Response& res) {
         RequestInput in(req);
         std::string lang = lang_of(req);
         auto user = current_user(req);
-        legacy(req, res, "/currency-conversion", [=, this] { return do_fx(in, lang, user.value_or("")); });
+        if (user && !control_.config().can_access_admin_control(*user)) {
+            res.status = 403;
+            res.set_header("Cache-Control", "no-store");
+            res.set_content(i18n::t(lang, "admin_control_forbidden"), "text/plain; charset=utf-8");
+            return;
+        }
+        legacy(req, res, "/admin-control", [=, this] { return do_broker_orders(in, lang, user.value_or("")); });
     });
     svr.Post("/submit-trading-status", [=, this](const Request& req, Response& res) {
         RequestInput in(req);
@@ -1024,7 +1151,12 @@ void Server::start() {
                              "/submit-algo-stop"}) {
         svr.Get(path, [=, this](const Request&, Response& res) { redirect(res, "/control-panel", 302); });
     }
-    svr.Get("/submit-currency-conversion", [=, this](const Request&, Response& res) { redirect(res, "/currency-conversion", 302); });
+    // A history request is only ever queued by an explicit POST.
+    svr.Get("/submit-broker-orders", [](const Request&, Response& res) {
+        res.status = 405;
+        res.set_header("Allow", "POST");
+        res.set_content("Method Not Allowed", "text/plain; charset=utf-8");
+    });
     svr.Get("/submit-trading-status", [=, this](const Request&, Response& res) { redirect(res, "/trading-status", 302); });
 
     // --- server-sent events ----------------------------------------------------------------------
@@ -1062,7 +1194,7 @@ void Server::start() {
         auto payload_for = [this, ctx](unsigned topic) -> std::string {
             switch (topic) {
                 case kTopicAccounts: return *control_.accounts_view_text(ctx->lang);
-                case kTopicQuotes: return *control_.market_payload_text();
+                case kTopicQuotes: return *control_.quotes_payload_text();
                 case kTopicBook: return *control_.insights_payload_text(ctx->book_symbol, ctx->depth);
                 case kTopicSmart: return *control_.smart_status_text();
                 case kTopicAlgo: return *control_.algo_status_text();

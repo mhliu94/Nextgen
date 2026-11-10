@@ -26,18 +26,6 @@ std::optional<std::string> env_opt(const char* name) {
     return std::string(v);
 }
 
-json read_json_file(const std::string& path) {
-    std::ifstream in(path, std::ios::binary);
-    if (!in) throw ConfigError("Unable to read file: " + path);
-    std::stringstream buffer;
-    buffer << in.rdbuf();
-    try {
-        return json::parse(buffer.str());
-    } catch (const json::exception& e) {
-        throw ConfigError("Invalid JSON in " + path + ": " + e.what());
-    }
-}
-
 json& ensure_object(json& parent, const char* key) {
     auto it = parent.find(key);
     if (it == parent.end() || it->is_null()) parent[key] = json::object();
@@ -83,6 +71,18 @@ const std::set<std::string>& trading_media() {
 }
 
 }  // namespace
+
+json read_json_file(const std::string& path) {
+    std::ifstream in(path, std::ios::binary);
+    if (!in) throw ConfigError("Unable to read file: " + path);
+    std::stringstream buffer;
+    buffer << in.rdbuf();
+    try {
+        return json::parse(buffer.str());
+    } catch (const json::exception& e) {
+        throw ConfigError("Invalid JSON in " + path + ": " + e.what());
+    }
+}
 
 std::string resolve_relative_path(const std::string& base_dir, const std::string& path) {
     if (path.empty()) return path;
@@ -206,9 +206,9 @@ SmartSellingConfig normalize_smart_selling_config(const json* raw_in) {
     if (!raw.is_object()) throw ConfigError("smart_selling must be an object");
     SmartSellingConfig cfg;
     static const std::map<std::string, std::string> default_percentages = {
-        {"patient", "3"}, {"normal", "6"}, {"urgent", "10"}};
+        {"patient", "6"}, {"normal", "12"}, {"urgent", "20"}, {"ultra", "30"}};
     static const std::map<std::string, std::string> instrument_defaults = {
-        {"tick_size", "0.01"}, {"quantity_step", "1"}, {"min_quantity", "1"}, {"min_notional", "0"}};
+        {"tick_size", "0.01"}, {"quantity_step", "1"}, {"min_quantity", "100"}, {"min_notional", "0"}};
 
     if (const json* v = json_find(raw, "state_db")) {
         if (!v->is_string() || trim(v->get<std::string>()).empty()) throw ConfigError("smart_selling.state_db must be nonempty");
@@ -284,7 +284,56 @@ SmartSellingConfig normalize_smart_selling_config(const json* raw_in) {
     return cfg;
 }
 
+SmartSellingConfig normalize_smart_buying_config(const json* raw_in) {
+    if (raw_in && !raw_in->is_null() && !raw_in->is_object()) throw ConfigError("smart_buying must be an object");
+    json source = (raw_in && raw_in->is_object()) ? *raw_in : json::object();
+    bool explicit_state_db = source.contains("state_db");
+    // The shared validator runs with buying's fixed rates; messages keep its smart_selling wording.
+    source["participation_percentages"] = json{{"patient", "5"}, {"normal", "8"}, {"urgent", "15"}};
+    SmartSellingConfig cfg = normalize_smart_selling_config(&source);
+    if (!explicit_state_db) cfg.state_db = "./logs/smart_buying.sqlite3";
+    cfg.participation_percentages = {{"patient", "5"}, {"normal", "8"}, {"urgent", "15"}};
+    // max() keeps the configured spelling only when it is strictly larger, like Python's max(Decimal, Decimal).
+    Decimal min_quantity = Decimal::parse(cfg.instrument_defaults.at("min_quantity"));
+    if (!(min_quantity > Decimal(100))) cfg.instrument_defaults["min_quantity"] = "100";
+    Decimal quantity_step = Decimal::parse(cfg.instrument_defaults.at("quantity_step"));
+    if (!(quantity_step > Decimal(1))) cfg.instrument_defaults["quantity_step"] = "1";
+    return cfg;
+}
+
+ReportingConfig normalize_reporting_config(const json* raw_in, const std::string& config_dir) {
+    ReportingConfig cfg;
+    json empty = json::object();
+    const json& raw = raw_in ? *raw_in : empty;
+    bool only_db_path = raw.is_object();
+    if (only_db_path) {
+        for (auto it = raw.begin(); it != raw.end(); ++it) {
+            if (it.key() != "db_path") only_db_path = false;
+        }
+    }
+    if (!only_db_path) throw ConfigError("reporting must be an object containing only db_path.");
+    const json* value = json_find(raw, "db_path");
+    std::string path;
+    if (auto override = env_opt("REPORTING_DB_PATH"); override && !trim(*override).empty()) {
+        path = std::filesystem::absolute(trim(*override)).lexically_normal().string();
+    } else if (!value || value->is_null()) {
+        path = std::filesystem::absolute("./reports/activity.sqlite3").lexically_normal().string();
+    } else {
+        if (!value->is_string() || trim(value->get<std::string>()).empty() || value->get<std::string>() == ":memory:") {
+            throw ConfigError("reporting.db_path must be a persistent file path.");
+        }
+        path = std::filesystem::absolute(resolve_relative_path(config_dir, value->get<std::string>())).lexically_normal().string();
+    }
+    cfg.db_path = path;
+    return cfg;
+}
+
 bool AppConfig::is_privileged(const std::string& user) const { return trim(user) == "lmh"; }
+
+std::vector<std::string> AppConfig::market_data_symbols() const {
+    if (market_data.has_publisher_symbols) return market_data.symbols;
+    return load_symbols(*this);
+}
 
 std::string default_config_path(const std::string& config_dir) {
     if (auto env = env_opt("ACCOUNT_DASHBOARD_CONFIG"); env && !trim(*env).empty()) return trim(*env);
@@ -321,7 +370,7 @@ PersistenceConfig normalize_persistence_config(const json* raw_in, const std::st
             if (!v->is_string()) throw ConfigError(std::string(label) + ".timezone must be a string");
             current = trim(v->get<std::string>());
         }
-        if (!TimeZone::find(current)) throw ConfigError(std::string(label) + ".timezone " + current + " is not supported (use America/New_York, UTC, Asia/Shanghai, Asia/Hong_Kong, Asia/Singapore or Asia/Tokyo)");
+        if (!TimeZone::find(current)) throw ConfigError(std::string(label) + ".timezone " + current + " is not a known time zone (zones other than America/New_York, UTC, Asia/Shanghai, Asia/Hong_Kong, Asia/Singapore and Asia/Tokyo need the system tz database)");
         return current;
     };
 
@@ -429,7 +478,20 @@ AppConfig load_config(const std::string& config_path, const ConfigOverrides& ove
     set_default(kafka, "group_id", env_or("KAFKA_GROUP_ID", "account-dashboard"));
     set_default(kafka, "market_data_group_id", env_or("KAFKA_MARKET_DATA_GROUP_ID", "market-data-dashboard"));
     set_default(kafka, "auto_offset_reset", env_or("KAFKA_AUTO_OFFSET_RESET", "latest"));
-    set_default(kafka, "market_data_auto_offset_reset", env_or("KAFKA_MARKET_DATA_AUTO_OFFSET_RESET", "earliest"));
+    set_default(kafka, "market_data_auto_offset_reset", env_or("KAFKA_MARKET_DATA_AUTO_OFFSET_RESET", "latest"));
+    {
+        json replay_raw = kafka.contains("market_data_replay_records")
+                              ? kafka["market_data_replay_records"]
+                              : json(env_or("KAFKA_MARKET_DATA_REPLAY_RECORDS", "100"));
+        std::optional<long long> replay;
+        if (replay_raw.is_number_integer() || replay_raw.is_number_unsigned() || replay_raw.is_string()) {
+            replay = json_to_int(&replay_raw);
+        }
+        if (!replay || *replay < 0 || *replay > 2147483647LL) {
+            throw ConfigError("Config kafka.market_data_replay_records must be a non-negative integer.");
+        }
+        out.kafka.market_data_replay_records = static_cast<int>(*replay);
+    }
     set_default(kafka, "poll_timeout_sec", 1.0);
     json& producer = ensure_object(kafka, "producer");
     set_default(producer, "acks", "all");
@@ -459,8 +521,24 @@ AppConfig load_config(const std::string& config_path, const ConfigOverrides& ove
     }
 
     json& market = ensure_object(cfg, "market_data");
-    set_default(market, "historical_prices_csv",
-                env_or("MARKET_DATA_HISTORICAL_PRICES_CSV", "./market_data/historical_prices.csv"));
+    if (const json* publisher = json_find(market, "publisher_config"); publisher && json_python_truthy(publisher)) {
+        out.market_data.publisher_config = resolve_relative_path(out.config_dir, json_string(*publisher));
+        json document = read_json_file(out.market_data.publisher_config);
+        const json* publisher_symbols = document.is_object() ? json_find(document, "symbols") : nullptr;
+        bool valid = publisher_symbols && publisher_symbols->is_array() && !publisher_symbols->empty();
+        if (valid) {
+            for (const auto& symbol : *publisher_symbols) {
+                if (!symbol.is_string() || trim(symbol.get<std::string>()).empty()) valid = false;
+            }
+        }
+        if (!valid) throw ConfigError("Market-data publisher config requires a non-empty symbols list.");
+        std::set<std::string> seen;
+        for (const auto& symbol : *publisher_symbols) {
+            std::string clean = to_upper(trim(symbol.get<std::string>()));
+            if (seen.insert(clean).second) out.market_data.symbols.push_back(clean);
+        }
+        out.market_data.has_publisher_symbols = true;
+    }
     std::string max_levels_raw = env_or("MARKET_INSIGHTS_MAX_LEVELS",
                                         json_string(market.value("market_insights_max_levels", json(20))));
     int max_levels = 20;
@@ -474,7 +552,6 @@ AppConfig load_config(const std::string& config_path, const ConfigOverrides& ove
         max_levels = std::stoi(t);
     }
     out.market_data.market_insights_max_levels = std::max(1, std::min(max_levels, 20));
-    out.market_data.historical_prices_csv = resolve_relative_path(out.config_dir, json_string(market["historical_prices_csv"]));
 
     out.fast_trading = normalize_fast_trading_config(json_find(cfg, "fast_trading"));
 
@@ -484,6 +561,17 @@ AppConfig load_config(const std::string& config_path, const ConfigOverrides& ove
         out.smart_selling.state_db = resolve_relative_path(out.config_dir, out.smart_selling.state_db);
     }
 
+    const json* buying_raw = json_find(cfg, "smart_buying");
+    out.smart_buying = normalize_smart_buying_config(buying_raw);
+    if (buying_raw && buying_raw->is_object() && buying_raw->contains("state_db")) {
+        out.smart_buying.state_db = resolve_relative_path(out.config_dir, out.smart_buying.state_db);
+    }
+    if (std::filesystem::absolute(out.smart_buying.state_db).lexically_normal() ==
+        std::filesystem::absolute(out.smart_selling.state_db).lexically_normal()) {
+        throw ConfigError("Smart buying and Smart selling require separate state databases");
+    }
+
+    out.reporting = normalize_reporting_config(json_find(cfg, "reporting"), out.config_dir);
     out.persistence = normalize_persistence_config(json_find(cfg, "persistence"), out.config_dir, out.smart_selling);
 
     json& auth = ensure_object(cfg, "auth");
@@ -511,7 +599,10 @@ AppConfig load_config(const std::string& config_path, const ConfigOverrides& ove
     json& server = ensure_object(cfg, "server");
     set_default(server, "host", env_or("UI_HOST", "0.0.0.0"));
     set_default(server, "port", std::stoi(env_or("UI_PORT", "8000")));
-    std::string ssl_raw = to_lower(trim(env_or("UI_SSL_ENABLED", json_truthy(json_find(server, "ssl_enabled")) ? "true" : "false")));
+    // str(server.get("ssl_enabled", False)).strip().lower() in ("1", "true", "yes", "on")
+    const json* ssl_json = json_find(server, "ssl_enabled");
+    std::string ssl_default = !ssl_json ? "false" : ssl_json->is_null() ? "none" : json_string(*ssl_json);
+    std::string ssl_raw = to_lower(trim(env_or("UI_SSL_ENABLED", ssl_default)));
     out.server.ssl_enabled = ssl_raw == "1" || ssl_raw == "true" || ssl_raw == "yes" || ssl_raw == "on";
     set_default(server, "ssl_certfile", env_or("UI_SSL_CERTFILE", ""));
     set_default(server, "ssl_keyfile", env_or("UI_SSL_KEYFILE", ""));
@@ -542,9 +633,9 @@ AppConfig load_config(const std::string& config_path, const ConfigOverrides& ove
     return out;
 }
 
-AccountDirectory load_account_metas(const AppConfig& config) {
+AccountDirectory load_account_metas(const AppConfig& config, bool include_hidden) {
     if (config.accounts_file.empty()) {
-        return AccountDirectory(parse_account_metas(config.inline_accounts, false, false));
+        return AccountDirectory(parse_account_metas(config.inline_accounts, false, include_hidden));
     }
     json data = read_json_file(config.accounts_file);
     const json* accounts = data.is_object() ? json_find(data, "accounts") : &data;
@@ -552,7 +643,7 @@ AccountDirectory load_account_metas(const AppConfig& config) {
         throw ConfigError("Trading accounts file must contain a non-empty accounts list: " + config.accounts_file);
     }
     try {
-        return AccountDirectory(parse_account_metas(*accounts, true, false));
+        return AccountDirectory(parse_account_metas(*accounts, true, include_hidden));
     } catch (const std::invalid_argument& e) {
         throw ConfigError(e.what());
     }

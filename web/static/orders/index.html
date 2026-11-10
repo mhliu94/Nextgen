@@ -1,0 +1,182 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark light">
+  <title>Orders · KTrader</title>
+  <link rel="icon" href="/static/favicon.svg" type="image/svg+xml">
+  <link rel="preload" href="/static/fonts/ktrader-cjk.woff2" as="font" type="font/woff2" crossorigin>
+  <link rel="stylesheet" href="/static/styles.css">
+  <script src="/static/i18n.js" defer></script>
+  <script src="/static/app.js" defer></script>
+</head>
+<body>
+  <header class="topbar">
+    <a class="brand" href="/" aria-label="KTrader Orders" data-i18n-label="brand_label"><span class="brand-mark" aria-hidden="true"></span><span class="brand-name">KTrader</span><span class="brand-section" data-i18n="brand_section">/ Orders</span></a>
+    <div class="topbar-actions">
+      <div class="language-switch" role="group" aria-label="Language" data-i18n-label="language">
+        <button type="button" data-language="en" lang="en" aria-pressed="true">EN</button><button type="button" data-language="zh" lang="zh-CN" aria-pressed="false">中文</button>
+      </div>
+      <button class="icon-btn" id="theme" type="button" aria-label="Switch between light and dark theme" data-i18n-label="theme_toggle"></button>
+      <div class="session" id="session" hidden><span class="user" id="username"></span><button id="logout" class="btn ghost sm" type="button" data-i18n="logout">Sign out</button></div>
+    </div>
+  </header>
+  <main class="content">
+    <p id="loading" class="loading" role="status" data-i18n="connecting_dashboard">Connecting to your order dashboard…</p>
+
+    <section id="login" class="login card" hidden>
+      <p class="eyebrow" data-i18n="monitor">ORDER MONITOR</p>
+      <h1 class="login-title"><span data-i18n="login_heading">Your trading day,</span> <span data-i18n="login_heading_end">in one place.</span></h1>
+      <p class="muted" data-i18n="login_description">Sign in with your KTrader credentials to follow today's orders.</p>
+      <form id="login-form" class="stack">
+        <label class="field"><span data-i18n="username">Username</span><input id="login-username" name="username" autocomplete="username" autocapitalize="none" spellcheck="false" required maxlength="256"></label>
+        <label class="field"><span data-i18n="password">Password</span><input id="password" name="password" type="password" autocomplete="current-password" required maxlength="4096"></label>
+        <p id="login-error" class="error" role="alert"></p>
+        <button id="login-submit" class="btn primary block" type="submit" data-i18n="login">Sign in</button>
+      </form>
+    </section>
+
+    <section id="dashboard" hidden>
+      <div class="page-heading">
+        <div>
+          <p class="eyebrow" data-i18n="monitor">ORDER MONITOR</p>
+          <h1 id="dashboard-title" data-i18n="today_orders">Today's orders</h1>
+          <p id="day" class="muted"></p>
+        </div>
+        <span id="feed-status" class="pill" role="status" data-i18n="connecting">Connecting</span>
+      </div>
+      <div id="notice" class="notice" role="status" hidden></div>
+
+      <nav class="report-tabs" role="tablist" aria-label="Order reports" data-i18n-label="report_tabs">
+        <button id="tab-orders" type="button" role="tab" aria-selected="true" aria-controls="panel-orders" data-tab="orders"><span data-i18n="recent_orders">Recent orders</span></button>
+        <button id="tab-algo" type="button" role="tab" aria-selected="false" aria-controls="panel-algo" tabindex="-1" data-tab="algo"><span data-i18n="algo_sessions">Algo sessions</span></button>
+        <button id="tab-tags" type="button" role="tab" aria-selected="false" aria-controls="panel-tags" tabindex="-1" data-tab="tags"><span data-i18n="tags">Tags</span></button>
+        <button id="tab-unreconciled" type="button" role="tab" aria-selected="false" aria-controls="panel-unreconciled" tabindex="-1" data-tab="unreconciled"><span data-i18n="unreconciled_orders">Unreconciled orders</span><span id="unreconciled-badge" class="tab-count">—</span></button>
+      </nav>
+
+      <section id="panel-orders" class="panel" role="tabpanel" aria-labelledby="tab-orders">
+        <div class="metrics">
+          <div class="metric"><span data-i18n="all_orders">All orders</span><strong id="total">0</strong></div>
+          <div class="metric working"><span data-i18n="working">Working</span><strong id="working">0</strong></div>
+          <div class="metric filled"><span data-i18n="filled">Filled</span><strong id="filled">0</strong></div>
+          <div class="metric closed"><span data-i18n="closed">Canceled / rejected / expired</span><strong id="closed">0</strong></div>
+        </div>
+        <section class="card" aria-label="Orders" data-i18n-label="orders">
+          <div class="filters">
+            <label class="field"><span data-i18n="account">Account</span><select id="account"><option value="" data-i18n="all_accounts">All accounts</option></select></label>
+            <label class="field"><span data-i18n="status">Status</span><select id="status"><option value="" data-i18n="all_statuses">All statuses</option></select></label>
+            <label class="field search"><span data-i18n="search">Search</span><input id="search" type="search" autocomplete="off" spellcheck="false" placeholder="Symbol, order ID, command ID or tag" aria-label="Search orders" data-i18n-placeholder="search_placeholder" data-i18n-label="search_orders"></label>
+          </div>
+          <div class="table-meta"><span id="count" data-i18n="zero_orders">0 orders</span><span id="refreshed" data-i18n="waiting_data">Waiting for data</span></div>
+          <div class="table-scroll">
+            <table class="data stacked" id="orders-table">
+              <caption class="sr-only" data-i18n="table_caption">Today's orders, newest update first</caption>
+              <thead><tr>
+                <th scope="col" data-i18n="updated">Updated</th>
+                <th scope="col" data-i18n="account">Account</th>
+                <th scope="col" data-i18n="order">Order</th>
+                <th scope="col" data-i18n="symbol_side">Symbol / side</th>
+                <th scope="col" data-i18n="type">Type</th>
+                <th scope="col" data-i18n="status">Status</th>
+                <th scope="col" class="number" data-i18n="filled_quantity">Filled / quantity</th>
+                <th scope="col" class="number" data-i18n="limit_stop">Limit / stop</th>
+                <th scope="col" class="number" data-i18n="average_fill">Avg. fill</th>
+                <th scope="col" data-i18n="details">Details</th>
+              </tr></thead>
+              <tbody id="orders"></tbody>
+            </table>
+          </div>
+          <div id="empty" class="empty" hidden><strong id="empty-title" data-i18n="no_orders">No orders today</strong><p id="empty-detail" data-i18n="new_orders">New orders will appear here automatically.</p></div>
+          <nav class="pagination" aria-label="Order pages" data-i18n-label="pagination">
+            <label class="page-size"><span data-i18n="page_size">Orders per page</span><select id="page-size"><option value="10">10</option><option value="20" selected>20</option><option value="50">50</option></select></label>
+            <div class="page-controls">
+              <button id="previous-page" class="btn ghost sm" type="button" data-i18n="previous_page" disabled>Previous</button>
+              <span id="page-summary" role="status" aria-live="polite" aria-atomic="true"></span>
+              <button id="next-page" class="btn ghost sm" type="button" data-i18n="next_page" disabled>Next</button>
+            </div>
+          </nav>
+        </section>
+      </section>
+
+      <section id="panel-algo" class="panel" role="tabpanel" aria-labelledby="tab-algo" hidden>
+        <section class="card">
+          <div class="report-heading"><h2 data-i18n="algo_sessions">Algo sessions</h2><span id="algo-current" class="pill" role="status"></span></div>
+          <p class="muted" data-i18n="algo_description">Starting parameters and confirmed executions across every participating account.</p>
+          <label class="field report-selector"><span data-i18n="select_session">Session</span><select id="algo-select"></select></label>
+          <p id="algo-empty" class="empty" data-i18n="no_sessions">No algorithm sessions recorded yet.</p>
+          <div id="algo-report" hidden>
+            <div id="algo-summary" class="report-summary"></div>
+            <details class="parameters" open><summary data-i18n="starting_parameters">Starting parameters</summary><dl id="algo-parameters" class="kv"></dl></details>
+            <div id="algo-accounts" class="table-scroll"></div>
+          </div>
+          <p class="report-note" data-i18n="cash_note">Cash amounts use confirmed fills before fees. Currencies are shown separately; missing prices or currencies are marked incomplete.</p>
+        </section>
+      </section>
+
+      <section id="panel-tags" class="panel" role="tabpanel" aria-labelledby="tab-tags" hidden>
+        <section class="card">
+          <div class="report-heading"><h2 data-i18n="tags">Tags</h2><span id="tag-current" class="pill" role="status"></span></div>
+          <p class="muted" data-i18n="tag_description">Tag orders created for a symbol while the tag is active. Existing tagged orders keep updating as fills arrive after tagging stops.</p>
+          <form id="tag-form" class="tag-controls">
+            <label class="field"><span data-i18n="tag_name">Tag name</span><input id="tag-name" required maxlength="100" autocomplete="off"></label>
+            <label class="field"><span data-i18n="symbol">Symbol</span><input id="tag-symbol" required maxlength="64" autocomplete="off" autocapitalize="characters" spellcheck="false" placeholder="AAPL"></label>
+            <div class="tag-buttons">
+              <button id="tag-start" class="btn primary" type="submit" data-i18n="start_tagging">Start tagging</button>
+              <button id="tag-stop" class="btn danger" type="button" data-i18n="stop_tagging" hidden>Stop tagging</button>
+            </div>
+          </form>
+          <p id="tag-error" class="error" role="alert"></p>
+          <label class="field report-selector"><span data-i18n="select_tag">Tag period</span><select id="tag-select"></select></label>
+          <p id="tag-empty" class="empty" data-i18n="no_tags">No tag periods recorded yet.</p>
+          <div id="tag-report" hidden><div id="tag-summary" class="report-summary"></div><div id="tag-accounts" class="table-scroll"></div></div>
+          <p class="report-note" data-i18n="cash_note">Cash amounts use confirmed fills before fees. Currencies are shown separately; missing prices or currencies are marked incomplete.</p>
+        </section>
+      </section>
+
+      <section id="panel-unreconciled" class="panel" role="tabpanel" aria-labelledby="tab-unreconciled" hidden>
+        <section class="card">
+          <div class="report-heading"><h2 data-i18n="unreconciled_orders">Unreconciled orders</h2><span id="unreconciled-current" class="pill" role="status"></span></div>
+          <p class="muted" data-i18n="unreconciled_description">Orders and commands still unresolved by Smart selling or Smart buying, across all dates. These can prevent a new session for the same account and symbol.</p>
+          <p class="report-note" data-i18n="unreconciled_note">Open orders may still be working normally. Check the broker's actual status before reconciling; this view does not cancel orders or clear account locks.</p>
+          <div id="unreconciled-notice" class="notice" role="status" hidden></div>
+          <div class="filters">
+            <label class="field"><span data-i18n="account">Account</span><select id="unreconciled-account"><option value="" data-i18n="all_accounts">All accounts</option></select></label>
+            <label class="field"><span data-i18n="symbol">Symbol</span><select id="unreconciled-symbol"><option value="" data-i18n="all_symbols">All symbols</option></select></label>
+            <label class="field search"><span data-i18n="search">Search</span><input id="unreconciled-search" type="search" autocomplete="off" spellcheck="false" placeholder="Account, symbol, order or command ID" aria-label="Account, symbol, order or command ID" data-i18n-placeholder="unreconciled_search" data-i18n-label="unreconciled_search"></label>
+          </div>
+          <div class="table-meta"><span id="unreconciled-count"></span><span id="unreconciled-refreshed"></span></div>
+          <div class="table-scroll">
+            <table class="data stacked" id="unreconciled-table">
+              <caption class="sr-only" data-i18n="unreconciled_caption">Unresolved records across all dates, newest first</caption>
+              <thead><tr>
+                <th scope="col" data-i18n="account">Account</th>
+                <th scope="col" data-i18n="symbol_side">Symbol / side</th>
+                <th scope="col" data-i18n="record_kind">Record</th>
+                <th scope="col" data-i18n="status">Status</th>
+                <th scope="col" class="number" data-i18n="filled_quantity">Filled / quantity</th>
+                <th scope="col" class="number" data-i18n="limit_price">Limit price</th>
+                <th scope="col" data-i18n="last_evidence">Last report / submission</th>
+                <th scope="col" data-i18n="identifiers">Order / command IDs</th>
+                <th scope="col" data-i18n="reason">Reason</th>
+              </tr></thead>
+              <tbody id="unreconciled-rows"></tbody>
+            </table>
+          </div>
+          <p id="unreconciled-empty" class="empty"></p>
+          <nav class="pagination" aria-label="Unreconciled order pages" data-i18n-label="unreconciled_pages">
+            <label class="page-size"><span data-i18n="page_size">Orders per page</span><select id="unreconciled-page-size"><option value="10">10</option><option value="20" selected>20</option><option value="50">50</option></select></label>
+            <div class="page-controls">
+              <button id="unreconciled-previous" class="btn ghost sm" type="button" data-i18n="previous_page" disabled>Previous</button>
+              <span id="unreconciled-page" role="status" aria-live="polite" aria-atomic="true"></span>
+              <button id="unreconciled-next" class="btn ghost sm" type="button" data-i18n="next_page" disabled>Next</button>
+            </div>
+          </nav>
+        </section>
+      </section>
+
+      <footer class="footer"><span data-i18n="footer">Order monitoring · Session and tag reports</span><span id="refresh-note"></span></footer>
+    </section>
+  </main>
+</body>
+</html>

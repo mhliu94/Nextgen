@@ -136,6 +136,72 @@ std::string canonical_symbol(std::string_view s) {
 
 std::string normalize_symbol_simple(std::string_view s) { return to_upper(trim(s)); }
 
+std::size_t utf8_length(std::string_view s) {
+    std::size_t count = 0;
+    for (unsigned char c : s) {
+        if ((c & 0xC0) != 0x80) ++count;  // every byte that is not a continuation byte starts a code point
+    }
+    return count;
+}
+
+namespace {
+
+// Decodes one UTF-8 code point starting at `index`; returns its length (1 for an invalid byte).
+std::size_t decode_utf8(std::string_view s, std::size_t index, char32_t& code_point) {
+    auto byte = [&](std::size_t i) { return static_cast<unsigned char>(s[i]); };
+    unsigned char lead = byte(index);
+    std::size_t length = lead < 0x80 ? 1 : (lead >> 5) == 0x6 ? 2 : (lead >> 4) == 0xE ? 3 : (lead >> 3) == 0x1E ? 4 : 0;
+    if (length == 0 || index + length > s.size()) {
+        code_point = lead;
+        return 1;
+    }
+    char32_t value = length == 1 ? lead : lead & (0xFF >> (length + 1));
+    for (std::size_t i = 1; i < length; ++i) {
+        if ((byte(index + i) & 0xC0) != 0x80) {
+            code_point = lead;
+            return 1;
+        }
+        value = (value << 6) | (byte(index + i) & 0x3F);
+    }
+    code_point = value;
+    return length;
+}
+
+bool python_isspace(char32_t c) {
+    return (c >= 0x09 && c <= 0x0D) || (c >= 0x1C && c <= 0x20) || c == 0x85 || c == 0xA0 || c == 0x1680 ||
+           (c >= 0x2000 && c <= 0x200A) || c == 0x2028 || c == 0x2029 || c == 0x202F || c == 0x205F || c == 0x3000;
+}
+
+}  // namespace
+
+std::string python_strip(std::string_view s) {
+    std::size_t begin = 0;
+    while (begin < s.size()) {
+        char32_t c;
+        std::size_t length = decode_utf8(s, begin, c);
+        if (!python_isspace(c)) break;
+        begin += length;
+    }
+    // Remember where the last non-space code point ends.
+    std::size_t end = begin;
+    for (std::size_t index = begin; index < s.size();) {
+        char32_t c;
+        std::size_t length = decode_utf8(s, index, c);
+        index += length;
+        if (!python_isspace(c)) end = index;
+    }
+    return std::string(s.substr(begin, end - begin));
+}
+
+bool contains_python_whitespace(std::string_view s) {
+    for (std::size_t index = 0; index < s.size();) {
+        char32_t c;
+        index += decode_utf8(s, index, c);
+        if (python_isspace(c)) return true;
+    }
+    return false;
+}
+
 std::string random_token(std::size_t bytes) {
     std::vector<unsigned char> buf(bytes);
     if (RAND_bytes(buf.data(), static_cast<int>(bytes)) != 1) {
@@ -163,6 +229,24 @@ std::string random_token(std::size_t bytes) {
     return out;
 }
 
+std::string uuid4_hex() {
+    unsigned char bytes[16];
+    if (RAND_bytes(bytes, sizeof(bytes)) != 1) {
+        std::random_device rd;
+        for (auto& b : bytes) b = static_cast<unsigned char>(rd());
+    }
+    bytes[6] = static_cast<unsigned char>((bytes[6] & 0x0F) | 0x40);  // version 4
+    bytes[8] = static_cast<unsigned char>((bytes[8] & 0x3F) | 0x80);  // RFC 4122 variant
+    static const char* hex = "0123456789abcdef";
+    std::string out;
+    out.reserve(32);
+    for (unsigned char b : bytes) {
+        out.push_back(hex[b >> 4]);
+        out.push_back(hex[b & 15]);
+    }
+    return out;
+}
+
 std::string format_double(double value) {
     if (!std::isfinite(value)) return "null";
     char buf[64];
@@ -170,6 +254,99 @@ std::string format_double(double value) {
     std::string out(buf, static_cast<std::size_t>(result.ptr - buf));
     // Python prints integral floats as "100.0"; keep JSON-friendly plain form.
     return out;
+}
+
+std::string python_float_repr(double value) {
+    if (std::isnan(value)) return "nan";
+    if (std::isinf(value)) return value < 0 ? "-inf" : "inf";
+    if (value == 0.0) return std::signbit(value) ? "-0.0" : "0.0";
+    char buf[64];
+    auto result = std::to_chars(buf, buf + sizeof(buf), value, std::chars_format::scientific);  // shortest digits
+    std::string_view text(buf, static_cast<std::size_t>(result.ptr - buf));
+    bool negative = text.front() == '-';
+    if (negative) text.remove_prefix(1);
+    std::size_t e = text.find('e');
+    std::string digits;
+    for (char c : text.substr(0, e)) {
+        if (c != '.') digits.push_back(c);
+    }
+    int exponent = std::atoi(std::string(text.substr(e + 1)).c_str());  // decimal exponent of the first digit
+    std::string out = negative ? "-" : "";
+    if (exponent < -4 || exponent >= 16) {
+        out.push_back(digits[0]);
+        if (digits.size() > 1) {
+            out.push_back('.');
+            out.append(digits, 1, std::string::npos);
+        }
+        char tail[16];
+        std::snprintf(tail, sizeof(tail), "e%c%02d", exponent < 0 ? '-' : '+', std::abs(exponent));
+        out += tail;
+    } else if (exponent < 0) {
+        out += "0.";
+        out.append(static_cast<std::size_t>(-exponent - 1), '0');
+        out += digits;
+    } else if (static_cast<int>(digits.size()) <= exponent + 1) {
+        out += digits;
+        out.append(static_cast<std::size_t>(exponent + 1) - digits.size(), '0');
+        out += ".0";
+    } else {
+        out.append(digits, 0, static_cast<std::size_t>(exponent + 1));
+        out.push_back('.');
+        out.append(digits, static_cast<std::size_t>(exponent + 1), std::string::npos);
+    }
+    return out;
+}
+
+std::optional<double> python_float(std::string_view raw) {
+    std::string text = trim(raw);
+    if (text.empty()) return std::nullopt;
+    std::size_t pos = 0;
+    bool negative = false;
+    if (text[pos] == '+' || text[pos] == '-') {
+        negative = text[pos] == '-';
+        ++pos;
+    }
+    std::string body = to_lower(std::string_view(text).substr(pos));
+    if (body == "inf" || body == "infinity") return negative ? -INFINITY : INFINITY;
+    if (body == "nan") return std::nan("");
+    // digitpart ::= digit (["_"] digit)* ; floatnumber ::= [digitpart] "." digitpart | digitpart ["."] [exponent]
+    std::string cleaned = negative ? "-" : "";
+    auto digitpart = [&](std::size_t& i) {
+        std::size_t start = i;
+        while (i < body.size()) {
+            if (std::isdigit(static_cast<unsigned char>(body[i]))) {
+                cleaned.push_back(body[i]);
+                ++i;
+            } else if (body[i] == '_' && i > start && i + 1 < body.size() &&
+                       std::isdigit(static_cast<unsigned char>(body[i - 1])) &&
+                       std::isdigit(static_cast<unsigned char>(body[i + 1]))) {
+                ++i;
+            } else {
+                break;
+            }
+        }
+        return i > start;
+    };
+    std::size_t i = 0;
+    bool integer_digits = digitpart(i);
+    bool fraction_digits = false;
+    if (i < body.size() && body[i] == '.') {
+        cleaned.push_back('.');
+        ++i;
+        fraction_digits = digitpart(i);
+    }
+    if (!integer_digits && !fraction_digits) return std::nullopt;
+    if (i < body.size() && body[i] == 'e') {
+        cleaned.push_back('e');
+        ++i;
+        if (i < body.size() && (body[i] == '+' || body[i] == '-')) cleaned.push_back(body[i++]);
+        if (!digitpart(i)) return std::nullopt;
+    }
+    if (i != body.size()) return std::nullopt;
+    char* end = nullptr;
+    double value = std::strtod(cleaned.c_str(), &end);
+    if (end == cleaned.c_str() || *end != '\0') return std::nullopt;
+    return value;
 }
 
 }  // namespace ng
@@ -251,7 +428,7 @@ std::optional<std::string> json_to_string(const json* value) {
     if (value->is_boolean()) return value->get<bool>() ? "True" : "False";
     if (value->is_number_integer()) return std::to_string(value->get<long long>());
     if (value->is_number_unsigned()) return std::to_string(value->get<unsigned long long>());
-    if (value->is_number_float()) return format_double(value->get<double>());
+    if (value->is_number_float()) return python_float_repr(value->get<double>());
     return value->dump();
 }
 
@@ -271,6 +448,15 @@ bool json_truthy(const json* value) {
         std::string v = to_lower(trim(value->get<std::string>()));
         return v == "1" || v == "true" || v == "yes" || v == "on" || v == "y";
     }
+    // Python's _truthy_bool falls back to str(value), which never spells a truthy word for a list or dict.
+    return false;
+}
+
+bool json_python_truthy(const json* value) {
+    if (!value || value->is_null()) return false;
+    if (value->is_boolean()) return value->get<bool>();
+    if (value->is_number()) return value->get<double>() != 0.0;
+    if (value->is_string()) return !value->get<std::string>().empty();
     return !value->empty();
 }
 

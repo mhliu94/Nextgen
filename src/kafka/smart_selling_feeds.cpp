@@ -1,9 +1,9 @@
 #include "kafka/smart_selling_feeds.h"
 
 #include <chrono>
-#include <random>
 
 #include "core/logging.h"
+#include "core/strings.h"
 #include "core/time_util.h"
 #include "algo/smart_selling/order_status.h"
 #include "algo/smart_selling/runtime.h"
@@ -13,16 +13,7 @@ namespace {
 
 constexpr const char* kLog = "trading-ui.smart-selling-consumer";
 
-std::string uuid_hex() {
-    static thread_local std::mt19937_64 rng{std::random_device{}()};
-    static const char* hex = "0123456789abcdef";
-    std::string out;
-    for (int i = 0; i < 4; ++i) {
-        std::uint64_t v = rng();
-        for (int j = 0; j < 16; ++j) out.push_back(hex[(v >> (j * 4)) & 15]);
-    }
-    return out;
-}
+std::string uuid_hex() { return uuid4_hex(); }
 
 }  // namespace
 
@@ -245,8 +236,8 @@ void SmartSellingFeed::deliver_message(const Message& message) {
     runtime_.on_volume_payload(payload, message.topic, message.partition, message.offset);
 }
 
-SmartSellingConsumer::SmartSellingConsumer(const AppConfig& config, smart::SmartSellingRuntime& runtime) {
-    const auto& settings = config.smart_selling;
+SmartSellingConsumer::SmartSellingConsumer(const AppConfig& config, const SmartSellingConfig& settings,
+                                           smart::SmartSellingRuntime& runtime) {
     std::string bootstrap = config.kafka.bootstrap_servers;
     std::string market_bootstrap = config.kafka.market_data_bootstrap_servers;
     std::string order_topic = settings.order_status_topic;

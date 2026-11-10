@@ -32,8 +32,15 @@ public:
     // Parses [+-]digits[.digits][(e|E)[+-]digits]. Rejects NaN/Infinity, blanks and junk.
     static Decimal parse(std::string_view text);
     static std::optional<Decimal> try_parse(std::string_view text) noexcept;
-    // Shortest round-trip representation of a double, like Python's str(float).
+    // Shortest round-trip digits of a double (integral values carry no fractional digit).
     static Decimal from_double(double value);
+    // Exactly Python's Decimal(str(float)): 100.0 keeps one fractional digit ("100.0").
+    static Decimal from_python_float(double value);
+    // Python's `a / b` under a context of `precision` significant digits and ROUND_HALF_EVEN,
+    // including the ideal-exponent rule for exact quotients (Decimal("1.00") / 2 == Decimal("0.50")).
+    static Decimal python_div(const Decimal& a, const Decimal& b, int precision = 28);
+    // Context rounding Python applies after + and *: at most `precision` significant digits, half-even.
+    Decimal round_significant(int precision = 28) const;
 
     static const Decimal& zero();
     static const Decimal& one();
@@ -56,6 +63,10 @@ public:
     std::string str() const;
     // Plain notation without trailing fractional zeros.
     std::string normalized_str() const;
+    // Python's str(Decimal(value).normalize()): trailing zeros are dropped even before the decimal
+    // point, and the result switches to scientific notation exactly like CPython ("1E+2", "1.5E+3",
+    // "40.5", "1.2E-7", "0").
+    std::string python_normalized_str() const;
     double to_double() const;
     // Throws unless the value is integral and fits.
     long long to_int64() const;
@@ -73,7 +84,11 @@ public:
 
     // Multiply by 10^n exactly.
     Decimal scaleb(int n) const;
-    // floor(this / step) * step and ceil(this / step) * step, exact.
+    // floor(this / step) * step and ceil(this / step) * step, exact. The result carries the same
+    // number of fractional digits as Python's
+    //     (value / step).to_integral_value(rounding) * step
+    // so persisted strings match the Python engine ("20" stays "20" on a 0.01 grid, "20.123"
+    // becomes "20.13").
     Decimal round_down_to_step(const Decimal& step) const;
     Decimal round_up_to_step(const Decimal& step) const;
     // Exact integer floor division (this / divisor), divisor != 0.
@@ -94,6 +109,7 @@ private:
     // Align two values to a common scale; may shed least-significant digits
     // when a value would otherwise overflow 128 bits.
     static void align(Decimal& a, Decimal& b);
+    Decimal round_to_step(const Decimal& step, bool up) const;
 
     int128 mant_;
     int scale_;

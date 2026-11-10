@@ -172,8 +172,33 @@ bool AccountDetailsConsumer::validate_snapshot(AccountSnapshot& snap, const std:
 // ---------------------------------------------------------------------------
 
 PriceBookConsumer::PriceBookConsumer(const KafkaConfig& kafka, MarketDataStore& store, PayloadCallback payload_callback,
-                                     HealthCallback health_callback)
-    : kafka_(kafka), store_(store), payload_callback_(std::move(payload_callback)), health_callback_(std::move(health_callback)) {}
+                                     HealthCallback health_callback, QuoteCallback quote_callback, double quote_history_seconds)
+    : kafka_(kafka),
+      store_(store),
+      payload_callback_(std::move(payload_callback)),
+      health_callback_(std::move(health_callback)),
+      quote_callback_(std::move(quote_callback)),
+      quote_history_seconds_(quote_history_seconds) {}
+
+long long PriceBookConsumer::start_offset(const std::string& topic, int partition, double now_wall,
+                                          const WatermarkLookup& watermarks, const TimeLookup& offset_for_time) const {
+    if (quote_history_seconds_ > 0 && topic == kafka_.stock_quotes_topic) {
+        long long timestamp_ms = static_cast<long long>((now_wall - quote_history_seconds_) * 1000);
+        if (auto offset = offset_for_time(topic, partition, timestamp_ms)) return *offset;
+        NG_LOG_WARN(kMarketLog, "Quote history offsets unavailable; falling back to bounded recent replay");
+    }
+    // These records are complete snapshots. Bound the warm-up on every assignment, including
+    // restarts and rebalances, regardless of commits.
+    int replay_records = kafka_.market_data_replay_records;
+    if (replay_records == 0) return kOffsetEnd;
+    auto marks = watermarks(topic, partition);
+    if (!marks) {
+        NG_LOG_WARN(kMarketLog, "market-data offsets unavailable for {}[{}]; waiting for new data", topic, partition);
+        return kOffsetEnd;
+    }
+    // The high watermark is the next offset after the latest record.
+    return std::max(marks->first, marks->second - replay_records);
+}
 
 PriceBookConsumer::~PriceBookConsumer() { stop(); }
 
@@ -194,10 +219,16 @@ void PriceBookConsumer::start() {
         .apply(kafka_.market_data_client_config)
         .route_logs(kMarketLog);
     Consumer::Options options;
-    options.seek_to_beginning_on_assign = true;
-    options.on_assign = [](std::vector<TopicPartition>& partitions) {
+    options.on_assign = [this](std::vector<TopicPartition>& partitions) {
+        double now = wall_now();
         std::string assigned;
         for (auto& tp : partitions) {
+            tp.offset = start_offset(
+                tp.topic, tp.partition, now,
+                [this](const std::string& topic, int partition) { return consumer_->query_watermark_offsets(topic, partition, 5000); },
+                [this](const std::string& topic, int partition, long long timestamp_ms) {
+                    return consumer_->offset_for_time(topic, partition, timestamp_ms, 5000);
+                });
             if (!assigned.empty()) assigned += ", ";
             assigned += tp.topic + "[" + std::to_string(tp.partition) + "]@" + std::to_string(tp.offset);
         }
@@ -267,7 +298,16 @@ void PriceBookConsumer::run() {
 void PriceBookConsumer::handle_payload(const json& payload, const std::string& topic, int partition, long long offset) {
     if (topic == kafka_.stock_quotes_topic) {
         auto quote = stock_quote_from_payload(payload);
-        if (quote) store_.upsert_stock_quote(*quote);
+        if (quote) {
+            store_.upsert_stock_quote(*quote);
+            if (quote_callback_) {
+                try {
+                    quote_callback_(*quote);
+                } catch (const std::exception& e) {
+                    NG_LOG_ERROR(kMarketLog, "Could not persist market quote history: {}", e.what());
+                }
+            }
+        }
         return;
     }
     if (topic != kafka_.market_data_topic) return;

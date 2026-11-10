@@ -8,6 +8,8 @@
 #include <cstdio>
 #include <cstring>
 
+#include "core/strings.h"
+
 namespace ng {
 namespace {
 
@@ -180,6 +182,101 @@ Decimal Decimal::from_double(double value) {
     return parse(std::string_view(buf, static_cast<std::size_t>(result.ptr - buf)));
 }
 
+Decimal Decimal::from_python_float(double value) {
+    if (!std::isfinite(value)) throw DecimalError("non-finite double");
+    return parse(python_float_repr(value));
+}
+
+namespace {
+
+// Drops `count` least-significant decimal digits of a non-negative coefficient with ROUND_HALF_EVEN.
+uint128 drop_digits_half_even(uint128 coefficient, int count) {
+    if (count <= 0) return coefficient;
+    if (count > kMaxPow10) return 0;
+    uint128 unit = static_cast<uint128>(pow10(count));
+    uint128 quotient = coefficient / unit;
+    uint128 remainder = coefficient % unit;
+    uint128 half = unit / 2;
+    if (remainder > half || (remainder == half && (quotient & 1))) ++quotient;
+    return quotient;
+}
+
+Decimal from_coefficient(bool negative, uint128 coefficient, int exponent) {
+    // value = coefficient * 10^exponent; the class stores a non-negative scale.
+    int128 signed_value = static_cast<int128>(coefficient);
+    if (negative) signed_value = -signed_value;
+    if (exponent <= 0) return Decimal(signed_value, -exponent);
+    int128 scaled;
+    if (exponent > kMaxPow10 || mul_overflow(signed_value, pow10(exponent), &scaled)) throw DecimalError("decimal overflow");
+    return Decimal(scaled, 0);
+}
+
+}  // namespace
+
+Decimal Decimal::round_significant(int precision) const {
+    int digits = digit_count();
+    if (precision < 1 || digits <= precision) return *this;
+    bool negative = mant_ < 0;
+    uint128 coefficient = negative ? static_cast<uint128>(-mant_) : static_cast<uint128>(mant_);
+    int dropped = digits - precision;
+    coefficient = drop_digits_half_even(coefficient, dropped);
+    int exponent = -scale_ + dropped;
+    if (count_digits(static_cast<int128>(coefficient)) > precision) {  // 99.9 -> 100
+        coefficient /= 10;
+        exponent += 1;
+    }
+    return from_coefficient(negative, coefficient, exponent);
+}
+
+Decimal Decimal::python_div(const Decimal& a, const Decimal& b, int precision) {
+    if (b.mant_ == 0) throw DecimalError("division by zero");
+    if (precision < 1) precision = 1;
+    int ideal_exponent = -a.scale_ + b.scale_;
+    if (a.mant_ == 0) return Decimal(0, std::clamp(-ideal_exponent, 0, kMaxScale), Raw{});
+    bool negative = (a.mant_ < 0) != (b.mant_ < 0);
+    uint128 numerator = a.mant_ < 0 ? static_cast<uint128>(-a.mant_) : static_cast<uint128>(a.mant_);
+    uint128 denominator = b.mant_ < 0 ? static_cast<uint128>(-b.mant_) : static_cast<uint128>(b.mant_);
+    int shift = count_digits(static_cast<int128>(denominator)) - count_digits(static_cast<int128>(numerator)) + precision + 1;
+    int exponent = ideal_exponent - shift;
+    uint128 coefficient = 0, remainder = 0;
+    if (shift >= 0) {
+        // Long division keeps every intermediate below 10 * denominator.
+        if (count_digits(static_cast<int128>(denominator)) > 36) throw DecimalError("decimal overflow");
+        coefficient = numerator / denominator;
+        remainder = numerator % denominator;
+        for (int i = 0; i < shift; ++i) {
+            remainder *= 10;
+            coefficient = coefficient * 10 + remainder / denominator;
+            remainder %= denominator;
+        }
+    } else {
+        if (-shift > kMaxPow10) throw DecimalError("decimal overflow");
+        int128 scaled;
+        if (mul_overflow(static_cast<int128>(denominator), pow10(-shift), &scaled)) throw DecimalError("decimal overflow");
+        coefficient = numerator / static_cast<uint128>(scaled);
+        remainder = numerator % static_cast<uint128>(scaled);
+    }
+    if (remainder != 0) {
+        if (coefficient % 5 == 0) ++coefficient;  // sticky digit so the final rounding sees an inexact tail
+    } else {
+        while (exponent < ideal_exponent && coefficient % 10 == 0) {
+            coefficient /= 10;
+            ++exponent;
+        }
+    }
+    int digits = count_digits(static_cast<int128>(coefficient));
+    if (digits > precision) {
+        int dropped = digits - precision;
+        coefficient = drop_digits_half_even(coefficient, dropped);
+        exponent += dropped;
+        if (count_digits(static_cast<int128>(coefficient)) > precision) {
+            coefficient /= 10;
+            ++exponent;
+        }
+    }
+    return from_coefficient(negative, coefficient, exponent);
+}
+
 bool Decimal::is_integral() const noexcept {
     if (scale_ == 0) return true;
     return mant_ % pow10_table()[static_cast<std::size_t>(std::min(scale_, kMaxPow10))] == 0 && scale_ <= kMaxPow10;
@@ -212,6 +309,38 @@ std::string Decimal::str() const {
 }
 
 std::string Decimal::normalized_str() const { return normalized().str(); }
+
+std::string Decimal::python_normalized_str() const {
+    if (mant_ == 0) return "0";
+    uint128 magnitude = mant_ < 0 ? static_cast<uint128>(-mant_) : static_cast<uint128>(mant_);
+    std::string digits = uint128_to_string(magnitude);
+    int exponent = -scale_;
+    while (digits.size() > 1 && digits.back() == '0') {
+        digits.pop_back();
+        ++exponent;
+    }
+    int leftdigits = exponent + static_cast<int>(digits.size());
+    int dotplace = (exponent <= 0 && leftdigits > -6) ? leftdigits : 1;
+    std::string out = mant_ < 0 ? "-" : "";
+    if (dotplace <= 0) {
+        out += "0.";
+        out.append(static_cast<std::size_t>(-dotplace), '0');
+        out += digits;
+    } else if (dotplace >= static_cast<int>(digits.size())) {
+        out += digits;
+        out.append(static_cast<std::size_t>(dotplace) - digits.size(), '0');
+    } else {
+        out.append(digits, 0, static_cast<std::size_t>(dotplace));
+        out.push_back('.');
+        out.append(digits, static_cast<std::size_t>(dotplace), std::string::npos);
+    }
+    if (leftdigits != dotplace) {
+        char tail[16];
+        std::snprintf(tail, sizeof(tail), "E%+d", leftdigits - dotplace);
+        out += tail;
+    }
+    return out;
+}
 
 Decimal Decimal::normalized() const noexcept {
     int128 m = mant_;
@@ -345,15 +474,32 @@ Decimal::int128 Decimal::ceil_div(const Decimal& divisor) const {
     return ceil_div_int(a.mant_, b.mant_);
 }
 
-Decimal Decimal::round_down_to_step(const Decimal& step) const {
-    int128 q = floor_div(step);
-    return Decimal(q, 0, Raw{}) * step;
+Decimal Decimal::round_to_step(const Decimal& step, bool up) const {
+    int128 q = up ? ceil_div(step) : floor_div(step);
+    Decimal result = Decimal(q, 0, Raw{}) * step;
+    // Python keeps an exact quotient at the "ideal" exponent exp(value) - exp(step) when that is
+    // positive (to_integral_value leaves such a value untouched), so a value already on the grid with
+    // fewer fractional digits than the step keeps its own digits.
+    int ideal = step.scale_ - scale_;
+    if (ideal > 0 && result == *this) {
+        int reducible = 0;
+        if (q == 0) {
+            reducible = ideal;
+        } else {
+            for (int128 rest = q; reducible < ideal && rest % 10 == 0; rest /= 10) ++reducible;
+        }
+        reducible = std::min(reducible, result.scale_);
+        for (int i = 0; i < reducible; ++i) {
+            result.mant_ /= 10;
+            result.scale_ -= 1;
+        }
+    }
+    return result;
 }
 
-Decimal Decimal::round_up_to_step(const Decimal& step) const {
-    int128 q = ceil_div(step);
-    return Decimal(q, 0, Raw{}) * step;
-}
+Decimal Decimal::round_down_to_step(const Decimal& step) const { return round_to_step(step, false); }
+
+Decimal Decimal::round_up_to_step(const Decimal& step) const { return round_to_step(step, true); }
 
 Decimal Decimal::div(const Decimal& divisor, int fractional_digits) const {
     if (divisor.mant_ == 0) throw DecimalError("division by zero");

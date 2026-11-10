@@ -126,7 +126,7 @@ add_custom_command(
 # Library with everything except main()
 # ---------------------------------------------------------------------------
 file(GLOB_RECURSE NG_SOURCES CONFIGURE_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/src/*.cpp)
-list(FILTER NG_SOURCES EXCLUDE REGEX "/src/main\\.cpp$")
+list(FILTER NG_SOURCES EXCLUDE REGEX "/src/(main|orders_main)\\.cpp$")
 
 add_library(nextgen_lib STATIC ${NG_SOURCES} ${NG_WEB_ASSETS_CPP})
 target_include_directories(nextgen_lib PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
@@ -144,12 +144,21 @@ if(NG_STATIC_LIBSTDCXX)
   target_link_options(nextgen-gui PRIVATE -static-libstdc++ -static-libgcc)
 endif()
 
+# The order monitor (rewrite of order_ui): a second, read-only server sharing the same library.
+add_executable(nextgen-orders src/orders_main.cpp)
+target_link_libraries(nextgen-orders PRIVATE nextgen_lib)
+target_compile_options(nextgen-orders PRIVATE -Wall -Wextra -Wno-unused-parameter)
+if(NG_STATIC_LIBSTDCXX)
+  target_link_options(nextgen-orders PRIVATE -static-libstdc++ -static-libgcc)
+endif()
+
 if(NG_ENABLE_LTO AND NG_IPO_OK AND CMAKE_BUILD_TYPE STREQUAL "Release")
   set_property(TARGET nextgen_lib PROPERTY INTERPROCEDURAL_OPTIMIZATION TRUE)
   set_property(TARGET nextgen-gui PROPERTY INTERPROCEDURAL_OPTIMIZATION TRUE)
+  set_property(TARGET nextgen-orders PROPERTY INTERPROCEDURAL_OPTIMIZATION TRUE)
 endif()
 
-install(TARGETS nextgen-gui RUNTIME DESTINATION bin)
+install(TARGETS nextgen-gui nextgen-orders RUNTIME DESTINATION bin)
 
 # ---------------------------------------------------------------------------
 # Tests

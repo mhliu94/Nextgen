@@ -1,4 +1,4 @@
-#include "algo/smart_selling/order_status.h"
+#include "orders/order_status.h"
 
 #include <cmath>
 #include <set>
@@ -6,7 +6,7 @@
 #include "core/strings.h"
 #include "core/time_util.h"
 
-namespace ng::smart {
+namespace ng::orders {
 namespace {
 
 [[noreturn]] void fail(const std::string& field, const char* rule) {
@@ -188,4 +188,10 @@ OrderEvent parse_order_payload(const json& payload) {
     return event;
 }
 
-}  // namespace ng::smart
+const std::vector<std::string>& order_statuses() {
+    static const std::vector<std::string> statuses = {"PENDING_NEW", "NEW", "PARTIALLY_FILLED", "PENDING_CANCEL", "FILLED",
+                                                      "CANCELED", "REJECTED", "EXPIRED", "UNKNOWN"};
+    return statuses;
+}
+
+}  // namespace ng::orders

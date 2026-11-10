@@ -37,8 +37,11 @@ std::optional<long long> json_to_int(const json* value);
 std::optional<std::string> json_to_string(const json* value);
 // Python truthiness of a JSON value used by the account parser (parse_bool).
 bool json_parse_bool(const json* value);
-// Python's `bool(value)` truthiness for the fast-trading helpers (_truthy_bool).
+// The fast-trading helpers' _truthy_bool(): booleans and numbers by value, strings only when they
+// spell 1/true/yes/on/y.
 bool json_truthy(const json* value);
+// Python's plain `bool(value)`: false for null/missing, false, 0, "", [] and {}.
+bool json_python_truthy(const json* value);
 std::string json_dump_compact(const json& value);
 std::string json_dump_sorted(const json& value);
 

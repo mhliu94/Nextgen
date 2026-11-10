@@ -96,6 +96,29 @@
     },
   };
 
+  // Live quote row for a symbol: the streamed rows cover the market-data symbols; anything else
+  // (custom symbols typed in order dialogs) is looked up through /api/quotes and cached briefly.
+  function quoteRow(symbol, onUpdate) {
+    symbol = String(symbol || "").trim().toUpperCase();
+    if (!symbol) return null;
+    if (state.rows[symbol]) return state.rows[symbol];
+    const cached = state.quoteCache.get(symbol);
+    const now = Date.now();
+    if (!cached || (!cached.pending && now - cached.at > 5000)) {
+      const entry = { row: cached ? cached.row : null, at: now, pending: true };
+      state.quoteCache.set(symbol, entry);
+      api("/api/quotes?symbol=" + encodeURIComponent(symbol))
+        .then((payload) => { entry.row = payload && payload.rows ? payload.rows[symbol] || null : null; })
+        .catch(() => { /* keep the previous value */ })
+        .finally(() => { entry.pending = false; entry.at = Date.now(); if (onUpdate) onUpdate(); });
+    }
+    return cached ? cached.row : null;
+  }
+  function lastPriceText(symbol, onUpdate) {
+    const row = quoteRow(symbol, onUpdate);
+    return row && !row.error && row.last !== null && row.last !== undefined ? fmt.price(row.last) : "—";
+  }
+
   function holdingSymbol(value) {
     const symbol = String(value || "").trim().toUpperCase();
     return symbol.startsWith("US.") ? symbol.slice(3) : symbol;
@@ -155,6 +178,8 @@
     prevRows: {},
     renderQueued: new Set(),
     connected: true,
+    quoteCache: new Map(),  // symbol -> { row, at } from /api/quotes?symbol= (symbols outside the live set)
+    activePage: null,
   };
 
   function t(key, params) {
@@ -262,14 +287,16 @@
   // ------------------------------------------------------------------------------------------
   // Router & chrome
   // ------------------------------------------------------------------------------------------
+  // `gate` names the bootstrap entitlement a page requires (the server enforces the same rules).
   const PAGES = [
     { id: "account-details", path: "/account-details", label: "nav_account" },
     { id: "control-panel", path: "/control-panel", label: "nav_control" },
-    { id: "market-data", path: "/market-data", label: "nav_market" },
+    { id: "market-data", path: "/market-data", label: "nav_market", gate: "can_access_market_data", forbidden: "md_forbidden" },
     { id: "market-insights", path: "/market-insights", label: "nav_insights" },
-    { id: "currency-conversion", path: "/currency-conversion", label: "nav_conversion", privileged: true },
-    { id: "trading-status", path: "/trading-status", label: "nav_status", privileged: true },
+    { id: "admin-control", path: "/admin-control", label: "nav_admin", gate: "can_access_admin_control", forbidden: "admin_control_forbidden" },
+    { id: "trading-status", path: "/trading-status", label: "nav_status", gate: "can_manage_trading", forbidden: "trading_status_forbidden" },
   ];
+  const pageAllowed = (page) => !page.gate || !!(state.boot && state.boot[page.gate]);
 
   function routeFromPath(pathname) {
     const found = PAGES.find((p) => p.path === pathname);
@@ -290,8 +317,8 @@
     const id = routeFromPath(location.pathname);
     if (id === null) { state.route = "not-found"; } else state.route = id;
     const page = PAGES.find((p) => p.id === state.route);
-    if (page && page.privileged && !(state.boot && state.boot.privileged)) {
-      toast("err", t(page.id === "currency-conversion" ? "conversion_forbidden" : "trading_status_forbidden"));
+    if (page && !pageAllowed(page)) {
+      toast("err", t(page.forbidden));
       navigate("control-panel", true);
       return;
     }
@@ -303,7 +330,7 @@
     const nav = $("#nav");
     nav.replaceChildren();
     for (const page of PAGES) {
-      if (page.privileged && !(state.boot && state.boot.privileged)) continue;
+      if (!pageAllowed(page)) continue;
       nav.append(h("a", { class: "tab" + (state.route === page.id ? " active" : ""), href: page.path, onclick: (e) => { e.preventDefault(); navigate(page.id); } }, t(page.label)));
     }
     document.documentElement.lang = state.lang;
@@ -346,7 +373,8 @@
     const feeds = state.feeds || {};
     const items = [["accounts", "feed_accounts"], ["market", "feed_market"], ["orders", "feed_orders"], ["volume", "feed_volume"]];
     for (const [key, label] of items) {
-      const feed = feeds[key];
+      // Smart buying has its own order/volume consumers; show them when Smart selling is disabled.
+      const feed = feeds[key] === null && feeds["buying_" + key] ? feeds["buying_" + key] : feeds[key];
       if (feed === null) continue;  // feature disabled
       const cls = feedClass(feed);
       const stateText = feed && feed.state ? t("feed_" + (cls === "stale" ? "stale" : feed.state)) : t("feed_unavailable");
@@ -445,7 +473,7 @@
   async function refreshAll() {
     try {
       const [accounts, market, algo, feeds] = await Promise.all([
-        api("/api/accounts/view"), api("/api/market-data"), api("/api/algo"), api("/api/health"),
+        api("/api/accounts/view"), api("/api/quotes"), api("/api/algo"), api("/api/health"),
       ]);
       state.accounts = accounts;
       state.rows = market.rows || {};
@@ -468,8 +496,10 @@
     const content = $("#content");
     closeModal();
     if (state.route !== "market-insights") closeBookStream();
+    if (state.activePage && state.activePage.destroy) state.activePage.destroy();
     content.replaceChildren();
     const page = pages[state.route];
+    state.activePage = page || null;
     if (!page) {
       content.append(h("div", { class: "card" }, h("h2", { class: "card-title", text: t("page_not_found") })));
       return;
@@ -505,7 +535,7 @@
 
       root.append(
         h("div", { class: "page-head" },
-          h("h1", { class: "page-title", text: t("tab_account") }),
+          h("h1", { class: "page-title", text: t("page_account_details") }),
           h("div", { class: "toolbar" },
             h("div", { class: "field" }, h("label", { for: "account-sort", text: t("sort_accounts") }), sortSel),
             secField,
@@ -535,7 +565,7 @@
       const usdTotal = portfolio.cash && portfolio.cash.USD !== undefined ? portfolio.cash.USD : null;
       $("#account-kpis").replaceChildren(
         kpi(t("usd_cash_total"), fmt.money(usdTotal), t("snapshot_coverage") + ": " + withData + " / " + metas.length),
-        kpi(t("market_value_total"), fmt.money(portfolio.total_market_value), portfolio.market_value_complete ? t("portfolio_market_value_help") : t("stale_data_hint")),
+        kpi(t("portfolio_total_market_value"), fmt.money(portfolio.total_market_value), t("portfolio_total_market_value_help")),
         kpi(t("accounts_trading_on"), tradingOn + " / " + metas.length, t("trading")),
         kpi(t("last_update"), view.generated_at ? fmt.age(view.generated_at) : "—", view.generated_at ? fmt.clock(view.generated_at) : ""));
 
@@ -555,6 +585,10 @@
         h("div", { class: "help", text: t("portfolio_summary") }),
         h("div", { class: "section-heading", text: t("cash_holdings") }),
         h("div", { class: "chips" }, cashChips.length ? cashChips : h("em", { text: "—" })),
+        h("div", { class: "section-heading", text: t("portfolio_totals") }),
+        h("div", { class: "chips" }, h("div", { class: "chip" }, h("div", { class: "chip-label", text: t("portfolio_total_market_value") }),
+          h("div", { class: "chip-value num", id: "portfolio-market-value-total", text: fmt.num(portfolio.total_market_value || 0) }))),
+        h("div", { class: "help", text: t("portfolio_total_market_value_help") }),
         h("div", { class: "section-heading", text: t("positions") }),
         h("div", { class: "table-scroll" }, h("table", { class: "data" },
           h("thead", null, h("tr", null, h("th", { text: t("symbol") }), h("th", { class: "right", text: t("qty") }), h("th", { class: "right", title: t("weighted_avg_px"), text: t("avg_px") }),
@@ -686,8 +720,7 @@
     function renderSummary() {
       const acct = (state.accounts && state.accounts.accounts || []).find((a) => a.account_id === meta.id);
       cashEl.textContent = fmt.money(usdCash(acct));
-      const row = state.rows[picker.selected()];
-      lastEl.textContent = row && !row.error ? fmt.price(row.last) : "—";
+      lastEl.textContent = lastPriceText(picker.selected(), renderSummary);
     }
     picker.input.addEventListener("symbolchange", renderSummary);
     const form = h("form", { onsubmit: async (e) => {
@@ -800,15 +833,25 @@
       lSymbol.addEventListener("change", () => { persistLimit(); renderLimit(); });
 
       // --- Algorithmic trading
-      const algoMode = radioGroup("algo-mode", [{ value: "E", label: t("mode_e") }, { value: "F", label: t("mode_f") }, { value: "G", label: t("mode_g") }], "E");
-      algoMode.inputs.forEach((i, idx) => { i.id = "algo-mode-" + ["e", "f", "g"][idx]; i.nextSibling.setAttribute("for", i.id); });
+      const modes = [{ value: "E", label: t("mode_e") }, { value: "F", label: t("mode_f") }];
+      if (state.boot.smart_selling_available) modes.push({ value: "G", label: t("mode_g") });
+      if (state.boot.smart_buying_available) modes.push({ value: "H", label: t("mode_h") });
+      const algoMode = radioGroup("algo-mode", modes, "E");
+      algoMode.inputs.forEach((i) => { i.id = "algo-mode-" + i.value.toLowerCase(); i.nextSibling.setAttribute("for", i.id); });
       const algoSymbol = h("select", { id: "algo_symbol", required: true }, symbolOptions());
       const algoMsg = h("div", { class: "help", id: "smart-selling-message", role: "status" });
-      const algoForm = h("form", { id: "algo-form", onsubmit: (e) => { e.preventDefault(); const mode = algoMode.value(); if (mode === "G") openSmartModal(algoSymbol.value, algoMsg); else openFastModal(mode, algoSymbol.value, algoMsg); } },
+      const algoForm = h("form", { id: "algo-form", onsubmit: (e) => {
+        e.preventDefault();
+        const mode = algoMode.value();
+        if (mode === "G") openSmartModal(algoSymbol.value, algoMsg, false);
+        else if (mode === "H") openSmartModal(algoSymbol.value, algoMsg, true);
+        else openFastModal(mode, algoSymbol.value, algoMsg);
+      } },
         h("div", { class: "row" }, h("div", { class: "field" }, h("label", { text: t("trading_mode") }), algoMode.el), h("div", { class: "field" }, h("label", { for: "algo_symbol", text: t("symbol") }), algoSymbol)),
         h("button", { class: "btn green", id: "algo-submit", type: "submit" }, t("algo_submit")));
       const algoStatus = h("div", { id: "algo-status" });
       const smartStatus = h("div", { id: "smart-status" });
+      const buyingStatus = h("div", { id: "smart-buying-status" });
 
       // --- Stop all
       const stopReason = h("input", { id: "stop_reason", type: "text", placeholder: t("stop_reason_placeholder") });
@@ -843,7 +886,10 @@
             card(t("recent_commands"), recent)),
           h("div", { class: "col" },
             card(t("limit_order"), limitForm),
-            card(t("algo_title"), [algoForm, h("div", { class: "divider" }), h("div", { class: "section-heading", text: t("active_algo") }), algoStatus, h("div", { class: "divider" }), h("div", { class: "section-heading", text: t("smart_status_title") }), smartStatus]),
+            card(t("algo_title"), [algoForm, h("div", { class: "divider" }), h("div", { class: "section-heading", text: t("active_algo") }), algoStatus,
+              state.boot.smart_selling_available ? [h("div", { class: "divider" }), h("div", { class: "section-heading", text: t("smart_status_title") }), smartStatus] : null,
+              state.boot.smart_buying_available ? [h("div", { class: "divider" }), h("div", { class: "section-heading", text: t("smart_buying_status_title") }), buyingStatus] : null,
+              h("div", { class: "help", style: "margin-top:8px", text: t("smart_sessions_filter_note") })]),
             card(t("cancel_orders_title"), cancelForm))),
         h("datalist", { id: "symbol-suggestions" }, symbolOptions()));
 
@@ -853,7 +899,7 @@
     update(topics) {
       if (!$("#algo-form")) return;
       if (topics.has("accounts") || topics.has("quotes")) { this.renderers.renderMarketCash(); this.renderers.renderQuick(); this.renderers.renderLimit(); }
-      if (topics.has("smart") || topics.has("algo")) renderSmartStatus($("#smart-status"), $("#algo-status"));
+      if (topics.has("smart") || topics.has("algo")) renderSmartStatus($("#smart-status"), $("#algo-status"), $("#smart-buying-status"));
       if (topics.has("commands")) renderRecentCommands($("#recent-commands"));
     },
   };
@@ -887,7 +933,7 @@
       return label + ": " + formatAccountBalance(a, selling, symbol);
     });
     balanceEl.textContent = parts.length ? parts.join(", ") : "—";
-    if (lastEl) { const row = state.rows[symbol]; lastEl.textContent = row && !row.error ? fmt.price(row.last) : "—"; }
+    if (lastEl) lastEl.textContent = lastPriceText(symbol, () => renderBalances(accountIds, symbol, selling, labelEl, balanceEl, lastEl));
   }
 
   async function submitForm(e, url, payloadFn, msgEl, showToast = true) {
@@ -923,8 +969,8 @@
       h("thead", null, h("tr", null, h("th", { text: t("time") }), h("th", { text: t("type") }), h("th", { text: t("account") }), h("th", { text: t("details") }), h("th", { text: t("status") }))),
       h("tbody", null, commands.slice(0, 25).map((c) => {
         const cmd = c.command || {};
-        const details = [cmd.symbol, cmd.side, cmd.qty_shares !== undefined ? fmt.int(cmd.qty_shares) : null, cmd.notional_usd !== undefined ? fmt.money(cmd.notional_usd) : null, cmd.limit_price !== undefined ? "@" + fmt.price(cmd.limit_price) : null, cmd.trading_mode ? t("algo_mode_label") + " " + cmd.trading_mode : null, cmd.trading_enabled !== undefined ? (cmd.trading_enabled ? t("turn_on") : t("turn_off")) : null, cmd.source_currency ? cmd.source_currency + "→" + cmd.target_currency + " " + fmt.num(cmd.source_amount) : null].filter(Boolean).join(" ");
-        return h("tr", null, h("td", { class: "num", text: fmt.clock(c.at) }), h("td", null, h("code", { text: cmd.type || "" })), h("td", { text: cmd.account_id || c.key }), h("td", { text: details, title: cmd.command_id || "" }), h("td", null, h("span", { class: "pill " + (c.status === "failed" ? "off" : c.status === "queued" ? "unknown" : "on"), text: c.status === "failed" ? c.error || c.status : t("published") })));
+        const details = [cmd.symbol, cmd.side, cmd.qty_shares !== undefined ? fmt.int(cmd.qty_shares) : null, cmd.notional_usd !== undefined ? fmt.money(cmd.notional_usd) : null, cmd.limit_price !== undefined ? "@" + fmt.price(cmd.limit_price) : null, cmd.trading_mode ? t("algo_mode_label") + " " + cmd.trading_mode : null, cmd.trading_enabled !== undefined ? (cmd.trading_enabled ? t("turn_on") : t("turn_off")) : null, cmd.source_currency ? cmd.source_currency + "→" + cmd.target_currency + " " + fmt.num(cmd.source_amount) : null, cmd.trading_date ? cmd.trading_date + " · " + t("account_count", { count: (cmd.account_ids || []).length }) : null].filter(Boolean).join(" ");
+        return h("tr", null, h("td", { class: "num", text: fmt.clock(c.at) }), h("td", null, h("code", { text: cmd.type || "" })), h("td", { text: cmd.account_id || (Array.isArray(cmd.account_ids) ? cmd.account_ids.join(", ") : c.key) }), h("td", { text: details, title: cmd.command_id || "" }), h("td", null, h("span", { class: "pill " + (c.status === "failed" ? "off" : c.status === "queued" ? "unknown" : "on"), text: c.status === "failed" ? c.error || c.status : t("published") })));
       })))));
   }
 
@@ -932,7 +978,12 @@
   function smartStateLabel(stateName) { const key = SMART_STATE_KEYS[stateName]; return key ? t("smart_state_" + key) : String(stateName || "—"); }
 
   const stopRequests = new Set();
-  function renderSmartStatus(smartRoot, algoRoot) {
+  // Sessions started today (browser-local date) plus every active session, as the trading UI shows them.
+  function visibleParents(parents) {
+    const today = new Date().toDateString();
+    return (parents || []).filter((p) => p.active || new Date(p.start).toDateString() === today);
+  }
+  function renderSmartStatus(smartRoot, algoRoot, buyingRoot) {
     if (algoRoot) {
       const fast = (state.algo && state.algo.fast) || [];
       if (!fast.length) {
@@ -941,18 +992,29 @@
         algoRoot.replaceChildren(...fast.map((s) => {
           const cmd = s.command || {};
           const cycle = s.last_cycle || {};
+          const target = cmd.fast_trading_total_target_position;
+          const position = target !== undefined && target !== null
+            ? h("div", { class: "status-meta", text: t("fast_target_position_status", { current: cycle.total_position === null || cycle.total_position === undefined ? "—" : fmt.qty(cycle.total_position), target: fmt.int(target) }) })
+            : null;
           return h("div", { class: "status-item" },
             h("div", null,
-              h("div", { class: "status-title" }, h("span", { class: "pill info", text: cmd.trading_mode || "" }), " ", cmd.symbol || "", s.stopping ? h("span", { class: "pill stale", text: t("smart_state_stopping") }) : h("span", { class: "pill on", text: t("smart_state_running") }), cmd.fast_trading_test_mode ? h("span", { class: "pill purple", text: t("test_mode_tag") }) : null),
+              h("div", { class: "status-title" }, h("span", { class: "pill info", text: cmd.trading_mode || "" }), " ", cmd.symbol || "", " ", s.stopping ? h("span", { class: "pill stale", text: t("smart_state_stopping") }) : h("span", { class: "pill on", text: t("smart_state_running") }), cmd.fast_trading_test_mode ? h("span", { class: "pill purple", text: t("test_mode_tag") }) : null),
               h("div", { class: "status-meta" }, t("algo_running_since") + " " + fmt.clock(s.started_at) + " · " + t("algo_cycles") + " " + s.cycles + " · " + t("algo_published") + " " + s.published_commands + " · " + t("fast_accounts") + ": " + (cmd.fast_trading_account_ids || []).join(", ")),
-              h("div", { class: "status-meta" }, t("fast_cycle_result") + ": " + (cycle.reason || (cycle.commands ? cycle.commands + " cmd" : "—")) + (cycle.limit_price ? " @" + fmt.price(cycle.limit_price) : "") + (cycle.total_resting_qty ? " · " + t("fast_target_percentage").split(" (")[0] + " " + fmt.int(cycle.target_quantity) + "/" + fmt.int(cycle.total_resting_qty) : ""))));
+              h("div", { class: "status-meta" }, t("fast_cycle_result") + ": " + (cycle.reason || (cycle.commands ? cycle.commands + " cmd" : "—")) + (cycle.limit_price ? " @" + fmt.price(cycle.limit_price) : "") + (cycle.total_resting_qty ? " · " + t("fast_target_percentage").split(" (")[0] + " " + fmt.int(cycle.target_quantity) + "/" + fmt.int(cycle.total_resting_qty) : "")),
+              position,
+              h("div", { class: "status-meta faint mono", text: t("fast_session_id") + ": " + (s.session_id || "") })));
         }));
       }
     }
-    if (!smartRoot) return;
     const smart = state.smart || (state.algo && state.algo.smart);
-    const parents = (smart && smart.parents) || [];
-    if (!parents.length) { smartRoot.replaceChildren(h("div", { class: "empty", text: t("smart_status_empty") })); return; }
+    if (smartRoot) renderParentsTable(smartRoot, visibleParents(smart && smart.parents), false);
+    const buying = state.algo && state.algo.buying;
+    if (buyingRoot) renderParentsTable(buyingRoot, visibleParents(buying && buying.parents), true);
+  }
+
+  function renderParentsTable(root, parents, buying) {
+    if (!parents.length) { root.replaceChildren(h("div", { class: "empty", text: t(buying ? "smart_buying_status_empty" : "smart_status_empty") })); return; }
+    const base = buying ? "/api/smart-buying/" : "/api/smart-selling/";
     const rows = parents.map((p) => {
       const childState = p.active_order && p.active_order.state;
       const marketKey = String(p.market_state || "").toLowerCase();
@@ -964,17 +1026,25 @@
       const terminal = ["STOPPING", "STOPPED", "COMPLETED", "DEADLINE", "EXPIRED"].includes(p.state);
       const stopBtn = h("button", { class: "btn sm red", type: "button", "aria-label": t("smart_stop") + " " + accountLabel + " " + p.symbol, disabled: stopRequests.has(p.parent_id) || terminal, onclick: async () => {
         stopBtn.disabled = true; stopRequests.add(p.parent_id);
-        try { await api("/api/smart-selling/" + encodeURIComponent(p.parent_id) + "/stop", { method: "POST" }); toast("info", t("smart_stopping")); }
+        try { await api(base + encodeURIComponent(p.parent_id) + "/stop", { method: "POST" }); toast("info", t("smart_stopping")); }
         catch (err) { toast("err", t("smart_request_failed") + " " + err.message); if (err instanceof AuthError) showLogin(err.message); }
         finally { stopRequests.delete(p.parent_id); refreshAlgo(); }
       } }, t("smart_stop"));
+      const bound = buying ? p.maximum_price : p.minimum_price;
+      const perAccount = Object.entries(p.accounts || {}).map(([id, a]) => {
+        let text = id + ": " + fmt.decimal(a.filled) + "/" + fmt.decimal(a.quantity);
+        if (buying) text += " (" + t("smart_cash_budget") + " " + fmt.money(a.spent) + " / " + fmt.money(a.cash_budget) + ")";
+        else if (a.average_cost !== null && a.average_cost !== undefined) text += " (" + t("smart_average_cost") + " " + fmt.decimal(a.average_cost) + ")";
+        return text;
+      }).join(", ");
       const details = h("details", null, h("summary", { text: t("details") }), h("dl", { class: "kv" },
         h("dt", { text: t("smart_mode") }), h("dd", { text: t("smart_" + p.mode) + " · " + t("smart_participation") + " " + (Number(p.participation) * 100).toFixed(2) + "%" }),
         h("dt", { text: t("smart_credit") }), h("dd", { text: fmt.decimal(p.free_credit) }),
+        buying ? null : [h("dt", { text: t("smart_child_cap") }), h("dd", { text: p.disable_child_cap ? t("smart_child_cap_disabled") : fmt.decimal(p.child_cap) })],
         h("dt", { text: t("smart_started_at") }), h("dd", { text: fmt.time(p.start) }),
         h("dt", { text: t("smart_deadline_at") }), h("dd", { text: p.deadline ? fmt.time(p.deadline) : t("smart_no_deadline") }),
-        h("dt", { text: t("smart_minimum_price") }), h("dd", { text: p.minimum_price ? fmt.decimal(p.minimum_price) : "—" }),
-        h("dt", { text: t("smart_accounts_detail") }), h("dd", { text: Object.entries(p.accounts || {}).map(([id, a]) => id + ": " + fmt.decimal(a.filled) + "/" + fmt.decimal(a.quantity)).join(", ") })));
+        h("dt", { text: t(buying ? "smart_maximum_price_short" : "smart_minimum_price_short") }), h("dd", { text: bound ? fmt.decimal(bound) : "—" }),
+        h("dt", { text: t("smart_accounts_detail") }), h("dd", { text: perAccount })));
       return h("tr", null,
         h("td", null, h("b", { text: accountLabel }), " / ", p.symbol, details),
         h("td", { class: "right num", text: fmt.decimal(p.quantity) }),
@@ -985,9 +1055,9 @@
         h("td", { text: reason }),
         h("td", null, stopBtn));
     });
-    smartRoot.replaceChildren(h("div", { class: "table-scroll" }, h("table", { class: "data", id: "smart-status-table" },
-      h("thead", null, h("tr", null, h("th", { text: t("account") + " / " + t("symbol") }), h("th", { class: "right", text: t("smart_inventory") }), h("th", { class: "right", text: t("smart_filled") }), h("th", { class: "right", text: t("smart_remaining") }), h("th", { class: "right", text: t("smart_reserved") }), h("th", { text: t("smart_state") }), h("th", { text: t("smart_reason") }), h("th", { text: t("smart_stop") }))),
-      h("tbody", { id: "smart-status-rows" }, rows))));
+    root.replaceChildren(h("div", { class: "table-scroll" }, h("table", { class: "data", id: buying ? "smart-buying-status-table" : "smart-status-table" },
+      h("thead", null, h("tr", null, h("th", { text: t("account") + " / " + t("symbol") }), h("th", { class: "right", text: t(buying ? "smart_target" : "smart_inventory") }), h("th", { class: "right", text: t("smart_filled") }), h("th", { class: "right", text: t("smart_remaining") }), h("th", { class: "right", text: t("smart_reserved") }), h("th", { text: t("smart_state") }), h("th", { text: t("smart_reason") }), h("th", { text: t("smart_stop") }))),
+      h("tbody", { id: buying ? "smart-buying-status-rows" : "smart-status-rows" }, rows))));
   }
   async function refreshAlgo() {
     try { state.algo = await api("/api/algo"); state.smart = state.algo.smart; queueRender("algo"); queueRender("smart"); } catch (e) { if (e instanceof AuthError) showLogin(e.message); }
@@ -1012,6 +1082,7 @@
     const target = radioGroup("fast_target_percentage", state.boot.fast_trading.target_percentage_choices.map((v) => ({ value: v, label: v + "%" })), "");
     const cycle = radioGroup("fast_cycle_seconds", state.boot.fast_trading.cycle_seconds_choices.map((v) => ({ value: v, label: String(v) })), "");
     const testMode = h("input", { type: "checkbox", id: "fast-test-mode" });
+    const targetPosition = h("input", { id: "fast-total-target-position", type: "number", min: "0", step: "1", inputmode: "numeric" });
     const error = h("div", { class: "warn", role: "alert" });
     const body = h("div", null,
       h("div", { class: "field" }, h("label", { for: "fast-price-limit", text: selling ? t("fast_sell_price_limit") : t("fast_buy_price_limit") }), price),
@@ -1019,6 +1090,8 @@
       h("div", { class: "field", style: "margin-top:10px" }, h("label", { text: t("fast_book_levels") }), levels.el),
       h("div", { class: "field", style: "margin-top:10px" }, h("label", { text: t("fast_target_percentage") }), target.el, h("div", { class: "help", text: t("fast_target_percentage_help") })),
       h("div", { class: "field", style: "margin-top:10px" }, h("label", { text: t("fast_cycle_seconds") }), cycle.el, h("div", { class: "help", text: t("fast_cycle_seconds_help") })),
+      h("div", { class: "field", style: "margin-top:10px" }, h("label", { for: "fast-total-target-position", text: t("fast_total_target_position") }), targetPosition,
+        h("div", { class: "help", text: t(selling ? "fast_total_target_position_sell_help" : "fast_total_target_position_buy_help") })),
       h("label", { class: "check-row", style: "margin-top:10px" }, testMode, h("span", { text: t("fast_test_mode") })),
       error);
     const submit = h("button", { class: "btn green", type: "button", onclick: async () => {
@@ -1029,10 +1102,14 @@
       if (!levels.value()) return (error.textContent = t("fast_book_levels_invalid"));
       if (!target.value()) return (error.textContent = t("fast_target_percentage_invalid"));
       if (!cycle.value()) return (error.textContent = t("fast_cycle_seconds_invalid"));
+      const targetText = targetPosition.value.trim();
+      if (targetText && (!/^\d+$/.test(targetText) || Number(targetText) > Number.MAX_SAFE_INTEGER)) return (error.textContent = t("fast_total_target_position_invalid"));
       error.textContent = "";
       submit.disabled = true;
       try {
-        const result = await api("/api/submit-algo", { json: { trading_mode: mode, symbol, fast_trading_config: { price_limit: priceLimit, account_ids: accountIds, book_levels: Number(levels.value()), target_percentage: Number(target.value()), cycle_seconds: Number(cycle.value()), test_mode: testMode.checked } } });
+        const config = { price_limit: priceLimit, account_ids: accountIds, book_levels: Number(levels.value()), target_percentage: Number(target.value()), cycle_seconds: Number(cycle.value()), test_mode: testMode.checked };
+        if (targetText) config.total_target_position = Number(targetText);
+        const result = await api("/api/submit-algo", { json: { trading_mode: mode, symbol, fast_trading_config: config } });
         msgEl.textContent = t("algo_submitted") + " " + result.strategy_key + ". " + t("published_cmd") + "=" + result.command.command_id;
         toast("ok", t("algo_submitted") + " " + result.strategy_key);
         closeModal();
@@ -1053,51 +1130,72 @@
     return date.getFullYear() + "-" + pad(date.getMonth() + 1) + "-" + pad(date.getDate()) + "T" + pad(date.getHours()) + ":" + pad(date.getMinutes()) + ":" + pad(date.getSeconds());
   }
 
-  function openSmartModal(symbol, msgEl) {
-    const accounts = accountChecklist("smartAccountId", (a) => "— " + t("owned_shares") + " (" + symbol + "): " + formatAccountBalance(a, true, symbol));
-    const startMode = radioGroup("smart_start_mode", [{ value: "now", label: t("smart_start_now") }, { value: "scheduled", label: t("smart_start_scheduled") }], "now");
-    const deadlineMode = radioGroup("smart_deadline_mode", [{ value: "none", label: t("smart_no_deadline") }, { value: "scheduled", label: t("smart_set_deadline") }], "scheduled");
+  // Smart selling (G) and Smart buying (H) share scheduling, submission and status; buying sizes each
+  // account from its available USD cash and bounds prices from above.
+  function availableUsdAccount(account) {
+    if (!account) return account;
+    const balances = account.available_cash_by_currency || {};
+    const key = Object.keys(balances).find((value) => value.trim().toUpperCase() === "USD");
+    return key === undefined ? account : Object.assign({}, account, { cash_by_currency: { USD: balances[key] } });
+  }
+
+  function openSmartModal(symbol, msgEl, buying) {
+    const prefix = buying ? "smart-buying" : "smart";
+    const accounts = accountChecklist(buying ? "smartBuyingAccountId" : "smartAccountId", buying
+      ? (a) => "— " + t("smart_buying_cash") + ": " + formatAccountBalance(availableUsdAccount(a), false, "")
+      : (a) => "— " + t("owned_shares") + " (" + symbol + "): " + formatAccountBalance(a, true, symbol));
+    const startMode = radioGroup(prefix + "_start_mode", [{ value: "now", label: t("smart_start_now") }, { value: "scheduled", label: t("smart_start_scheduled") }], "now");
+    const deadlineMode = radioGroup(prefix + "_deadline_mode", [{ value: "none", label: t("smart_no_deadline") }, { value: "scheduled", label: t("smart_set_deadline") }], "scheduled");
     const now = new Date();
-    const start = h("input", { id: "smart-start", type: "datetime-local", step: "1", value: localDateTime(now), disabled: true, hidden: true });
-    const deadline = h("input", { id: "smart-deadline", type: "datetime-local", step: "1", value: localDateTime(new Date(now.getTime() + 2 * 3600 * 1000)) });
+    const start = h("input", { id: prefix + "-start", type: "datetime-local", step: "1", value: localDateTime(now), disabled: true, hidden: true });
+    const deadline = h("input", { id: prefix + "-deadline", type: "datetime-local", step: "1", value: localDateTime(new Date(now.getTime() + 2 * 3600 * 1000)) });
     const updateTimes = () => { start.disabled = start.hidden = startMode.value() === "now"; deadline.disabled = deadline.hidden = deadlineMode.value() === "none"; };
     startMode.el.addEventListener("change", updateTimes); deadlineMode.el.addEventListener("change", updateTimes);
-    const mode = h("select", { id: "smart-mode" }, h("option", { value: "patient", text: t("smart_patient") }), h("option", { value: "normal", text: t("smart_normal"), selected: true }), h("option", { value: "urgent", text: t("smart_urgent") }));
-    const minPrice = h("input", { id: "smart-minimum-price", type: "number", min: "0", step: "any", inputmode: "decimal" });
+    const mode = h("select", { id: prefix + "-mode" }, h("option", { value: "patient", text: t("smart_patient") }), h("option", { value: "normal", text: t("smart_normal"), selected: true }), h("option", { value: "urgent", text: t("smart_urgent") }),
+      buying ? null : h("option", { value: "ultra", text: t("smart_ultra") }));
+    const boundKey = buying ? "maximum" : "minimum";
+    const priceBound = h("input", { id: prefix + "-" + boundKey + "-price", type: "number", min: "0", step: "any", inputmode: "decimal" });
+    const disableChildCap = buying ? null : h("input", { id: "smart-disable-child-cap", type: "checkbox", "aria-describedby": "smart-child-cap-help" });
     const error = h("div", { class: "warn", role: "alert" });
     const body = h("div", null,
-      h("p", { class: "help", text: t("smart_description") }),
+      h("p", { class: "help", text: t(buying ? "smart_buying_description" : "smart_description") }),
       h("div", { class: "field" }, h("label", { text: t("fast_accounts") }), accounts.el),
       h("div", { class: "row", style: "margin-top:10px" },
         h("div", { class: "field" }, h("label", { text: t("smart_start") }), startMode.el, start),
         h("div", { class: "field" }, h("label", { text: t("smart_deadline") }), deadlineMode.el, deadline)),
-      h("p", { class: "help", text: t("smart_local_time") }),
-      h("div", { class: "row" }, h("div", { class: "field" }, h("label", { for: "smart-mode", text: t("smart_mode") }), mode), h("div", { class: "field" }, h("label", { for: "smart-minimum-price", text: t("smart_minimum_price") }), minPrice)),
-      h("p", { class: "help", text: t("smart_completion_help") }),
+      h("p", { class: "help", text: t(buying ? "smart_buying_local_time" : "smart_local_time") }),
+      h("div", { class: "row" }, h("div", { class: "field" }, h("label", { for: prefix + "-mode", text: t("smart_mode") }), mode), h("div", { class: "field" }, h("label", { for: priceBound.id, text: t("smart_" + boundKey + "_price") }), priceBound)),
+      buying ? null : [h("label", { class: "check-row", style: "margin-top:10px" }, disableChildCap, h("span", { text: t("smart_disable_child_cap") })), h("p", { class: "help", id: "smart-child-cap-help", text: t("smart_child_cap_help") })],
+      h("p", { class: "help", text: t(buying ? "smart_buying_pov_help" : "smart_completion_help") }),
       error);
     const submit = h("button", { class: "btn green", type: "button", onclick: async () => {
       const accountIds = accounts.selected();
       const startDate = startMode.value() === "now" ? new Date() : new Date(start.value);
       const deadlineDate = deadlineMode.value() === "none" ? null : new Date(deadline.value);
-      const floor = minPrice.value.trim() ? Number(minPrice.value) : null;
+      const bound = priceBound.value.trim() ? Number(priceBound.value) : null;
       if (!accountIds.length) return (error.textContent = t("smart_invalid_account"));
       if (!symbol) return (error.textContent = t("invalid_symbol"));
       if (!Number.isFinite(startDate.getTime()) || (deadlineDate !== null && (!Number.isFinite(deadlineDate.getTime()) || deadlineDate <= startDate || deadlineDate.getTime() <= Date.now()))) return (error.textContent = t("smart_invalid_times"));
-      if (floor !== null && (!Number.isFinite(floor) || floor <= 0)) return (error.textContent = t("smart_invalid_price"));
+      if (bound !== null && (!Number.isFinite(bound) || bound <= 0)) return (error.textContent = t("smart_invalid_price"));
       error.textContent = "";
       submit.disabled = true;
+      // The server sizes the session (all sellable inventory, or available cash at the starting ask)
+      // and fixes the participation rate; quantity and imminent_event have no UI controls.
+      const payload = { account_ids: accountIds, symbol, mode: mode.value, start_time: startMode.value() === "now" ? null : startDate.toISOString(), deadline: deadlineDate === null ? null : deadlineDate.toISOString() };
+      payload[boundKey + "_price"] = bound;
+      if (disableChildCap) payload.disable_child_cap = disableChildCap.checked;
       try {
-        await api("/api/smart-selling", { json: { account_ids: accountIds, symbol, mode: mode.value, start_time: startMode.value() === "now" ? null : startDate.toISOString(), deadline: deadlineDate === null ? null : deadlineDate.toISOString(), minimum_price: floor } });
-        msgEl.textContent = t("smart_started");
-        toast("ok", t("smart_started"));
+        await api(buying ? "/api/smart-buying" : "/api/smart-selling", { json: payload });
+        msgEl.textContent = t(buying ? "smart_buying_started" : "smart_started");
+        toast("ok", t(buying ? "smart_buying_started" : "smart_started"));
         closeModal();
         refreshAlgo();
       } catch (err) {
         error.textContent = t("smart_request_failed") + " " + err.message;
         if (err instanceof AuthError) showLogin(err.message);
       } finally { submit.disabled = false; }
-    } }, t("smart_submit"));
-    openModal(t("smart_config_title"), body, { subtitle: t("symbol") + ": " + symbol, actions: [h("button", { class: "btn gray", type: "button", onclick: closeModal }, t("fast_config_cancel")), submit] });
+    } }, t(buying ? "smart_buying_submit" : "smart_submit"));
+    openModal(t(buying ? "smart_buying_config_title" : "smart_config_title"), body, { subtitle: t("symbol") + ": " + symbol, actions: [h("button", { class: "btn gray", type: "button", onclick: closeModal }, t("fast_config_cancel")), submit] });
     if (!state.boot.accounts.length) { submit.disabled = true; error.textContent = t("smart_no_accounts"); }
     updateTimes();
     accounts.render();
@@ -1105,14 +1203,97 @@
     activeModal.onClose = () => clearInterval(timer);
   }
 
-  // ---- Market data ---------------------------------------------------------------------------
+  // ---- Market data (lmh only) -------------------------------------------------------------------
+  // Five-minute windows of market volume, our own traded volume and an estimated VWAP for one
+  // publisher symbol, plus the live quote table for every market-data symbol.
   pages["market-data"] = {
     render(root) {
-      root.append(h("div", { class: "page-head" }, h("h1", { class: "page-title", text: t("md_title") }), h("span", { class: "help", text: t("md_quote_source") })),
-        h("section", { class: "card" }, h("div", { class: "table-scroll" }, h("table", { class: "data", id: "md-table" },
-          h("thead", null, h("tr", null, h("th", { text: t("symbol") }), h("th", { class: "right", text: t("md_prev_close") }), h("th", { class: "right", text: t("md_last") }), h("th", { class: "right", text: t("md_change") }), h("th", { class: "right", text: t("md_change_pct") }), h("th", { class: "right", text: t("md_short_interest") }), h("th", { class: "right", text: t("md_volume") }), h("th", { text: t("md_sparkline") }), h("th", { class: "right", text: t("md_asof") }))),
-          h("tbody", null, state.boot.symbols.slice().sort().map((s) => h("tr", { dataset: { symbol: s } }, h("td", null, h("b", { text: s })), h("td", { class: "right num", dataset: { col: "prev" } }, "—"), h("td", { class: "right num", dataset: { col: "last" } }, "—"), h("td", { class: "right num", dataset: { col: "chg" } }, "—"), h("td", { class: "right num", dataset: { col: "chgpct" } }, "—"), h("td", { class: "right num", dataset: { col: "si" } }, "—"), h("td", { class: "right num", dataset: { col: "vol" } }, "—"), h("td", { dataset: { col: "spark" } }), h("td", { class: "right num faint", dataset: { col: "asof" } }, "—"))))))));
+      const symbols = state.boot.market_data_symbols || [];
+      const saved = storage.get("ktrader.market_data.symbol");
+      const select = h("select", { id: "md-symbol", disabled: !symbols.length }, symbols.map((sym) => h("option", { value: sym, text: sym })));
+      if (saved && symbols.includes(saved)) select.value = saved;
+      select.addEventListener("change", () => { storage.set("ktrader.market_data.symbol", select.value); this.showEmpty(t("md_loading")); this.poll(); });
+      const headCell = (key, attrs) => h("th", Object.assign({ scope: "col" }, attrs || {}), t(key));
+      root.append(
+        h("div", { class: "page-head" },
+          h("div", null, h("h1", { class: "page-title", text: t("md_title") }), h("div", { class: "help", text: t("md_window_note") })),
+          h("div", { class: "toolbar" }, h("div", { class: "field" }, h("label", { for: "md-symbol", text: t("symbol") }), select))),
+        h("div", { class: "kpis", id: "md-trade" }),
+        h("div", { class: "warn", id: "md-error", role: "status", "aria-live": "polite" }),
+        h("section", { class: "card" },
+          h("div", { class: "table-scroll" }, h("table", { class: "data", id: "md-windows" },
+            h("caption", { class: "help", style: "text-align:left;padding:0 0 8px", text: t("md_table_caption") }),
+            h("thead", null,
+              h("tr", null, headCell("md_window", { rowspan: 2 }), headCell("md_market_volume", { rowspan: 2, class: "right" }),
+                h("th", { scope: "colgroup", colspan: 3, style: "text-align:center", text: t("md_our_volume") }), headCell("md_vwap_estimate", { rowspan: 2, class: "right" })),
+              h("tr", null, headCell("md_bought", { class: "right" }), headCell("md_sold", { class: "right" }), headCell("md_gross", { class: "right" }))),
+            h("tbody", { id: "md-window-rows" }))),
+          h("p", { class: "help", text: t("md_method_note") }),
+          h("p", { class: "help", text: t("md_partial_note") }),
+          h("div", { class: "faint", id: "md-updated", "aria-live": "polite" })),
+        h("section", { class: "card", style: "margin-top:var(--gap)" },
+          h("div", { class: "card-head" }, h("h2", { class: "card-title", text: t("md_live_quotes") }), h("div", { class: "card-sub", text: t("md_note_live") })),
+          h("div", { class: "table-scroll" }, h("table", { class: "data", id: "md-table" },
+            h("thead", null, h("tr", null, h("th", { text: t("symbol") }), h("th", { class: "right", text: t("md_prev_close") }), h("th", { class: "right", text: t("md_last") }), h("th", { class: "right", text: t("md_change") }), h("th", { class: "right", text: t("md_change_pct") }), h("th", { class: "right", text: t("md_volume") }), h("th", { text: t("md_sparkline") }), h("th", { class: "right", text: t("md_asof") }))),
+            h("tbody", null, symbols.map((sym) => h("tr", { dataset: { symbol: sym } }, h("td", null, h("b", { text: sym })), h("td", { class: "right num", dataset: { col: "prev" } }, "—"), h("td", { class: "right num", dataset: { col: "last" } }, "—"), h("td", { class: "right num", dataset: { col: "chg" } }, "—"), h("td", { class: "right num", dataset: { col: "chgpct" } }, "—"), h("td", { class: "right num", dataset: { col: "vol" } }, "—"), h("td", { dataset: { col: "spark" } }), h("td", { class: "right num faint", dataset: { col: "asof" } }, "—"))))))));
+      this.select = select;
+      this.requestId = 0;
+      this.pending = null;
+      this.renderTrade(null);
+      if (symbols.length) { this.showEmpty(t("md_loading")); this.poll(); } else this.showEmpty(t("md_no_symbols"));
+      this.timer = setInterval(() => this.poll(), 5000);
       this.update(new Set(["quotes"]));
+    },
+    destroy() { clearInterval(this.timer); this.requestId++; },
+    zoneTime(epoch, zone, withDate) {
+      if (epoch === null || epoch === undefined) return "—";
+      return new Date(epoch * 1000).toLocaleString(state.lang === "zh" ? "zh-CN" : "en-GB", Object.assign({ timeZone: zone, hourCycle: "h23", hour: "2-digit", minute: "2-digit" }, withDate ? { month: "short", day: "2-digit", second: "2-digit" } : {}));
+    },
+    renderTrade(data) {
+      const trade = data ? data.last_trade : null;
+      const zone = data ? data.timezone : "America/New_York";
+      $("#md-trade").replaceChildren(
+        kpi(t("md_last_trade_time"), trade ? this.zoneTime(trade.time, zone, true) : "—", ""),
+        kpi(t("md_last_trade_quantity"), trade ? fmt.qty(trade.quantity) : "—", ""),
+        kpi(t("md_last_trade_price"), trade && trade.price !== null ? fmt.price(trade.price) : "—", ""));
+    },
+    showEmpty(message) {
+      const rows = $("#md-window-rows");
+      if (!rows) return;
+      rows.replaceChildren(h("tr", null, h("td", { colspan: 6, class: "empty", text: message })));
+      this.renderTrade(null);
+      $("#md-updated").textContent = "";
+    },
+    async poll() {
+      const symbol = this.select && this.select.value;
+      if (!symbol || this.pending === symbol || !$("#md-windows")) return;
+      const id = ++this.requestId;
+      this.pending = symbol;
+      const error = $("#md-error");
+      try {
+        const data = await api("/api/market-data?symbol=" + encodeURIComponent(symbol));
+        if (id !== this.requestId || symbol !== this.select.value) return;
+        if (data.symbol !== symbol || !Array.isArray(data.windows)) throw new Error(t("md_unavailable"));
+        const cell = (value, complete, digits) => {
+          const n = Number(value);
+          const text = value === null || value === undefined || !Number.isFinite(n) ? "—" : n.toLocaleString(undefined, { maximumFractionDigits: digits });
+          return h("td", { class: "right num", title: complete ? null : t("md_partial"), text: complete ? text : text + " *" });
+        };
+        $("#md-window-rows").replaceChildren(...data.windows.map((w) => h("tr", { class: w.current ? "current" : null },
+          h("th", { scope: "row", style: "text-align:left;font-weight:600", text: this.zoneTime(w.start, data.timezone, true).replace(/:\d{2}$/, "") + " – " + this.zoneTime(w.end, data.timezone, false) + (w.current ? " · " + t("md_current") : "") }),
+          cell(w.market_volume, w.market_complete, 0), cell(w.bought, w.our_complete, 4), cell(w.sold, w.our_complete, 4), cell(w.gross, w.our_complete, 4), cell(w.vwap_estimate, w.market_complete, 4))));
+        this.renderTrade(data);
+        error.textContent = data.quote_state !== "live" || data.order_feed !== "live" ? t("md_feed_warning") : "";
+        $("#md-updated").textContent = t("md_updated") + " " + this.zoneTime(data.generated_at, data.timezone, true);
+      } catch (err) {
+        if (id !== this.requestId || symbol !== this.select.value) return;
+        if (err instanceof AuthError) { showLogin(err.message); return; }
+        this.showEmpty(t("md_unavailable"));
+        error.textContent = err.status === 403 ? t("md_forbidden") : err.message || t("md_unavailable");
+        if (err.status === 403) clearInterval(this.timer);
+      } finally {
+        if (id === this.requestId) this.pending = null;
+      }
     },
     update(topics) {
       if (!topics.has("quotes")) return;
@@ -1126,8 +1307,9 @@
         if (!row) continue;
         cell("prev").textContent = fmt.price(row.prev_close);
         if (row.error) {
-          cell("last").textContent = "ERR: " + row.error;
-          ["chg", "chgpct", "si", "vol", "asof"].forEach((c) => (cell(c).textContent = "—"));
+          cell("last").textContent = row.error;
+          ["chg", "chgpct", "vol"].forEach((c) => (cell(c).textContent = "—"));
+          cell("asof").textContent = fmt.epoch(row.asof_epoch);
           continue;
         }
         const lastCell = cell("last");
@@ -1135,7 +1317,6 @@
         if (prev && typeof prev.last === "number" && typeof row.last === "number" && prev.last !== row.last) { lastCell.classList.remove("flash-up", "flash-down"); void lastCell.offsetWidth; lastCell.classList.add(row.last > prev.last ? "flash-up" : "flash-down"); }
         const chg = cell("chg"); chg.textContent = fmt.signed(row.change, 4); chg.className = "right num " + (row.change > 0 ? "up" : row.change < 0 ? "down" : "");
         const pct = cell("chgpct"); pct.textContent = fmt.pct(row.change_pct); pct.className = "right num " + (row.change_pct > 0 ? "up" : row.change_pct < 0 ? "down" : "");
-        cell("si").textContent = row.short_interest === null || row.short_interest === undefined ? "—" : Number(row.short_interest).toFixed(2) + "%";
         cell("vol").textContent = fmt.int(row.volume);
         cell("asof").textContent = fmt.epoch(row.asof_epoch);
         cell("spark").replaceChildren(sparkline(state.midHistory.get(symbol) || []));
@@ -1236,33 +1417,54 @@
     },
   };
 
-  // ---- Currency conversion -------------------------------------------------------------------
-  pages["currency-conversion"] = {
+  // ---- Admin control (lmh only) ------------------------------------------------------------------
+  // One read-only GET_BROKER_ORDERS request for a New York trading day and a set of accounts.
+  pages["admin-control"] = {
     render(root) {
-      const metas = state.boot.accounts;
-      const tigers = metas.filter((m) => String(m.broker).trim().toLowerCase() === "tiger");
-      const options = (tigers.length ? tigers : metas).map((m) => h("option", { value: m.id, text: "#" + m.num_id + " " + m.id + " (" + m.broker + ")" }));
-      const account = h("select", { id: "conversion_account_id", required: true }, options);
-      const source = h("select", { id: "source_currency", required: true }, h("option", { value: "HKD", text: "HKD" }), h("option", { value: "USD", text: "USD" }));
-      const target = h("select", { id: "target_currency", required: true }, h("option", { value: "USD", text: "USD" }), h("option", { value: "HKD", text: "HKD" }));
-      const amount = h("input", { id: "source_amount", type: "text", inputmode: "decimal", placeholder: "2000", required: true });
-      const balances = h("b", { id: "conversion-balances", class: "num", text: "-" });
-      const msg = h("div", { class: "warn" });
-      const keepOpposite = (changed) => { if (source.value !== target.value) return; if (changed === source) target.value = source.value === "HKD" ? "USD" : "HKD"; else source.value = target.value === "HKD" ? "USD" : "HKD"; };
-      source.addEventListener("change", () => keepOpposite(source)); target.addEventListener("change", () => keepOpposite(target));
-      const renderBalances = () => { const a = ((state.accounts && state.accounts.accounts) || []).find((x) => x.account_id === account.value); const cash = a && a.cash_by_currency ? a.cash_by_currency : {}; balances.textContent = ["USD " + fmt.num(cash.USD), "HKD " + fmt.num(cash.HKD)].join(" | "); };
-      account.addEventListener("change", renderBalances);
-      this.renderBalances = renderBalances;
-      const form = h("form", { id: "currency-conversion-form", onsubmit: (e) => submitForm(e, "/api/fx", () => ({ account_id: account.value, source_currency: source.value, target_currency: target.value, source_amount: amount.value }), msg) },
-        h("div", { class: "field" }, h("label", { for: "conversion_account_id", text: t("account") }), account),
-        h("div", { class: "row" }, h("div", { class: "field" }, h("label", { for: "source_currency", text: t("source_currency") }), source), h("div", { class: "field" }, h("label", { for: "target_currency", text: t("target_currency") }), target)),
-        h("div", { class: "field" }, h("label", { for: "source_amount", text: t("source_amount") }), amount),
-        h("div", { class: "help" }, t("conversion_balances") + ": ", balances), h("div", { class: "help", text: t("conversion_help") }), msg,
-        h("button", { class: "btn", type: "submit" }, t("submit_conversion")));
-      root.append(h("div", { class: "page-head" }, h("h1", { class: "page-title", text: t("currency_conversion") })), h("div", { class: "grid-2" }, h("div", { class: "col" }, card(t("currency_conversion") + " · USD/HKD", form))));
-      renderBalances();
+      const metas = state.boot.accounts;  // sorted by numeric id
+      const today = state.boot.broker_orders_today;
+      const date = h("input", { id: "broker-orders-date", type: "date", required: true, max: today, value: today });
+      const all = h("input", { class: "choice-input", type: "checkbox", id: "broker-orders-all", name: "account_ids", value: "__ALL__", checked: true });
+      const accounts = metas.map((m, i) => h("input", { class: "choice-input", type: "checkbox", id: "broker-orders-account-" + i, name: "account_ids", value: m.id, dataset: { brokerOrdersAccount: "" } }));
+      const submit = h("button", { class: "btn", type: "submit" }, t("broker_orders_submit"));
+      const message = h("div", { class: "help", role: "status", "aria-live": "polite" });
+      const sync = () => { submit.disabled = !all.checked && !accounts.some((i) => i.checked); };
+      all.addEventListener("change", () => { if (all.checked) accounts.forEach((i) => (i.checked = false)); sync(); });
+      accounts.forEach((i) => i.addEventListener("change", () => { if (i.checked) all.checked = false; sync(); }));
+      const form = h("form", { id: "broker-orders-form", onsubmit: async (e) => {
+        e.preventDefault();
+        if (!form.checkValidity()) { form.reportValidity(); return; }
+        const ids = all.checked ? ["__ALL__"] : accounts.filter((i) => i.checked).map((i) => i.value);
+        if (!ids.length) { message.className = "warn"; message.textContent = t("quick_pick_account"); return; }
+        submit.disabled = true;
+        message.className = "help";
+        message.textContent = t("submitting");
+        try {
+          const result = await api("/api/broker-orders", { json: { trading_date: date.value, account_ids: ids } });
+          message.className = "ok-msg";
+          message.textContent = result.message;
+          toast("ok", result.message);
+        } catch (err) {
+          message.className = "warn";
+          message.textContent = err.message || t("broker_orders_publish_failed");
+          if (err instanceof AuthError) showLogin(err.message);
+        } finally { sync(); }
+      } },
+        h("div", { class: "field" }, h("label", { for: "broker-orders-date", text: t("broker_orders_date") }), date),
+        h("div", { class: "field" }, h("label", { text: t("cancel_accounts") }),
+          h("div", { class: "choice-grid", role: "group" }, all, h("label", { class: "choice-btn", for: "broker-orders-all", text: t("all_accounts") }),
+            metas.map((m, i) => [accounts[i], h("label", { class: "choice-btn", for: accounts[i].id, title: [m.id, m.broker].join(" | "), text: "#" + m.num_id + " " + m.id })]))),
+        h("div", { class: "help", text: t("broker_orders_help") }),
+        message,
+        submit);
+      root.append(h("div", { class: "page-head" }, h("h1", { class: "page-title", text: t("admin_control") })),
+        h("div", { class: "grid-2" }, h("div", { class: "col" }, card(t("broker_orders_title"), form))));
+      // A submitted page restored from the back/forward cache must be usable again.
+      this.onPageShow = () => sync();
+      window.addEventListener("pageshow", this.onPageShow);
+      sync();
     },
-    update(topics) { if (topics.has("accounts") && this.renderBalances && $("#currency-conversion-form")) this.renderBalances(); },
+    destroy() { if (this.onPageShow) window.removeEventListener("pageshow", this.onPageShow); },
   };
 
   // ---- Trading status ---------------------------------------------------------------------
@@ -1298,9 +1500,10 @@
     let health;
     try { health = await api("/api/health"); } catch (e) { toast("err", e.message); return; }
     const feeds = health.feeds || {};
-    const feedRows = ["accounts", "market", "orders", "volume"].map((k) => {
+    const feedRows = ["accounts", "market", "orders", "volume", "buying_orders", "buying_volume", "own_orders"].filter((k) => feeds[k] !== null && feeds[k] !== undefined || ["accounts", "market"].includes(k)).map((k) => {
       const f = feeds[k];
-      return h("tr", null, h("td", { text: t("feed_" + k) }), h("td", null, f ? h("span", { class: "pill " + (feedClass(f) === "live" ? "on" : feedClass(f) === "down" ? "off" : feedClass(f) === "stale" ? "stale" : "unknown"), text: t("feed_" + (feedClass(f) === "stale" ? "stale" : f.state || "unavailable")) }) : h("span", { class: "pill unknown", text: t("feed_unavailable") })), h("td", { class: "num", text: f && f.last_message_at ? fmt.age(f.last_message_at) : "—" }), h("td", { class: "right num", text: f ? fmt.int(f.messages) : "—" }), h("td", { class: "right num", text: f ? fmt.int(f.rejected) : "—" }), h("td", { class: "faint", text: f && f.last_error ? f.last_error : (f && f.topic ? f.topic : "") }));
+      const rejected = f ? (f.rejected !== undefined ? f.rejected : f.invalid_messages) : null;
+      return h("tr", null, h("td", { text: t("feed_" + k) }), h("td", null, f ? h("span", { class: "pill " + (feedClass(f) === "live" ? "on" : feedClass(f) === "down" ? "off" : feedClass(f) === "stale" ? "stale" : "unknown"), text: t("feed_" + (feedClass(f) === "stale" ? "stale" : f.state || "unavailable")) }) : h("span", { class: "pill unknown", text: t("feed_unavailable") })), h("td", { class: "num", text: f && f.last_message_at ? fmt.age(f.last_message_at) : "—" }), h("td", { class: "right num", text: f && f.messages !== undefined ? fmt.int(f.messages) : "—" }), h("td", { class: "right num", text: rejected !== null && rejected !== undefined ? fmt.int(rejected) : "—" }), h("td", { class: "faint", text: f && f.last_error ? f.last_error : (f && f.detail ? f.detail : (f && f.topic ? f.topic : "")) }));
     });
     const cmd = health.commands || {};
     const body = h("div", null,
@@ -1352,8 +1555,15 @@
     // Have the embedded CJK fallback face ready before the first layout, so text is never shaped
     // with a glyph-less fallback on machines without a Chinese system font.
     try { if (document.fonts && document.fonts.load) await document.fonts.load('400 16px "KTrader CJK"'); } catch (e) { /* ignore */ }
+    // A ?lang= link wins over the cookie, as in the original pages; it is remembered so the
+    // server's own messages use the same language.
+    const queryLang = new URLSearchParams(location.search).get("lang");
     const cookieLang = getCookie("lang");
-    const lang = cookieLang === "zh" || cookieLang === "en" ? cookieLang : (navigator.language || "").toLowerCase().startsWith("zh") ? "zh" : "en";
+    let lang = cookieLang === "zh" || cookieLang === "en" ? cookieLang : (navigator.language || "").toLowerCase().startsWith("zh") ? "zh" : "en";
+    if ((queryLang === "zh" || queryLang === "en") && queryLang !== cookieLang) {
+      lang = queryLang;
+      document.cookie = "lang=" + lang + "; path=/; max-age=15552000; samesite=lax";
+    }
     if (!state.T || !Object.keys(state.T).length || state.lang !== lang) await loadDictionary(lang);
     let bootstrap;
     try {

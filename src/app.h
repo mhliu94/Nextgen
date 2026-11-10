@@ -11,6 +11,8 @@
 #include "kafka/smart_selling_feeds.h"
 #include "ops/holdings_recorder.h"
 #include "ops/order_archive.h"
+#include "order_ui/consumer.h"
+#include "reporting/system_snapshots.h"
 #include "web/control.h"
 #include "web/server.h"
 #include "web/sessions.h"
@@ -62,6 +64,12 @@ private:
     std::unique_ptr<kafka::AccountDetailsConsumer> account_consumer_;
     std::unique_ptr<kafka::PriceBookConsumer> market_consumer_;
     std::unique_ptr<kafka::SmartSellingConsumer> smart_consumer_;
+    std::unique_ptr<kafka::SmartSellingConsumer> buying_consumer_;
+    // Independent order-status consumer feeding the Market Data dashboard's own-volume figures.
+    std::unique_ptr<order_ui::OrderStatusConsumer> market_order_consumer_;
+    // Every configured trade account, including accounts hidden in the UI (system snapshots).
+    AccountDirectory snapshot_accounts_;
+    std::unique_ptr<reporting::SystemSnapshotRecorder> system_snapshots_;
     std::unique_ptr<ops::HoldingsRecorder> holdings_;
     std::unique_ptr<ops::OrderArchiveScheduler> archive_;
     std::atomic<bool> stop_requested_{false};

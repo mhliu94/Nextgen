@@ -1,6 +1,6 @@
 // Application services and the control logic that used to live in trading_ui/webserver.py:
-// ownership guards between manual orders and algorithm sessions, the single-session rule
-// across E/F/G, and the JSON views served to the browser.
+// ownership guards between manual orders and algorithm sessions, the one-session-per-account rule
+// across E/F/G/H, and the JSON views served to the browser.
 #pragma once
 
 #include <atomic>
@@ -21,7 +21,11 @@
 #include "model/account_store.h"
 #include "model/market_data.h"
 #include "ops/operations_log.h"
+#include "algo/smart_buying/runtime.h"
 #include "algo/smart_selling/runtime.h"
+#include "order_ui/store.h"
+#include "reporting/activity_reporting.h"
+#include "reporting/market_activity.h"
 #include "web/event_hub.h"
 
 namespace ng::web {
@@ -68,11 +72,14 @@ struct FeedHealthProviders {
     std::function<json()> market;
     std::function<json()> orders;
     std::function<json()> volume;
+    std::function<json()> buying_orders;
+    std::function<json()> buying_volume;
 };
 
 struct StopAllResult {
     int fast_stopped = 0;
     int smart_stopped = 0;
+    int buying_stopped = 0;
     bool notification_published = false;
     json notification;
     std::string notification_error;
@@ -88,8 +95,13 @@ public:
     void set_operations_log(std::unique_ptr<OperationsLog> log);
     // Status of the persistence services (order archive, holdings recorder) for /api/health.
     void set_persistence_status(std::function<json()> provider) { persistence_status_ = std::move(provider); }
+    // Opens the shared activity reports (algorithm sessions, order tags, market activity) and the
+    // projection of our own orders that feeds the Market Data dashboard. Call before the algorithm
+    // managers are created so they can report their sessions.
+    void create_reporting(const std::string& db_path);
     void create_fast_trading_manager();
     void create_smart_selling_runtime(std::shared_ptr<smart::SmartSellingEngine> engine = nullptr);
+    void create_smart_buying_runtime(std::shared_ptr<smart::SmartBuyingEngine> engine = nullptr);
     void set_feed_health_providers(FeedHealthProviders providers);
     void start_background();  // starts the smart heartbeat and hub wiring
     void shutdown();
@@ -100,11 +112,15 @@ public:
     const std::vector<std::string>& symbols() const { return symbols_; }
     AccountStore& account_store() { return account_store_; }
     MarketDataStore& market_store() { return market_store_; }
-    HistoricalCloseStore& historical_closes() { return *historical_; }
     EventHub& hub() { return hub_; }
     CommandSink* command_sink() { return sink_.get(); }
     fast::StrategyManager* fast_manager() { return fast_.get(); }
     smart::SmartSellingRuntime* smart_runtime() { return smart_.get(); }
+    smart::SmartBuyingRuntime* buying_runtime() { return buying_.get(); }
+    reporting::ActivityReporting* reporting() { return reporting_.get(); }
+    reporting::MarketActivity* market_activity() { return market_activity_.get(); }
+    // Today's projection of our own orders (independent order-status consumer of the control server).
+    order_ui::OrderStore* market_order_store() { return market_order_store_.get(); }
     OperationsLog* operations_log() { return operations_log_.get(); }
     double started_at() const { return started_at_; }
 
@@ -116,9 +132,14 @@ public:
     void publish_control_command(const json& command, const std::string& key);
     void publish_fast_trading_command(const json& command, const std::string& key);
     void publish_trading_command(const json& command, const std::string& key);
+    // Several algorithm sessions may run at once, across modes E, F, G and H, but each account
+    // participates in at most one. The managers check ownership across modes; one lock serializes
+    // starts so two sessions cannot claim the same account at the same time.
     std::string start_fast_strategy(const json& command);
     json start_smart_parent(const json& settings);
     json stop_smart_parent(const std::string& parent_id);
+    json start_smart_buying_parent(const json& settings);
+    json stop_smart_buying_parent(const std::string& parent_id);
     StopAllResult stop_all_algorithms(const std::optional<std::string>& reason);
     bool any_algorithm_active() const;
 
@@ -126,10 +147,13 @@ public:
     json accounts_payload(const std::string& lang) const;   // /api/accounts
     json accounts_view(const std::string& lang) const;      // accounts + metas + portfolio + stock quotes
     json market_rows(const std::vector<std::string>& symbols) const;
-    json market_payload(const std::optional<std::string>& symbol) const;  // /api/market-data
+    json quotes_payload(const std::optional<std::string>& symbol) const;  // /api/quotes
+    // /api/market-data: five-minute market and own-volume windows for one publisher symbol.
+    json market_activity_payload(const std::string& symbol) const;
     json insights_payload(const std::string& symbol, int depth) const;    // /api/market-insights
     std::vector<std::string> insight_symbols() const;
     json smart_status() const;
+    json smart_buying_status() const;
     json algo_status() const;
     json feeds_health() const;
     json health() const;
@@ -141,9 +165,10 @@ public:
     // client per event.
     std::shared_ptr<const std::string> accounts_payload_text(const std::string& lang) const;
     std::shared_ptr<const std::string> accounts_view_text(const std::string& lang) const;
-    std::shared_ptr<const std::string> market_payload_text() const;
+    std::shared_ptr<const std::string> quotes_payload_text() const;
     std::shared_ptr<const std::string> insights_payload_text(const std::string& symbol, int depth) const;
     std::shared_ptr<const std::string> smart_status_text() const;
+    std::shared_ptr<const std::string> smart_buying_status_text() const;
     std::shared_ptr<const std::string> algo_status_text() const;
     std::shared_ptr<const std::string> feeds_health_text() const;
     std::shared_ptr<const std::string> commands_history_text() const;
@@ -151,19 +176,23 @@ public:
     int max_insight_levels() const { return config_.market_data.market_insights_max_levels; }
 
 private:
-    void require_idle_algorithms() const;
     bool owned_by_algorithm(const std::string& account_id) const;
+    // Smart selling and Smart buying, whichever are enabled.
+    std::vector<smart::SmartSellingRuntime*> smart_managers() const;
 
     AppConfig config_;
     AccountDirectory accounts_;
     std::vector<std::string> symbols_;
     AccountStore account_store_;
     MarketDataStore market_store_;
-    std::unique_ptr<HistoricalCloseStore> historical_;
     std::unique_ptr<CommandSink> sink_;
     std::unique_ptr<OperationsLog> operations_log_;
+    std::unique_ptr<reporting::ActivityReporting> reporting_;
+    std::unique_ptr<reporting::MarketActivity> market_activity_;
+    std::unique_ptr<order_ui::OrderStore> market_order_store_;
     std::unique_ptr<fast::StrategyManager> fast_;
     std::unique_ptr<smart::SmartSellingRuntime> smart_;
+    std::unique_ptr<smart::SmartBuyingRuntime> buying_;
     FeedHealthProviders feed_health_;
     EventHub hub_;
     std::function<json()> persistence_status_;

@@ -1,8 +1,6 @@
 // Integration tests against librdkafka's in-process mock cluster: real producer/consumer code paths.
 #include <doctest.h>
 
-#include <librdkafka/rdkafka.h>
-#include <librdkafka/rdkafka_mock.h>
 
 #include <chrono>
 #include <filesystem>
@@ -16,70 +14,20 @@
 #include "kafka/smart_selling_feeds.h"
 #include "ops/order_archive.h"
 #include "algo/smart_selling/runtime.h"
+#include "kafka_fixture.h"
 #include "test_helpers.h"
 
 using ng::json;
 
+using ngtest::kafka_config;
+using ngtest::MockCluster;
+using ngtest::produce;
+
 namespace {
-
-struct MockCluster {
-    rd_kafka_t* rk = nullptr;
-    rd_kafka_mock_cluster_t* cluster = nullptr;
-    std::string bootstraps;
-
-    MockCluster() {
-        char errstr[512];
-        rd_kafka_conf_t* conf = rd_kafka_conf_new();
-        rd_kafka_conf_set(conf, "test.mock.num.brokers", "1", errstr, sizeof(errstr));
-        rd_kafka_conf_set(conf, "log_level", "3", errstr, sizeof(errstr));
-        rk = rd_kafka_new(RD_KAFKA_PRODUCER, conf, errstr, sizeof(errstr));
-        REQUIRE(rk != nullptr);
-        cluster = rd_kafka_handle_mock_cluster(rk);
-        REQUIRE(cluster != nullptr);
-        bootstraps = rd_kafka_mock_cluster_bootstraps(cluster);
-    }
-    ~MockCluster() {
-        if (rk) rd_kafka_destroy(rk);
-    }
-    void topic(const std::string& name, int partitions = 1) {
-        REQUIRE(rd_kafka_mock_topic_create(cluster, name.c_str(), partitions, 1) == RD_KAFKA_RESP_ERR_NO_ERROR);
-    }
-};
-
-ng::KafkaConfig kafka_config(const std::string& bootstraps) {
-    ng::KafkaConfig k;
-    k.bootstrap_servers = bootstraps;
-    k.market_data_bootstrap_servers = bootstraps;
-    k.account_details_topic = "account-details";
-    k.trading_commands_topic = "trading-commands";
-    k.market_data_topic = "price-books";
-    k.stock_quotes_topic = "stock-quotes";
-    k.group_id = "account-dashboard-test";
-    k.market_data_group_id = "market-data-test";
-    k.auto_offset_reset = "earliest";
-    k.market_data_auto_offset_reset = "earliest";
-    k.poll_timeout_sec = 0.2;
-    return k;
-}
-
 template <typename Pred>
 bool wait_until(Pred pred, int timeout_ms = 15000) {
-    auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
-    while (std::chrono::steady_clock::now() < deadline) {
-        if (pred()) return true;
-        std::this_thread::sleep_for(std::chrono::milliseconds(25));
-    }
-    return pred();
+    return ngtest::kafka_wait_until(pred, timeout_ms);
 }
-
-void produce(const std::string& bootstraps, const std::string& topic, const std::string& key, const std::string& value) {
-    ng::kafka::Config conf;
-    conf.set("bootstrap.servers", bootstraps).set("acks", "all");
-    ng::kafka::Producer producer(conf);
-    producer.produce(topic, key, value);
-    REQUIRE(producer.flush(10000) == 0);
-}
-
 }  // namespace
 
 TEST_CASE("account-details and market-data feeds consume from a Kafka cluster") {
@@ -166,7 +114,7 @@ TEST_CASE("smart selling feeds replay retained snapshots before going live") {
     smart_cfg = ng::normalize_smart_selling_config(&raw);
     ng::smart::SmartSellingRuntime runtime(
         smart_cfg, [&]() -> const ng::AccountDirectory& { return accounts; }, [] { return std::map<std::string, ng::AccountSnapshot>{}; },
-        [](const json&, const std::string&) {}, nullptr, nullptr, std::make_shared<ng::smart::SmartSellingEngine>(":memory:"));
+        [](const json&, const std::string&) {}, nullptr, std::make_shared<ng::smart::SmartSellingEngine>(":memory:"));
     ng::AppConfig app;
     app.kafka = kafka_config(cluster.bootstraps);
     app.smart_selling = smart_cfg;
@@ -226,4 +174,141 @@ TEST_CASE("order archive reads the retained order-status topic to its end and wr
     json other = ng::ops::persist_day_orders(config, accounts, std::string("2026-10-22"));
     CHECK(other["order_count"] == 1);
     CHECK(other["matching_updates"] == 1);
+}
+
+// --- bounded market-data replay (tests/test_market_data_replay.py, tests/test_market_activity.py) ---
+
+namespace {
+
+struct ReplayHarness {
+    ng::MarketDataStore store;
+    ng::KafkaConfig kafka = kafka_config("unused.invalid:9092");
+    int watermark_requests = 0;
+    std::vector<long long> time_requests;
+
+    long long offset(const ng::kafka::PriceBookConsumer& consumer, const std::string& topic, int partition,
+                     std::optional<std::pair<long long, long long>> watermarks, std::optional<long long> for_time = std::nullopt,
+                     double now = 0) {
+        return consumer.start_offset(
+            topic, partition, now,
+            [&](const std::string&, int) {
+                ++watermark_requests;
+                return watermarks;
+            },
+            [&](const std::string&, int, long long timestamp_ms) {
+                time_requests.push_back(timestamp_ms);
+                return for_time;
+            });
+    }
+};
+
+}  // namespace
+
+TEST_CASE("assignment replays only recent retained records") {
+    struct Case { long long low, high, expected; };
+    for (Case c : {Case{0, 1000000, 999900}, Case{0, 42, 0}, Case{950, 1000, 950}, Case{0, 0, 0}, Case{500, 500, 500}}) {
+        CAPTURE(c.high);
+        ReplayHarness h;
+        ng::kafka::PriceBookConsumer consumer(h.kafka, h.store);
+        CHECK(h.offset(consumer, "price-books", 0, std::pair{c.low, c.high}) == c.expected);
+        CHECK(h.watermark_requests == 1);
+        CHECK(h.time_requests.empty());
+    }
+}
+
+TEST_CASE("each topic and partition gets its own recent window on reassignment") {
+    ReplayHarness h;
+    h.kafka.market_data_replay_records = 25;
+    ng::kafka::PriceBookConsumer consumer(h.kafka, h.store);
+    CHECK(h.offset(consumer, "price-books", 0, std::pair{0LL, 1000LL}) == 975);
+    CHECK(h.offset(consumer, "price-books", 1, std::pair{0LL, 500LL}) == 475);
+    CHECK(h.offset(consumer, "stock-quotes", 0, std::pair{800LL, 810LL}) == 800);
+    CHECK(h.offset(consumer, "price-books", 0, std::pair{0LL, 2000LL}) == 1975);
+    CHECK(h.offset(consumer, "price-books", 1, std::pair{0LL, 800LL}) == 775);
+    CHECK(h.offset(consumer, "stock-quotes", 0, std::pair{800LL, 1000LL}) == 975);
+}
+
+TEST_CASE("zero replay waits for live data without watermark requests") {
+    ReplayHarness h;
+    h.kafka.market_data_replay_records = 0;
+    ng::kafka::PriceBookConsumer consumer(h.kafka, h.store);
+    CHECK(h.offset(consumer, "price-books", 0, std::pair{0LL, 1000LL}) == ng::kafka::kOffsetEnd);
+    CHECK(h.offset(consumer, "stock-quotes", 0, std::pair{0LL, 1000LL}) == ng::kafka::kOffsetEnd);
+    CHECK(h.watermark_requests == 0);
+}
+
+TEST_CASE("missing offsets fall back to live data without losing other partitions") {
+    ReplayHarness h;
+    ng::kafka::PriceBookConsumer consumer(h.kafka, h.store);
+    CHECK(h.offset(consumer, "price-books", 0, std::nullopt) == ng::kafka::kOffsetEnd);
+    CHECK(h.offset(consumer, "stock-quotes", 0, std::pair{0LL, 500LL}) == 400);
+}
+
+TEST_CASE("stock quote replay uses a time window without changing book replay") {
+    const double start = 1794237600.0;
+    struct Case { std::optional<long long> found; long long expected; };
+    for (Case c : {Case{123, 123}, Case{ng::kafka::kOffsetEnd, ng::kafka::kOffsetEnd}}) {
+        ReplayHarness h;
+        ng::kafka::PriceBookConsumer consumer(h.kafka, h.store, nullptr, nullptr, nullptr, 1500);
+        CHECK(h.offset(consumer, "stock-quotes", 0, std::pair{0LL, 1000LL}, c.found, start) == c.expected);
+        CHECK(h.offset(consumer, "price-books", 0, std::pair{0LL, 1000LL}, c.found, start) == 900);
+        REQUIRE(h.time_requests.size() == 1);  // only the quote partition is looked up by time
+        CHECK(h.time_requests[0] == static_cast<long long>((start - 1500) * 1000));
+        CHECK(h.watermark_requests == 1);
+    }
+    // A failed lookup falls back to the bounded record replay.
+    ReplayHarness h;
+    ng::kafka::PriceBookConsumer consumer(h.kafka, h.store, nullptr, nullptr, nullptr, 1500);
+    CHECK(h.offset(consumer, "stock-quotes", 0, std::pair{0LL, 1000LL}, std::nullopt, start) == 900);
+}
+
+TEST_CASE("polling skips old history then consumes new books with their original offsets") {
+    MockCluster cluster;
+    cluster.topic("price-books");
+    cluster.topic("stock-quotes");
+    ng::KafkaConfig kafka = kafka_config(cluster.bootstraps);
+    kafka.market_data_auto_offset_reset = "latest";
+    auto book = [](long long sequence) {
+        return json{{"symbol", "AAPL"}, {"sequence_num", sequence},
+                    {"bid_side", {{"levels", json::array({{{"price", sequence}, {"quantity", 10}}})}}},
+                    {"offer_side", {{"levels", json::array({{{"price", sequence + 1}, {"quantity", 10}}})}}}}
+            .dump();
+    };
+    {
+        ng::kafka::Config conf;
+        conf.set("bootstrap.servers", cluster.bootstraps).set("acks", "all");
+        ng::kafka::Producer producer(conf);
+        for (long long offset = 0; offset < 250; ++offset) producer.produce("price-books", "price-book", book(offset));
+        REQUIRE(producer.flush(15000) == 0);
+    }
+    ng::MarketDataStore store;
+    std::mutex mutex;
+    std::vector<long long> offsets;
+    std::atomic<bool> healthy{false};
+    ng::kafka::PriceBookConsumer consumer(
+        kafka, store,
+        [&](const json&, const std::string& topic, int partition, long long offset) {
+            std::lock_guard lock(mutex);
+            CHECK(topic == "price-books");
+            CHECK(partition == 0);
+            offsets.push_back(offset);
+        },
+        [&](bool value) { healthy = value; });
+    consumer.start();
+    auto count = [&] {
+        std::lock_guard lock(mutex);
+        return offsets.size();
+    };
+    REQUIRE(wait_until([&] { return count() == 100; }));
+    produce(cluster.bootstraps, "price-books", "price-book", book(250));
+    REQUIRE(wait_until([&] { return count() == 101; }));
+    {
+        std::lock_guard lock(mutex);
+        std::vector<long long> expected;
+        for (long long offset = 150; offset <= 250; ++offset) expected.push_back(offset);
+        CHECK(offsets == expected);
+    }
+    CHECK(store.get_book("AAPL", 5).bids[0].price == 250.0);
+    CHECK(healthy.load());
+    consumer.stop();
 }

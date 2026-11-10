@@ -10,6 +10,7 @@
 #include <optional>
 #include <string>
 #include <tuple>
+#include <vector>
 
 #include "core/decimal.h"
 #include "core/json.h"
@@ -129,5 +130,7 @@ std::optional<double> market_timestamp(const json* value, bool nanoseconds = fal
 std::optional<long long> market_sequence(const json* value);
 // Best price and summed same-price depth from a price-book side.
 std::pair<std::optional<Decimal>, Decimal> best_level(const json* side, bool bid);
+// Distinct prices of levels with actual, positive displayed liquidity, ascending.
+std::vector<Decimal> displayed_prices(const json* side);
 
 }  // namespace ng::smart

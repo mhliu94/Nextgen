@@ -31,10 +31,12 @@ public:
     bool apply_snapshot(const std::string& raw);
     bool reconcile(const std::string& client_order_id);
     std::optional<json> latest_snapshot(const std::string& client_order_id);
+    // Checks that a snapshot describes the owned child (account, instrument, side, ordinary limit,
+    // original quantity and price, broker id). Throws std::invalid_argument otherwise.
+    static void validate_owned_snapshot(const json& payload, const json& context);
 
 private:
     std::optional<json> find_owned_context(const json& payload);
-    static void validate_owned_snapshot(const json& payload, const json& context);
     void hold_identified_conflict(const std::optional<json>& context, const json& payload, const std::string& reason);
     static bool older_report_involves_unknown(const json& payload, const std::optional<FeedbackRow>& previous);
     bool should_ignore_retained_report(const OrderEvent& event, const std::optional<FeedbackRow>& account_previous,

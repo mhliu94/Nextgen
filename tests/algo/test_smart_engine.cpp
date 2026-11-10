@@ -4,17 +4,46 @@
 
 using namespace ngtest;
 
-TEST_CASE_FIXTURE(EngineFixture, "three fixed modes and one tick midpoint") {
+TEST_CASE_FIXTURE(EngineFixture, "four fixed modes and one tick midpoint") {
     struct Row { const char* mode; const char* rate; const char* price; };
-    for (Row row : {Row{"patient", ".03", "10.01"}, Row{"normal", ".06", "10.01"}, Row{"urgent", ".10", "10"}}) {
+    for (Row row : {Row{"patient", ".06", "10.01"}, Row{"normal", ".12", "10.01"}, Row{"urgent", ".20", "10"}, Row{"ultra", ".30", "10"}}) {
         INFO(row.mode);
         start({{"mode", row.mode}, {"account_id", row.mode}});
         tape("10000", row.mode);
         json c = child();
         CHECK(Dec(c["limit_price"]) == Dec(row.price));
         CHECK(Dec(status()["participation"]) == Dec(row.rate));
+        CHECK(Dec(status()["earned"]) == Dec("10000") * Dec(row.rate));
         report(c, "FILLED", c["quantity"].get<std::string>(), {{"final", true}});
         engine->request_stop(parent);
+    }
+}
+
+TEST_CASE_FIXTURE(EngineFixture, "ultra funds a minimum child at 30 percent and cancels after two seconds") {
+    start({{"mode", "4"}});
+    CHECK(status()["mode"] == "ultra");
+    tape("333");
+    CHECK(engine->tick().empty());
+    tape("1", "minimum-credit");
+    json c = child();
+    CHECK(c["quantity"] == "100");
+    CHECK(Dec(c["limit_price"]) == Dec(10));
+    CHECK(engine->prepare_dispatch(S(c["client_order_id"])));
+    report(c, "NEW");
+    now = 1.99;
+    CHECK(engine->tick().empty());
+    now = 2;
+    CHECK(action_types(engine->tick()) == std::vector<std::string>{"cancel"});
+}
+
+TEST_CASE_FIXTURE(EngineFixture, "child cap is independent of urgency") {
+    for (const char* mode : {"patient", "normal", "urgent", "ultra"}) {
+        for (json deadline : {json(wall() + 300), json(nullptr)}) {
+            INFO(mode << " deadline=" << deadline.dump());
+            start({{"mode", mode}, {"quantity", "12345"}, {"quantity_step", "5"}, {"deadline", deadline}});
+            CHECK(Dec(status()["child_cap"]) == Dec(1230));
+            engine->request_stop(parent);
+        }
     }
 }
 
@@ -58,6 +87,114 @@ TEST_CASE_FIXTURE(EngineFixture, "no invented initial credit") {
     CHECK(Dec(status()["earned"]) == Dec("0"));
 }
 
+TEST_CASE_FIXTURE(EngineFixture, "calculated child cap remains enabled by default and when unchecked") {
+    int index = 0;
+    for (json settings : {json::object(), json{{"disable_child_cap", false}}}) {
+        INFO(settings.dump());
+        start(settings);
+        quote({{"bid_size", "10000"}});
+        tape("10000", "print-" + std::to_string(index++));
+        CHECK(status()["disable_child_cap"] == false);
+        CHECK(status()["child_cap"] == "100");
+        CHECK(status()["free_credit"] == "200.00");
+        json c = child();
+        CHECK(c["quantity"] == "100");
+        auto prepared = engine->prepare_dispatch(S(c["client_order_id"]));
+        REQUIRE(prepared);
+        CHECK((*prepared)["quantity"] == "100");
+        report(c, "FILLED", "100", {{"final", true}});
+        engine->request_stop(parent);
+    }
+}
+
+TEST_CASE_FIXTURE(EngineFixture, "disabled child cap uses credit without displayed depth limit") {
+    start({{"disable_child_cap", true}});
+    quote({{"bid_size", "9"}});
+    tape("5000");
+    CHECK(status()["disable_child_cap"] == true);
+    CHECK(status()["child_cap"].is_null());
+    CHECK(Dec(status()["free_credit"]) == Dec(1000));
+    // Earned credit funds the child even when displayed depth is smaller.
+    json c = child();
+    CHECK(c["quantity"] == "1000");
+    quote({{"bid_size", "1"}});
+    auto prepared = engine->prepare_dispatch(S(c["client_order_id"]));
+    REQUIRE(prepared);
+    CHECK((*prepared)["quantity"] == "1000");
+    CHECK(Dec(status()["free_credit"]) == Dec(0));
+    CHECK(Dec(status()["reserved"]) == Dec(1000));
+}
+
+TEST_CASE_FIXTURE(EngineFixture, "disabled child cap preserves inventory and account split remainders") {
+    start({{"disable_child_cap", true}, {"account_ids", json::array({"A", "B"})}, {"account_quantities", {{"A", "200"}, {"B", "800"}}}});
+    quote({{"bid_size", "5000"}});
+    tape("20000");
+    CHECK(Dec(status()["free_credit"]) == Dec(1000));
+    CHECK(Dec(status()["discarded"]) == Dec(3000));
+    json first = child();
+    CHECK(first["account_id"] == "A");
+    CHECK(first["quantity"] == "200");
+    engine->prepare_dispatch(S(first["client_order_id"]));
+    report(first, "FILLED", "200", {{"final", true}});
+    now = 4;
+    quote({{"bid_size", "20000"}});
+    CHECK(engine->tick().empty());
+    now = 5;
+    quote({{"bid_size", "20000"}});
+    json second = child();
+    // The funded 1000-share slice retains all 800 remaining shares.
+    CHECK(second["account_id"] == "B");
+    CHECK(second["quantity"] == "800");
+    engine->prepare_dispatch(S(second["client_order_id"]));
+    report(second, "FILLED", "800", {{"final", true}});
+    CHECK(status()["state"] == "COMPLETED");
+    CHECK(status()["filled"] == "1000");
+}
+
+TEST_CASE_FIXTURE(EngineFixture, "disabled child cap still requires minimum credit") {
+    start({{"disable_child_cap", true}});
+    quote({{"bid_size", "10000"}});
+    tape("499");
+    CHECK(engine->tick().empty());
+    tape("1", "more");
+    quote({{"bid_size", "1"}});
+    CHECK(child()["quantity"] == "100");
+    status();
+}
+
+TEST_CASE_FIXTURE(EngineFixture, "disabled child cap survives restart") {
+    start({{"disable_child_cap", true}, {"deadline", nullptr}});
+    tape("5000");
+    engine->close();
+    reopen();
+    CHECK(status()["disable_child_cap"] == true);
+    CHECK(status()["child_cap"].is_null());
+    quote({{"bid_size", "5000"}});
+    json c = child();
+    CHECK(c["quantity"] == "1000");
+    auto prepared = engine->prepare_dispatch(S(c["client_order_id"]));
+    REQUIRE(prepared);
+    CHECK((*prepared)["quantity"] == "1000");
+}
+
+TEST_CASE_FIXTURE(EngineFixture, "legacy parent keeps calculated child cap after restart") {
+    start();
+    engine->close();
+    patch_stored_parent([](json& stored) { stored.erase("disable_child_cap"); });
+    reopen();
+    CHECK(status()["disable_child_cap"] == false);
+    quote({{"bid_size", "10000"}});
+    tape("10000");
+    CHECK(child()["quantity"] == "100");
+}
+
+TEST_CASE_FIXTURE(EngineFixture, "child cap switch requires a boolean") {
+    for (json value : {json(nullptr), json(0), json(1), json("false"), json("true"), json::array(), json::object()}) {
+        INFO(value.dump());
+        CHECK_THROWS_WITH_AS(start({{"disable_child_cap", value}}), "disable_child_cap must be a boolean", ng::smart::ValueError);
+    }
+}
+
 TEST_CASE_FIXTURE(EngineFixture, "child and credit cap limit large prints") {
     start();
     tape("10000");
@@ -65,32 +202,32 @@ TEST_CASE_FIXTURE(EngineFixture, "child and credit cap limit large prints") {
     CHECK(Dec(c["quantity"]) == Dec(100));
     json s = status();
     CHECK(Dec(s["free_credit"]) == Dec(100));
-    CHECK(Dec(s["discarded"]) == Dec(800));
+    CHECK(Dec(s["discarded"]) == Dec(1800));
     CHECK(engine->tick().empty());
 }
 
-TEST_CASE_FIXTURE(EngineFixture, "depth cap and partial budget flush") {
-    start();
-    quote({{"bid_size", "800"}});
-    tape("600");
+TEST_CASE_FIXTURE(EngineFixture, "partial budget flush without depth cap") {
+    start({{"quantity", "2000"}});
+    quote({{"bid_size", "1800"}});
+    tape("750");
     CHECK(engine->tick().empty());
     now = 29;
-    quote({{"bid_size", "800"}});
+    quote({{"bid_size", "1800"}});
     CHECK(engine->tick().empty());
     now = 30;
-    quote({{"bid_size", "800"}});
-    CHECK(Dec(child()["quantity"]) == Dec(60));
+    quote({{"bid_size", "1800"}});
+    CHECK(Dec(child()["quantity"]) == Dec(150));
 }
 
 TEST_CASE_FIXTURE(EngineFixture, "fractional credit and quantity step never round up") {
-    start({{"quantity", "100"}, {"quantity_step", ".1"}, {"min_quantity", ".1"}, {"horizon_seconds", 300}});
-    quote({{"bid_size", "100"}});
-    tape("12.345");
+    start({{"quantity", "10000"}, {"quantity_step", ".1"}, {"min_quantity", ".1"}, {"horizon_seconds", 300}});
+    quote({{"bid_size", "10000"}});
+    tape("1001.2345");
     now = 30;
-    quote({{"bid_size", "100"}});
+    quote({{"bid_size", "10000"}});
     json c = child();
-    CHECK(Dec(c["quantity"]) == Dec("1.2"));
-    CHECK(Dec(status()["free_credit"]) == Dec(".0345"));
+    CHECK(Dec(c["quantity"]) == Dec("200.2"));
+    CHECK(Dec(status()["free_credit"]) == Dec(".0469"));
 }
 
 TEST_CASE_FIXTURE(EngineFixture, "partial fill during cancel refunds final leaves once") {
@@ -110,7 +247,7 @@ TEST_CASE_FIXTURE(EngineFixture, "partial fill during cancel refunds final leave
     report(c, "PARTIALLY_FILLED", "40", {{"sequence", 1}});
     json result = status();
     CHECK(Dec(result["filled"]) == Dec(60));
-    CHECK(Dec(result["free_credit"]) == Dec(40));
+    CHECK(Dec(result["free_credit"]) == Dec(140));
     CHECK(Dec(result["reserved"]) == Dec(0));
     CHECK(Dec(result["fills_after_cancel"]) == Dec(20));
 }
@@ -155,7 +292,7 @@ TEST_CASE_FIXTURE(EngineFixture, "missing final cumulative proof preserves reser
     json result = status();
     CHECK(Dec(result["filled"]) == Dec(10));
     CHECK(Dec(result["reserved"]) == Dec(90));
-    CHECK(Dec(result["free_credit"]) == Dec(0));
+    CHECK(Dec(result["free_credit"]) == Dec(100));
 }
 
 TEST_CASE_FIXTURE(EngineFixture, "inconsistent filled status does not refund missing quantity") {
@@ -216,16 +353,18 @@ TEST_CASE_FIXTURE(EngineFixture, "archived conflict does not release new slot") 
 
 TEST_CASE_FIXTURE(EngineFixture, "tape dedup, corrections keep the original rate and fills earn no credit") {
     start({{"mode", "normal"}});
-    tape("1000");
-    tape("1000");
+    tape("800");
+    tape("800");
     correction("-100", "correction-1", "trade-1");
     correction("-100", "correction-1", "trade-1");
-    CHECK(Dec(status()["earned"]) == Dec(54));
+    CHECK(Dec(status()["earned"]) == Dec(84));
     now = 30;
     quote();
+    CHECK(engine->tick().empty());
+    tape("1000", "fresh");
     json c = child();
     report(c, "FILLED", c["quantity"].get<std::string>(), {{"final", true}});
-    CHECK(Dec(status()["earned"]) == Dec(54));
+    CHECK(Dec(status()["earned"]) == Dec(204));
 }
 
 TEST_CASE_FIXTURE(EngineFixture, "negative correction keeps live reservation and signed credit") {
@@ -234,7 +373,7 @@ TEST_CASE_FIXTURE(EngineFixture, "negative correction keeps live reservation and
     json c = child();
     correction("-900", "correction-1", "trade-1");
     json result = status();
-    CHECK(Dec(result["free_credit"]) == Dec(-90));
+    CHECK(Dec(result["free_credit"]) == Dec(-80));
     CHECK(Dec(result["reserved"]) == Dec(100));
     report(c, "FILLED", "100", {{"final", true}});
     now = 5;
@@ -274,17 +413,16 @@ TEST_CASE_FIXTURE(EngineFixture, "behind progress changes price not participatio
     quote();
     json c = child();
     CHECK(Dec(c["limit_price"]) == Dec(10));
-    CHECK(Dec(status()["participation"]) == Dec(".06"));
-    CHECK(Dec(status()["earned"]) == Dec(120));
+    CHECK(Dec(status()["participation"]) == Dec(".12"));
+    CHECK(Dec(status()["earned"]) == Dec(240));
 }
 
 TEST_CASE_FIXTURE(EngineFixture, "price floor upward tick and tiny depth") {
     start({{"minimum_price", "10.025"}});
     tape();
-    quote({{"bid_size", "9"}});
-    CHECK(engine->tick().empty());
-    quote({{"bid_size", "1000"}});
+    quote({{"ask_prices", json::array({"10.01", "10.02", "10.03"})}, {"bid_size", "9"}});
     json c = child();
+    CHECK(c["quantity"] == "100");
     CHECK(Dec(c["limit_price"]) == Dec("10.03"));
     CHECK(status()["reason"].get<std::string>().find("minimum price") != std::string::npos);
 }
@@ -308,14 +446,14 @@ TEST_CASE_FIXTURE(EngineFixture, "tape gap requires explicit recovery") {
     tape("500", "one", {{"sequence", 1}});
     tape("500", "three", {{"sequence", 3}});
     CHECK(engine->tick().empty());
-    CHECK(Dec(status()["earned"]) == Dec(50));
+    CHECK(Dec(status()["earned"]) == Dec(100));
     engine->set_feed_health("XYZ", true, "", true);
     tape("500", "four", {{"sequence", 4}});
     CHECK(Dec(child()["quantity"]) == Dec(100));
 }
 
 TEST_CASE_FIXTURE(EngineFixture, "deadline and disconnect keep unknown commitment") {
-    start({{"horizon_seconds", 30}});
+    start({{"quantity", "100"}, {"horizon_seconds", 30}});
     tape();
     json c = child();
     report(c, "NEW");
@@ -385,7 +523,7 @@ TEST_CASE_FIXTURE(EngineFixture, "capacity counts credit and reservation with st
     start();
     tape("2000");
     child();
-    engine->set_remaining_volume_forecast(parent, Dec("10000"));
+    engine->set_remaining_volume_forecast(parent, Dec("4500"));
     engine->tick();
     json capacity = status()["capacity"];
     CHECK(Dec(capacity["unfunded"]) == Dec(800));
@@ -410,20 +548,24 @@ TEST_CASE_FIXTURE(EngineFixture, "json safe status and durable event log") {
 }
 
 TEST_CASE_FIXTURE(EngineFixture, "minimum notional increases minimum legal child cap") {
-    start({{"quantity", "10"}, {"horizon_seconds", 7200}, {"min_notional", "100"}});
-    CHECK(Dec(status()["child_cap"]) == Dec(10));
-    tape("100");
-    CHECK(Dec(child()["quantity"]) == Dec(10));
+    start({{"quantity", "1000"}, {"horizon_seconds", 7200}, {"min_notional", "1500"}});
+    quote({{"bid_size", "1500"}});
+    CHECK(Dec(status()["child_cap"]) == Dec(150));
+    tape("1500");
+    CHECK(Dec(child()["quantity"]) == Dec(150));
 }
 
 TEST_CASE_FIXTURE(EngineFixture, "known bid consumption survives repeated old snapshot") {
-    start();
-    tape("2000");
+    start({{"quantity", "2000"}});
+    quote({{"bid_size", "2000"}});
+    tape("4000");
     json first = child();
-    report(first, "FILLED", "100", {{"final", true}});
+    report(first, "FILLED", "200", {{"final", true}});
     now = 5;
-    quote({{"source_time", wall_start}});
-    CHECK(Dec(child()["quantity"]) == Dec(90));
+    quote({{"bid_size", "2000"}, {"source_time", wall_start}});
+    json second = child();
+    CHECK(engine->quotes_for_test().at("XYZ").consumed == Dec(200));
+    CHECK(Dec(second["quantity"]) == Dec(200));
 }
 
 TEST_CASE_FIXTURE(EngineFixture, "new source snapshot reconciles known consumption") {
@@ -445,7 +587,7 @@ TEST_CASE_FIXTURE(EngineFixture, "broker rejection stops parent without retry") 
     quote();
     CHECK(engine->tick().empty());
     CHECK(status()["state"] == "STOPPED");
-    CHECK(Dec(status()["free_credit"]) == Dec(100));
+    CHECK(Dec(status()["free_credit"]) == Dec(200));
 }
 
 TEST_CASE_FIXTURE(EngineFixture, "persisted conflict blocks a fresh parent after stop") {
@@ -502,33 +644,34 @@ TEST_CASE_FIXTURE(EngineFixture, "cumulative interval straddling parent start is
     CHECK(Dec(status()["earned"]) == Dec(0));
     now = 5;
     tape("1000", "next", {{"interval_start", wall_start}});
-    CHECK(Dec(status()["earned"]) == Dec(100));
+    CHECK(Dec(status()["earned"]) == Dec(200));
 }
 
-TEST_CASE_FIXTURE(EngineFixture, "final dispatch shrinks to fresh depth and preserves accounting") {
-    start();
-    tape();
+TEST_CASE_FIXTURE(EngineFixture, "final dispatch ignores depth shrink and preserves accounting") {
+    start({{"quantity", "2000"}});
+    quote({{"bid_size", "2000"}});
+    tape("2000");
     json original = child();
-    quote({{"bid_size", "400"}, {"bid", "10.02"}, {"ask", "10.03"}});
+    quote({{"bid_size", "1"}, {"bid", "10.02"}, {"ask", "10.03"}});
     auto updated = engine->prepare_dispatch(S(original["client_order_id"]));
     REQUIRE(updated);
-    CHECK(Dec((*updated)["quantity"]) == Dec(40));
+    CHECK(Dec((*updated)["quantity"]) == Dec(200));
     CHECK(Dec((*updated)["limit_price"]) == Dec("10.02"));
     CHECK((*updated)["send_time"] == original["send_time"]);
-    CHECK(Dec(status()["free_credit"]) == Dec(60));
-    CHECK(Dec(status()["reserved"]) == Dec(40));
+    CHECK(Dec(status()["free_credit"]) == Dec(200));
+    CHECK(Dec(status()["reserved"]) == Dec(200));
     CHECK_FALSE(engine->prepare_dispatch(S(original["client_order_id"])));
 }
 
 TEST_CASE_FIXTURE(EngineFixture, "final dispatch does not enlarge child on deeper book") {
     start();
     tape();
-    quote({{"bid_size", "400"}});
+    quote({{"bid_size", "1000"}});
     json original = child();
     quote({{"bid_size", "10000"}});
     auto updated = engine->prepare_dispatch(S(original["client_order_id"]));
     REQUIRE(updated);
-    CHECK(Dec((*updated)["quantity"]) == Dec(40));
+    CHECK(Dec((*updated)["quantity"]) == Dec(100));
 }
 
 TEST_CASE_FIXTURE(EngineFixture, "halt before local dispatch releases unhanded reservation") {
@@ -539,7 +682,7 @@ TEST_CASE_FIXTURE(EngineFixture, "halt before local dispatch releases unhanded r
     CHECK_FALSE(engine->prepare_dispatch(S(original["client_order_id"])));
     json s = status();
     CHECK(Dec(s["reserved"]) == Dec(0));
-    CHECK(Dec(s["free_credit"]) == Dec(120));
+    CHECK(Dec(s["free_credit"]) == Dec(200));
     CHECK(s["fallback"] == false);
     CHECK(s["state"] == "HOLD");
     CHECK((*engine->get_order_context(S(original["client_order_id"])))["state"] == "TERMINAL");
@@ -556,7 +699,7 @@ TEST_CASE_FIXTURE(EngineFixture, "stop before dispatch releases without broker c
 }
 
 TEST_CASE_FIXTURE(EngineFixture, "deadline before dispatch never hands off order") {
-    start({{"horizon_seconds", 1}});
+    start({{"quantity", "100"}, {"horizon_seconds", 1}});
     tape();
     json original = child();
     now = 2;
@@ -566,11 +709,11 @@ TEST_CASE_FIXTURE(EngineFixture, "deadline before dispatch never hands off order
     CHECK(Dec(status()["reserved"]) == Dec(0));
 }
 
-TEST_CASE_FIXTURE(EngineFixture, "pre-dispatch shrink below notional minimum releases unsent") {
+TEST_CASE_FIXTURE(EngineFixture, "pre-dispatch inventory below minimum releases unsent") {
     start({{"min_notional", "500"}});
     tape();
     json original = child();
-    quote({{"bid_size", "400"}});
+    patch_stored_parent([](json& stored) { stored["accounts"]["A"]["quantity"] = "40"; });
     CHECK_FALSE(engine->prepare_dispatch(S(original["client_order_id"])));
     CHECK(Dec(status()["reserved"]) == Dec(0));
     CHECK(status()["reason"].get<std::string>().find("minimum") != std::string::npos);
@@ -606,13 +749,15 @@ TEST_CASE_FIXTURE(EngineFixture, "market watermark persists across restart") {
 }
 
 TEST_CASE_FIXTURE(EngineFixture, "depth heartbeat does not replenish known bid consumption") {
-    start();
-    tape("2000");
+    start({{"quantity", "2000"}});
+    quote({{"bid_size", "2000"}});
+    tape("4000");
     json c = child();
-    report(c, "FILLED", "100", {{"final", true}});
+    report(c, "FILLED", "200", {{"final", true}});
     now = 5;
-    quote({{"preserve_consumption", true}});
-    CHECK(Dec(child()["quantity"]) == Dec(90));
+    quote({{"bid_size", "2000"}, {"preserve_consumption", true}});
+    CHECK(engine->quotes_for_test().at("XYZ").consumed == Dec(200));
+    CHECK(Dec(child()["quantity"]) == Dec(200));
 }
 
 TEST_CASE_FIXTURE(EngineFixture, "abort prepared but unpublished child preserves fallback") {
@@ -668,7 +813,7 @@ TEST_CASE_FIXTURE(EngineFixture, "timer reconciliation releases only never prepa
     CHECK(status()["order_state"] == "RECONCILE");
     CHECK_FALSE(engine->prepare_dispatch(S(c["client_order_id"])));
     CHECK(Dec(status()["reserved"]) == Dec(0));
-    CHECK(Dec(status()["free_credit"]) == Dec(100));
+    CHECK(Dec(status()["free_credit"]) == Dec(200));
 }
 
 TEST_CASE_FIXTURE(EngineFixture, "prepared timer reconciliation keeps ambiguous reservation") {
@@ -698,9 +843,9 @@ TEST_CASE_FIXTURE(EngineFixture, "external decimal bounds do not truncate derive
         INFO(value);
         CHECK_THROWS_WITH_AS(ng::smart::parse_input_decimal(json(value)), doctest::Contains("precision"), ng::smart::ValueError);
     }
-    start({{"mode", "patient"}, {"quantity", "1"}, {"quantity_step", "1e-24"}, {"min_quantity", "1e-24"}});
+    start({{"mode", "patient"}, {"quantity", "100"}, {"quantity_step", "1e-24"}, {"min_quantity", "1e-24"}});
     tape("1e-24");
-    CHECK(Dec(status()["free_credit"]) == Dec("3e-26"));
+    CHECK(Dec(status()["free_credit"]) == Dec("6e-26"));
     CHECK_THROWS_WITH_AS(tape("1e-25", "out-of-bounds"), doctest::Contains("precision"), ng::smart::ValueError);
 }
 
@@ -744,13 +889,13 @@ TEST_CASE_FIXTURE(EngineFixture, "newer working report after terminal quarantine
     CHECK(cancel_current);
 }
 
-TEST_CASE_FIXTURE(EngineFixture, "round robin uses one shared slice and participation budget") {
+TEST_CASE_FIXTURE(EngineFixture, "unknown costs keep round robin and one shared participation budget") {
     start({{"account_ids", json::array({"A", "B", "C"})}, {"account_quantities", {{"A", "400"}, {"B", "400"}, {"C", "400"}}}});
     tape("2000");
     json first = child();
     CHECK(first["account_id"] == "A");
-    CHECK(Dec(first["quantity"]) == Dec("100"));
-    CHECK(Dec(status()["earned"]) == Dec("200.00"));
+    CHECK(first["quantity"] == "100");
+    CHECK(status()["earned"] == "400.00");
     CHECK(engine->tick().empty());
     int index = 1;
     for (const char* expected : {"B", "C", "A"}) {
@@ -766,20 +911,98 @@ TEST_CASE_FIXTURE(EngineFixture, "round robin uses one shared slice and particip
     }
 }
 
-TEST_CASE_FIXTURE(EngineFixture, "short inventory spills only remainder and retires empty accounts") {
-    start({{"account_ids", json::array({"empty", "A", "B", "C"})},
-           {"account_quantities", {{"empty", "0"}, {"A", "40"}, {"B", "30"}, {"C", "930"}}}});
+TEST_CASE_FIXTURE(EngineFixture, "closest cost account is used until exhausted before farther cost") {
+    start({{"account_ids", json::array({"A", "B"})}, {"account_quantities", {{"A", "750"}, {"B", "250"}}},
+           {"account_average_costs", {{"A", "11.00"}, {"B", "11.50"}}}});
     tape("2000");
     struct Step { double now; const char* account; const char* quantity; };
-    json s;
-    for (Step step : {Step{0, "A", "40"}, Step{5, "B", "30"}, Step{10, "C", "30"}, Step{15, "C", "100"}}) {
+    for (Step step : {Step{0, "B", "100"}, Step{5, "B", "100"}, Step{10, "A", "100"}}) {
         now = step.now;
-        quote();
+        quote({{"bid", 12}, {"ask", "12.01"}});
+        if (step.now == 10) tape("1000", "next-credit");
         json c = child();
         CHECK(c["account_id"] == step.account);
-        CHECK(Dec(c["quantity"]) == Dec(step.quantity));
+        CHECK(c["quantity"] == step.quantity);
+        report(c, "FILLED", step.quantity, {{"final", true}});
+        status();
+    }
+}
+
+TEST_CASE_FIXTURE(EngineFixture, "cost refresh changes next account without retargeting working child") {
+    start({{"account_ids", json::array({"A", "B"})}, {"account_quantities", {{"A", "500"}, {"B", "500"}}},
+           {"account_average_costs", {{"A", "11.00"}, {"B", "11.50"}}}});
+    quote({{"bid", "11.99"}, {"ask", "12.01"}});
+    tape("2000");
+    json first = child();
+    CHECK(first["account_id"] == "B");
+    engine->set_account_costs(parent, {{"A", Dec("12.10")}, {"B", Dec("11.50")}});
+    CHECK(status()["active_order"]["account_id"] == "B");
+    CHECK(engine->tick().empty());
+    report(first, "FILLED", first["quantity"].get<std::string>(), {{"final", true}});
+    now = 5;
+    quote({{"bid", 12}, {"ask", "12.01"}});
+    CHECK(child()["account_id"] == "A");
+}
+
+TEST_CASE_FIXTURE(EngineFixture, "closest cost uses absolute distance on either side of market") {
+    start({{"account_ids", json::array({"highest", "below", "above"})},
+           {"account_quantities", {{"highest", "400"}, {"below", "300"}, {"above", "300"}}},
+           {"account_average_costs", {{"highest", "13"}, {"below", "11.5"}, {"above", "12.1"}}}});
+    quote({{"bid", "11.99"}, {"ask", "12.01"}});
+    tape("2000");
+    json first = child();
+    CHECK(first["account_id"] == "above");
+    report(first, "FILLED", first["quantity"].get<std::string>(), {{"final", true}});
+    now = 5;
+    // A market-price move alone changes priority; costs have not changed.
+    quote({{"bid", "11.39"}, {"ask", "11.41"}});
+    CHECK(child()["account_id"] == "below");
+}
+
+TEST_CASE_FIXTURE(EngineFixture, "equal distances above and below market rotate using midpoint") {
+    start({{"account_ids", json::array({"above", "below"})}, {"account_quantities", {{"above", "500"}, {"below", "500"}}},
+           {"account_average_costs", {{"above", "12.5"}, {"below", "11.5"}}}, {"minimum_price", "13"}});
+    json levels = json::array({"12.1", "12.5", "13"});
+    quote({{"bid", "11.9"}, {"ask", "12.1"}, {"ask_prices", levels}});
+    tape("2000");
+    json first = child();
+    CHECK(first["account_id"] == "above");
+    CHECK(Dec(first["limit_price"]) >= Dec("13"));
+    report(first, "FILLED", first["quantity"].get<std::string>(), {{"final", true}});
+    now = 5;
+    quote({{"bid", "11.9"}, {"ask", "12.1"}, {"ask_prices", levels}});
+    CHECK(child()["account_id"] == "below");
+}
+
+TEST_CASE_FIXTURE(EngineFixture, "known costs rank before unknown and equal costs rotate") {
+    start({{"account_ids", json::array({"unknown", "A", "B"})},
+           {"account_quantities", {{"unknown", "200"}, {"A", "400"}, {"B", "400"}}},
+           {"account_average_costs", {{"A", "11.5"}, {"B", "11.50"}}}});
+    tape("2000");
+    json first = child();
+    CHECK(first["account_id"] == "A");
+    report(first, "FILLED", first["quantity"].get<std::string>(), {{"final", true}});
+    now = 5;
+    quote();
+    CHECK(child()["account_id"] == "B");
+}
+
+TEST_CASE_FIXTURE(EngineFixture, "short inventory sells available then spills to next closest account") {
+    // Input order deliberately differs from distance priority.
+    start({{"quantity", "10000"}, {"account_ids", json::array({"empty", "C", "B", "A"})},
+           {"account_quantities", {{"empty", "0"}, {"A", "400"}, {"B", "300"}, {"C", "9300"}}},
+           {"account_average_costs", {{"empty", "12"}, {"A", "12.10"}, {"B", "11.50"}, {"C", "13"}}}});
+    tape("20000");
+    struct Step { double now; const char* account; const char* quantity; };
+    json s;
+    for (Step step : {Step{0, "A", "400"}, Step{5, "B", "300"}, Step{10, "C", "300"}, Step{15, "C", "1000"}}) {
+        now = step.now;
+        quote({{"bid", "11.99"}, {"ask", "12.01"}, {"bid_size", "10000"}});
+        json c = child();
+        CHECK(c["account_id"] == step.account);
+        CHECK(c["quantity"] == step.quantity);
         if (step.now == 0) {
-            CHECK(Dec(status()["accounts"]["A"]["reserved"]) == Dec("40"));
+            CHECK(status()["accounts"]["A"]["reserved"] == "400");
             now = 1;
             CHECK(engine->tick().empty());
         }
@@ -789,25 +1012,27 @@ TEST_CASE_FIXTURE(EngineFixture, "short inventory spills only remainder and reti
     CHECK(s["accounts"]["empty"]["done"] == true);
     CHECK(s["accounts"]["A"]["done"] == true);
     CHECK(s["accounts"]["B"]["done"] == true);
-    CHECK(Dec(s["accounts"]["C"]["filled"]) == Dec("130"));
+    CHECK(s["accounts"]["C"]["filled"] == "1300");
 }
 
-TEST_CASE_FIXTURE(EngineFixture, "split slice keeps remainder when fresh depth is smaller") {
-    start({{"account_ids", json::array({"A", "B", "C"})}, {"account_quantities", {{"A", "40"}, {"B", "500"}, {"C", "460"}}}});
-    tape("2000");
+TEST_CASE_FIXTURE(EngineFixture, "split slice ignores smaller displayed depth") {
+    start({{"quantity", "10000"}, {"account_ids", json::array({"A", "B", "C"})},
+           {"account_quantities", {{"A", "400"}, {"B", "5000"}, {"C", "4600"}}}});
+    quote({{"bid_size", "10000"}});
+    tape("20000");
     json first = child();
-    report(first, "FILLED", "40", {{"final", true}});
+    report(first, "FILLED", "400", {{"final", true}});
     now = 5;
-    quote({{"bid_size", "500"}});
+    quote({{"bid_size", "1"}});
     json second = child();
     CHECK(second["account_id"] == "B");
-    CHECK(Dec(second["quantity"]) == Dec("50"));
-    report(second, "FILLED", "50", {{"final", true}});
+    CHECK(second["quantity"] == "600");
+    report(second, "FILLED", "600", {{"final", true}});
     now = 10;
-    quote();
+    quote({{"bid_size", "10000"}});
     json third = child();
     CHECK(third["account_id"] == "C");
-    CHECK(Dec(third["quantity"]) == Dec("10"));
+    CHECK(third["quantity"] == "1000");
 }
 
 TEST_CASE_FIXTURE(EngineFixture, "partial fill cancel refunds only selected account and rotates") {
@@ -853,58 +1078,61 @@ TEST_CASE_FIXTURE(EngineFixture, "fractional fill never creates an off step acco
     quote();
     tape("1000", "fractional-fill-followup");
     json third = child();
-    CHECK(third["account_id"] == "A");
-    CHECK(Dec(third["quantity"]) == Dec("79"));
+    // A's 79.5 leftover shares are below the 100-share minimum, so the slice goes to B.
+    CHECK(third["account_id"] == "B");
+    CHECK(third["quantity"] == "100");
     json account = status()["accounts"]["A"];
-    CHECK(Dec(account["remaining"]) == Dec("79.5"));
-    CHECK(Dec(account["reserved"]) == Dec(79));
+    CHECK(account["remaining"] == "79.5");
+    CHECK(Dec(account["reserved"]) == Dec(0));
 }
 
 TEST_CASE_FIXTURE(EngineFixture, "multi account pre-dispatch refund keeps account reservations exact") {
-    start({{"account_ids", json::array({"A", "B"})}, {"account_quantities", {{"A", "500"}, {"B", "500"}}}});
-    tape("2000");
+    start({{"quantity", "2000"}, {"account_ids", json::array({"A", "B"})}, {"account_quantities", {{"A", "1000"}, {"B", "1000"}}}});
+    quote({{"bid_size", "2000"}});
+    tape("4000");
     json first = child();
-    quote({{"bid_size", "400"}});
+    quote({{"bid_size", "1500"}});
     auto prepared = engine->prepare_dispatch(S(first["client_order_id"]));
     REQUIRE(prepared);
     CHECK((*prepared)["account_id"] == "A");
-    CHECK(Dec(status()["accounts"]["A"]["reserved"]) == Dec("40"));
+    CHECK(status()["accounts"]["A"]["reserved"] == "200");
     CHECK(engine->abort_dispatch(S(first["client_order_id"]), "not published"));
-    CHECK(Dec(status()["accounts"]["A"]["reserved"]) == Dec("0"));
+    CHECK(status()["accounts"]["A"]["reserved"] == "0");
 }
 
 TEST_CASE_FIXTURE(EngineFixture, "round robin and inventory survive restart") {
-    start({{"account_ids", json::array({"A", "B"})}, {"account_quantities", {{"A", "40"}, {"B", "960"}}}});
-    tape("2000");
+    start({{"quantity", "10000"}, {"account_ids", json::array({"A", "B"})}, {"account_quantities", {{"A", "400"}, {"B", "9600"}}}});
+    quote({{"bid_size", "10000"}});
+    tape("20000");
     json first = child();
-    report(first, "FILLED", "40", {{"final", true}});
+    report(first, "FILLED", "400", {{"final", true}});
     engine->close();
     now = 5;
     reopen();
-    quote();
+    quote({{"bid_size", "10000"}});
     json second = child();
     CHECK(second["account_id"] == "B");
-    CHECK(Dec(second["quantity"]) == Dec("60"));
+    CHECK(second["quantity"] == "600");
     CHECK(status()["accounts"]["A"]["done"] == true);
 }
 
 TEST_CASE_FIXTURE(EngineFixture, "explicit target remains supported without exceeding inventory") {
-    start({{"quantity", "150"}, {"horizon_seconds", 30}, {"account_ids", json::array({"A", "B"})},
-           {"account_quantities", {{"A", "40"}, {"B", "960"}}}});
-    tape("2000");
+    start({{"quantity", "1500"}, {"horizon_seconds", 30}, {"account_ids", json::array({"A", "B"})},
+           {"account_quantities", {{"A", "400"}, {"B", "9600"}}}});
+    tape("20000");
     struct Step { double now; const char* account; const char* quantity; };
-    for (Step step : {Step{0, "A", "40"}, Step{5, "B", "60"}, Step{10, "B", "50"}}) {
+    for (Step step : {Step{0, "A", "400"}, Step{5, "B", "1100"}}) {
         now = step.now;
-        quote();
+        quote({{"bid_size", "10000"}});
         json c = child();
         CHECK(c["account_id"] == step.account);
-        CHECK(Dec(c["quantity"]) == Dec(step.quantity));
+        CHECK(c["quantity"] == step.quantity);
         report(c, "FILLED", step.quantity, {{"final", true}});
     }
     json s = status();
     CHECK(s["state"] == "COMPLETED");
-    CHECK(Dec(s["filled"]) == Dec("150"));
-    CHECK(Dec(s["accounts"]["B"]["remaining"]) == Dec("850"));
+    CHECK(s["filled"] == "1500");
+    CHECK(s["accounts"]["B"]["remaining"] == "8500");
     CHECK(engine->tick().empty());
 }
 
@@ -988,7 +1216,7 @@ TEST_CASE_FIXTURE(EngineFixture, "python-written journal values are read back ex
         json stored = json::parse(select.column_text(0));
         CHECK(Dec(stored["F"]) == Dec("40"));
         CHECK(Dec(stored["R"]) == Dec("60"));
-        CHECK(Dec(stored["participation"]) == Dec("0.10"));
+        CHECK(Dec(stored["participation"]) == Dec("0.20"));
         CHECK(Dec(stored["order"]["cumulative_filled"]) == Dec("40"));
     }
     reopen();

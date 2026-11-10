@@ -201,6 +201,29 @@ std::vector<TopicPartition> Consumer::assignment() const {
     return out;
 }
 
+std::optional<std::pair<long long, long long>> Consumer::query_watermark_offsets(const std::string& topic, int partition,
+                                                                                 int timeout_ms) {
+    if (!rk_ || closed_) return std::nullopt;
+    int64_t low = 0, high = 0;
+    rd_kafka_resp_err_t err = rd_kafka_query_watermark_offsets(rk_, topic.c_str(), partition, &low, &high, timeout_ms);
+    if (err != RD_KAFKA_RESP_ERR_NO_ERROR) return std::nullopt;
+    return std::make_pair(static_cast<long long>(low), static_cast<long long>(high));
+}
+
+std::optional<long long> Consumer::offset_for_time(const std::string& topic, int partition, long long timestamp_ms, int timeout_ms) {
+    if (!rk_ || closed_) return std::nullopt;
+    rd_kafka_topic_partition_list_t* list = rd_kafka_topic_partition_list_new(1);
+    rd_kafka_topic_partition_list_add(list, topic.c_str(), partition)->offset = timestamp_ms;
+    rd_kafka_resp_err_t err = rd_kafka_offsets_for_times(rk_, list, timeout_ms);
+    std::optional<long long> result;
+    if (err == RD_KAFKA_RESP_ERR_NO_ERROR && list->cnt == 1 && list->elems[0].err == RD_KAFKA_RESP_ERR_NO_ERROR) {
+        long long offset = list->elems[0].offset;
+        result = offset >= 0 ? offset : kOffsetEnd;
+    }
+    rd_kafka_topic_partition_list_destroy(list);
+    return result;
+}
+
 void Consumer::close() {
     if (closed_ || !rk_) return;
     closed_ = true;

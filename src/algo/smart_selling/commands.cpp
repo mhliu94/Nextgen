@@ -31,7 +31,8 @@ json build_smart_selling_command(const json& action, const AccountDirectory& acc
         json shares = wire_number(action.at("quantity"), "Quantity", true);
         json price = wire_number(action.at("limit_price"), "Limit price", false);
         long long qty = shares.is_number_integer() ? shares.get<long long>() : static_cast<long long>(shares.get<double>());
-        command = orders::build_limit_order_command(account_id, symbol, "SELL", qty, price.get<double>(), accounts);
+        std::string side = action.contains("side") ? action.at("side").get<std::string>() : std::string("SELL");
+        command = orders::build_limit_order_command(account_id, symbol, side, qty, price.get<double>(), accounts);
         if (!shares.is_number_integer()) command["qty_shares"] = shares;  // fractional quantities stay exact floats
         command["command_id"] = action.at("client_order_id");
         command["client_order_id"] = action.at("client_order_id");
@@ -44,7 +45,7 @@ json build_smart_selling_command(const json& action, const AccountDirectory& acc
         throw std::invalid_argument("Only submit/cancel intents translate to trading commands");
     }
     command["parent_id"] = action.at("parent_id");
-    command["trading_mode"] = "G";
+    command["trading_mode"] = action.contains("trading_mode") ? action.at("trading_mode") : json("G");
     return command;
 }
 

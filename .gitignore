@@ -3,5 +3,7 @@ logs/
 certs/
 config/config.local.json
 config/trading_accounts.json
-config/historical_prices.csv
 *.log
+reports/
+snapshots/
+__pycache__/

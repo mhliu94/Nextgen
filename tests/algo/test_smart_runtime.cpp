@@ -1,6 +1,8 @@
 #include "smart_fixtures.h"
+#include <cmath>
 #include <set>
 #include "algo/smart_selling/runtime.h"
+#include "reporting_fakes.h"
 
 using namespace ngtest;
 using ng::AccountDirectory;
@@ -23,8 +25,8 @@ struct RuntimeFixture {
     std::shared_ptr<SmartSellingEngine> engine;
     std::unique_ptr<SmartSellingRuntime> runtime;
     std::string parent_id;
-    bool fast_active_flag = false;
-    bool fast_conflict_flag = false;
+    std::set<std::string> fast_owned;
+    ng::reporting::SessionReporter* reporting = nullptr;
 
     RuntimeFixture() {
         AccountSnapshot snap;
@@ -48,8 +50,8 @@ struct RuntimeFixture {
                 published.push_back(command);
                 keys.push_back(key);
             },
-            [this](const std::string&, const std::string&) { return fast_conflict_flag; }, [this] { return fast_active_flag; }, engine,
-            [this] { return now; }, [this] { return epoch + now; });
+            [this](const std::string& account) { return fast_owned.count(account) > 0; }, engine, [this] { return now; },
+            [this] { return epoch + now; }, reporting);
         runtime->set_feed_states_for_test({{"orders", "live"}, {"volume", "live"}});
     }
     std::string iso(double seconds = 0) const { return ng::iso_utc(epoch + now + seconds); }
@@ -151,11 +153,11 @@ TEST_CASE_FIXTURE(RuntimeFixture, "legacy legal explicit quantity accepts fracti
 
 TEST_CASE_FIXTURE(RuntimeFixture, "inventory rounding honors configured step and actual holdings") {
     build_runtime(json::parse(R"({"instruments": {"XYZ": {"quantity_step": "0.1", "min_quantity": "0.1"}}})"));
-    snap().positions[0].qty = 10.25;
-    snap().positions[0].available_qty = 50;
+    snap().positions[0].qty = 110.25;
+    snap().positions[0].available_qty = 150;
     json parent = runtime->start_parent(json{{"account_ids", json::array({"A"})}, {"symbol", "XYZ"}});
-    CHECK(Dec(parent["quantity"]) == Dec("10.2"));
-    CHECK(Dec(parent["accounts"]["A"]["quantity"]) == Dec("10.2"));
+    CHECK(parent["quantity"] == "110.2");
+    CHECK(parent["accounts"]["A"]["quantity"] == "110.2");
 }
 
 TEST_CASE_FIXTURE(RuntimeFixture, "all selected accounts require fresh enabled inventory and no open orders") {
@@ -188,10 +190,10 @@ TEST_CASE_FIXTURE(RuntimeFixture, "account selection and aggregate inventory val
 
 TEST_CASE_FIXTURE(RuntimeFixture, "inventory limits ignore short positions and cap reported available") {
     add_account("B", -10);
-    snap().positions[0].qty = 20;
+    snap().positions[0].qty = 200;
     snap().positions[0].available_qty = 1000;
     json parent = runtime->start_parent(json{{"account_ids", json::array({"A", "B"})}, {"symbol", "XYZ"}});
-    CHECK(Dec(parent["quantity"]) == Dec("20"));
+    CHECK(Dec(parent["quantity"]) == Dec("200"));
     CHECK(Dec(parent["accounts"]["B"]["quantity"]) == Dec("0"));
     runtime->stop_all();
     snap().positions[0].qty = 0;
@@ -199,24 +201,151 @@ TEST_CASE_FIXTURE(RuntimeFixture, "inventory limits ignore short positions and c
                       "Quantity must be positive and finite; no available position to sell");
 }
 
-TEST_CASE_FIXTURE(RuntimeFixture, "global active session and stopping reservation block other starts") {
+TEST_CASE_FIXTURE(RuntimeFixture, "stopping parent reserves its account while other accounts may start") {
     add_account();
     json command = submit();
     runtime->stop_all();
     runtime->wait_idle();
     CHECK(runtime->has_active_session());
     CHECK(runtime->owns_account("A"));
-    CHECK_THROWS_WITH(runtime->start_parent(json{{"account_ids", json::array({"B"})}, {"symbol", "OTHER"}}),
-                      "Smart selling already owns an active session; stop it before starting another");
+    const char* owned = "Account(s) A already belong to an algorithm session; stop it and await outstanding order confirmations "
+                        "before starting another";
+    CHECK_THROWS_WITH(runtime->start_parent(json{{"account_ids", json::array({"A"})}, {"symbol", "OTHER"}}), owned);
+    CHECK_THROWS_WITH(runtime->start_parent(json{{"account_ids", json::array({"B", "A"})}, {"symbol", "XYZ"}}), owned);
+    json other = runtime->start_parent(json{{"account_ids", json::array({"B"})}, {"symbol", "XYZ"}});
+    CHECK(runtime->owns_account("B"));
     order_payload(snapshot(command, {{"status", "CANCELED"}, {"sequence", 2}}));
-    CHECK_FALSE(runtime->has_active_session());
     CHECK_FALSE(runtime->owns_account("A"));
-    runtime->start_parent(json{{"account_ids", json::array({"B"})}, {"symbol", "XYZ"}});
+    CHECK(runtime->has_active_session());
+    runtime->stop_parent(S(other["parent_id"]));
+    CHECK_FALSE(runtime->has_active_session());
+    runtime->start_parent(json{{"account_ids", json::array({"A", "B"})}, {"symbol", "XYZ"}});
 }
 
-TEST_CASE_FIXTURE(RuntimeFixture, "any fast session blocks start even on different account or symbol") {
-    fast_active_flag = true;
-    CHECK_THROWS_WITH(start(), "Stop the existing algorithm before starting another session");
+TEST_CASE_FIXTURE(RuntimeFixture, "parents on disjoint accounts run at once across symbols") {
+    add_account();
+    snapshots["B"].positions.push_back(Position{"US.OTHER", 300, std::nullopt, 300});
+    json first = start();
+    json second = runtime->start_parent(json{{"account_ids", json::array({"B"})}, {"symbol", "OTHER"}, {"deadline", nullptr}});
+    std::set<std::string> active;
+    for (const json& parent : engine->list_parents(true)) active.insert(S(parent["parent_id"]));
+    CHECK(active == std::set<std::string>{S(first["parent_id"]), S(second["parent_id"])});
+    CHECK_THROWS_WITH(runtime->start_parent(json{{"account_ids", json::array({"B"})}, {"symbol", "XYZ"}}),
+                      "Account(s) B already belong to an algorithm session; stop it and await outstanding order confirmations "
+                      "before starting another");
+    CHECK(runtime->stop_all() == 2);
+}
+
+TEST_CASE_FIXTURE(RuntimeFixture, "fast sessions block only the accounts they own") {
+    add_account();
+    fast_owned = {"B"};
+    CHECK_THROWS_WITH(runtime->start_parent(json{{"account_ids", json::array({"A", "B"})}, {"symbol", "XYZ"}}),
+                      "Account(s) B already belong to an algorithm session; stop it and await outstanding order confirmations "
+                      "before starting another");
+    start();
+}
+
+TEST_CASE_FIXTURE(RuntimeFixture, "status keeps older active sessions beyond recent history without duplicates") {
+    json older = start({{"start_time", iso(-86400)}, {"deadline", nullptr}});
+    add_account("B");
+    for (int i = 0; i < 100; ++i) {
+        json stopped = start({{"account_id", "B"}, {"quantity", "100"}});
+        runtime->stop_parent(S(stopped["parent_id"]));
+    }
+    json current = start({{"account_id", "B"}, {"quantity", "100"}});
+    for (const json& parent : engine->list_parents()) CHECK(parent["parent_id"] != older["parent_id"]);
+    std::vector<json> visible = runtime->list_parents();
+    std::set<std::string> ids, active;
+    for (const json& parent : visible) {
+        ids.insert(S(parent["parent_id"]));
+        if (parent["active"].get<bool>()) active.insert(S(parent["parent_id"]));
+        CHECK(parent.contains("market_state"));
+    }
+    CHECK(ids.size() == visible.size());
+    CHECK(visible[0]["parent_id"] == current["parent_id"]);
+    CHECK(active == std::set<std::string>{S(older["parent_id"]), S(current["parent_id"])});
+}
+
+TEST_CASE_FIXTURE(RuntimeFixture, "average holding cost controls selection and refreshes from snapshots") {
+    AccountSnapshot& second = add_account();
+    snap().positions = {Position{"XYZ", 500, 11.0, std::nullopt}, Position{"US.XYZ", 500, 12.0, std::nullopt}};
+    second.positions[0].avg_price = 11.25;
+    json parent = runtime->start_parent(json{{"account_ids", json::array({"B", "A"})}, {"symbol", "XYZ"}, {"mode", "urgent"}, {"deadline", iso(300)}});
+    CHECK(Dec(parent["accounts"]["A"]["average_cost"]) == Dec("11.5"));
+    QuoteUpdate u;
+    u.bid = 12;
+    u.ask = 12.01;
+    u.bid_size = 1000;
+    u.source_time = epoch;
+    engine->on_quote("XYZ", u);
+    trade("cost-volume", 2000);
+    runtime->tick();
+    runtime->wait_idle();
+    REQUIRE(!published.empty());
+    // A's cost (11.5) is closer to the 12.005 midpoint than B's (11.25), although B was listed first.
+    CHECK(published.back()["account_id"] == "A");
+    second.positions[0].avg_price = 11.75;
+    runtime->tick();
+    runtime->wait_idle();
+    json updated = engine->get_parent(S(parent["parent_id"]));
+    CHECK(Dec(updated["accounts"]["B"]["average_cost"]) == Dec("11.75"));
+    CHECK(updated["active_order"]["account_id"] == "A");
+}
+
+TEST_CASE_FIXTURE(RuntimeFixture, "incomplete or invalid average cost is unknown") {
+    for (std::optional<double> cost : {std::optional<double>(), std::optional<double>(std::nan("")), std::optional<double>(INFINITY),
+                                       std::optional<double>(-1.0)}) {
+        snap().positions = {Position{"XYZ", 100, 11.0, std::nullopt}, Position{"US.XYZ", 100, cost, std::nullopt}};
+        CHECK_FALSE(runtime->account_average_cost("A", "XYZ").has_value());
+    }
+    // Short or flat holdings carry no cost; an account without a snapshot is unknown too.
+    snap().positions = {Position{"XYZ", -100, 11.0, std::nullopt}};
+    CHECK_FALSE(runtime->account_average_cost("A", "XYZ").has_value());
+    CHECK_FALSE(runtime->account_average_cost("missing", "XYZ").has_value());
+}
+
+TEST_CASE_FIXTURE(RuntimeFixture, "weighted average cost accepts recurring decimal and ignores client override") {
+    snap().positions = {Position{"XYZ", 100, 11.0, std::nullopt}, Position{"US.XYZ", 200, 12.0, std::nullopt}};
+    json parent = runtime->start_parent(json{{"account_ids", json::array({"A"})}, {"symbol", "XYZ"}, {"account_average_costs", {{"A", "999"}}}});
+    // Decimal(3500) / 300 under Python's default 28-digit context.
+    CHECK(parent["accounts"]["A"]["average_cost"] == "11.66666666666666666666666667");
+    runtime->tick();
+    CHECK(engine->get_parent(S(parent["parent_id"]))["accounts"] == parent["accounts"]);
+}
+
+TEST_CASE_FIXTURE(RuntimeFixture, "child cap switch controls the actual published quantity") {
+    json settings = {{"account_ids", json::array({"A"})}, {"symbol", "XYZ"}, {"mode", "urgent"}, {"deadline", iso(300)}};
+    for (json value : {json("true"), json("false"), json(1), json(nullptr)}) {
+        json invalid = settings;
+        invalid["disable_child_cap"] = value;
+        CHECK_THROWS_WITH(runtime->start_parent(invalid), "disable_child_cap must be a boolean");
+    }
+    CHECK_FALSE(runtime->has_active_session());
+    struct Row { const char* mode; bool disabled; int quantity; };
+    for (Row row : {Row{"urgent", true, 1000}, Row{"urgent", false, 100}, Row{"ultra", true, 1000}, Row{"ultra", false, 100}}) {
+        INFO(row.mode << " disabled=" << row.disabled);
+        json request = settings;
+        request["mode"] = row.mode;
+        request["disable_child_cap"] = row.disabled;
+        json parent = runtime->start_parent(request);
+        CHECK(parent["disable_child_cap"] == row.disabled);
+        QuoteUpdate u;
+        u.bid = 10;
+        u.ask = 10.01;
+        u.bid_size = 1;
+        u.source_time = epoch;
+        engine->on_quote("XYZ", u);
+        std::string label = std::string(row.mode) + "-" + (row.disabled ? "True" : "False");
+        trade(label, 5000);
+        runtime->tick();
+        runtime->wait_idle();
+        REQUIRE(!published.empty());
+        json command = published.back();
+        CHECK(command["qty_shares"] == row.quantity);
+        order_payload(snapshot(command, {{"order_id", "broker-" + label}, {"status", "FILLED"}, {"filled_quantity", row.quantity},
+                                         {"average_fill_price", 10}}));
+        runtime->stop_parent(S(parent["parent_id"]));
+    }
 }
 
 TEST_CASE_FIXTURE(RuntimeFixture, "no deadline publishes and does not request completion forecast") {
@@ -256,23 +385,23 @@ TEST_CASE_FIXTURE(RuntimeFixture, "dispatch uses selected child account and rech
 }
 
 TEST_CASE_FIXTURE(RuntimeFixture, "round robin handoffs never oversell when account snapshots lag fills") {
-    snap().positions[0].qty = 60;
-    snap().positions[0].available_qty = 60;
-    add_account("B", 140);
+    snap().positions[0].qty = 600;
+    snap().positions[0].available_qty = 600;
+    add_account("B", 1400);
     json parent = runtime->start_parent(json{{"account_ids", json::array({"A", "B"})}, {"symbol", "XYZ"}, {"mode", "urgent"}, {"deadline", iso(60)}});
     struct Step { const char* account; int quantity; };
     std::vector<json> commands;
     int index = 0;
-    for (Step step : {Step{"A", 60}, Step{"B", 40}, Step{"B", 100}}) {
+    for (Step step : {Step{"A", 600}, Step{"B", 400}, Step{"B", 1000}}) {
         now = index * 5;
         for (auto& [id, s] : snapshots) s.ts = iso();
         QuoteUpdate u;
         u.bid = 10;
         u.ask = 10.01;
-        u.bid_size = 1000;
+        u.bid_size = 10000;
         u.source_time = epoch + now;
         engine->on_quote("XYZ", u);
-        if (index != 1) trade("t" + std::to_string(index), 1000, epoch + now);
+        if (index != 1) trade("t" + std::to_string(index), 10000, epoch + now);
         runtime->tick();
         runtime->wait_idle();
         REQUIRE(!published.empty());
@@ -286,7 +415,7 @@ TEST_CASE_FIXTURE(RuntimeFixture, "round robin handoffs never oversell when acco
         ++index;
     }
     json result = engine->get_parent(S(parent["parent_id"]));
-    CHECK(Dec(result["filled"]) == Dec("200"));
+    CHECK(Dec(result["filled"]) == Dec("2000"));
     CHECK(Dec(result["remaining"]) == Dec("0"));
     CHECK(Dec(result["accounts"]["A"]["remaining"]) == Dec("0"));
     CHECK(Dec(result["accounts"]["B"]["remaining"]) == Dec("0"));
@@ -297,9 +426,10 @@ TEST_CASE_FIXTURE(RuntimeFixture, "round robin handoffs never oversell when acco
 }
 
 TEST_CASE_FIXTURE(RuntimeFixture, "configured percentages drive each mode and ignore http rate overrides") {
-    build_runtime(json::parse(R"({"participation_percentages": {"patient": "2.5", "normal": "4", "urgent": "12.25"}})"));
+    build_runtime(json::parse(R"({"participation_percentages": {"patient": "2.5", "normal": "4", "urgent": "12.25", "ultra": "27.5"}})"));
     struct Row { const char* mode; const char* percentage; };
-    for (Row row : {Row{"patient", "2.5"}, Row{"normal", "4"}, Row{"urgent", "12.25"}, Row{"1", "2.5"}}) {
+    for (Row row : {Row{"patient", "2.5"}, Row{"normal", "4"}, Row{"urgent", "12.25"}, Row{"ultra", "27.5"}, Row{"1", "2.5"},
+                    Row{"4", "27.5"}}) {
         INFO(row.mode);
         json parent = start({{"mode", row.mode}, {"participation_percentage", 99}, {"participation", ".99"}});
         trade(row.mode, 100);
@@ -473,9 +603,11 @@ TEST_CASE_FIXTURE(RuntimeFixture, "http cannot override execution rules or choos
 }
 
 TEST_CASE_FIXTURE(RuntimeFixture, "one account symbol and conflicting fast strategy are rejected") {
-    fast_conflict_flag = true;
-    CHECK_THROWS_WITH(start(), "Stop the existing algorithm before starting another session");
-    fast_conflict_flag = false;
+    const char* owned = "Account(s) A already belong to an algorithm session; stop it and await outstanding order confirmations "
+                        "before starting another";
+    fast_owned = {"A"};
+    CHECK_THROWS_WITH(start(), owned);
+    fast_owned.clear();
     start();
-    CHECK_THROWS_WITH(start({{"symbol", "XYZ"}}), "Smart selling already owns an active session; stop it before starting another");
+    CHECK_THROWS_WITH(start({{"symbol", "XYZ"}}), owned);
 }

@@ -25,8 +25,11 @@ Application::~Application() {
     try {
         request_stop();
         if (server_) server_->stop();
+        if (system_snapshots_) system_snapshots_->stop();
         if (smart_consumer_) smart_consumer_->stop();
+        if (buying_consumer_) buying_consumer_->stop();
         if (market_consumer_) market_consumer_->stop();
+        if (market_order_consumer_) market_order_consumer_->stop();
         if (account_consumer_) account_consumer_->stop();
         if (control_) control_->shutdown();
     } catch (...) {
@@ -45,10 +48,13 @@ void Application::initialise() {
     std::vector<std::string> symbols = load_symbols(config_);
     NG_LOG_INFO(kLog, "configuration loaded path={} accounts={} symbols={} librdkafka={}", config_.config_path, accounts.size(),
                 symbols.size(), kafka::library_version());
-    NG_LOG_INFO(kLog, "market-data historical_prices_csv={}", config_.market_data.historical_prices_csv);
+    // Archive every configured trade account, including accounts hidden in the UI.
+    snapshot_accounts_ = load_account_metas(config_, true);
 
     control_ = std::make_unique<web::ControlCenter>(config_, std::move(accounts), std::move(symbols));
     sessions_ = std::make_unique<web::SessionStore>();
+    control_->create_reporting(config_.reporting.db_path);
+    NG_LOG_INFO(kLog, "activity reports db={}", config_.reporting.db_path);
 
     double started_at = wall_now();
     control_->set_operations_log(std::make_unique<OperationsLog>(
@@ -66,10 +72,13 @@ void Application::initialise() {
         NG_LOG_INFO(kLog, "daily order archive at {} {} into {}", *config_.persistence.order_archive.daily_at,
                     config_.persistence.order_archive.timezone, config_.persistence.order_archive.dir);
     }
+    system_snapshots_ = std::make_unique<reporting::SystemSnapshotRecorder>(
+        config_.reporting.db_path, snapshot_accounts_, [this] { return control_->account_store().get_all(); });
     control_->set_persistence_status([this] {
         json out;
         out["order_archive"] = archive_ ? archive_->status() : json{{"enabled", false}};
         out["account_snapshots"] = holdings_ ? holdings_->status() : json{{"enabled", false}};
+        out["system_snapshots"] = system_snapshots_ ? system_snapshots_->status() : json{{"enabled", false}};
         return out;
     });
 
@@ -86,21 +95,44 @@ void Application::initialise() {
     } else {
         NG_LOG_INFO(kLog, "smart selling disabled by configuration");
     }
+    if (config_.smart_buying.enabled) {
+        control_->create_smart_buying_runtime();
+        NG_LOG_INFO(kLog, "smart buying journal={}", config_.smart_buying.state_db);
+    } else {
+        NG_LOG_INFO(kLog, "smart buying disabled by configuration");
+    }
 
     if (!options_.without_kafka) {
+        // The account feed also carries accounts hidden in the UI: they are archived by the system
+        // snapshots but never served to the browser.
         account_consumer_ = std::make_unique<kafka::AccountDetailsConsumer>(config_.kafka, control_->account_store(),
-                                                                            control_->accounts());
+                                                                            snapshot_accounts_);
         smart::SmartSellingRuntime* smart = control_->smart_runtime();
+        smart::SmartSellingRuntime* buying = control_->buying_runtime();
+        bool any_smart = smart || buying;
         market_consumer_ = std::make_unique<kafka::PriceBookConsumer>(
             config_.kafka, control_->market_store(),
-            smart ? kafka::PriceBookConsumer::PayloadCallback(
-                        [smart](const json& payload, const std::string& topic, int partition, long long offset) {
-                            smart->on_price_book(payload, topic, partition, offset);
-                        })
-                  : nullptr,
-            smart ? kafka::PriceBookConsumer::HealthCallback([smart](bool healthy) { smart->on_price_book_health(healthy); })
-                  : nullptr);
+            any_smart ? kafka::PriceBookConsumer::PayloadCallback(
+                            [smart, buying](const json& payload, const std::string& topic, int partition, long long offset) {
+                                if (smart) smart->on_price_book(payload, topic, partition, offset);
+                                if (buying) buying->on_price_book(payload, topic, partition, offset);
+                            })
+                      : nullptr,
+            any_smart ? kafka::PriceBookConsumer::HealthCallback([smart, buying](bool healthy) {
+                if (smart) smart->on_price_book_health(healthy);
+                if (buying) buying->on_price_book_health(healthy);
+            })
+                      : nullptr,
+            [this](const StockQuote& quote) { control_->market_activity()->record_quote(quote); },
+            // Enough retained quotes to populate the four five-minute windows after a restart.
+            25 * 60);
         if (smart) smart_consumer_ = std::make_unique<kafka::SmartSellingConsumer>(config_, *smart);
+        if (buying) buying_consumer_ = std::make_unique<kafka::SmartSellingConsumer>(config_, config_.smart_buying, *buying);
+        // Our traded volume does not depend on the order UI or either Smart controller being enabled.
+        order_ui::OrderKafkaConfig order_kafka = order_ui::load_kafka_config(config_.raw, config_.config_path);
+        order_kafka.group_id = "market-activity-" + order_kafka.group_id;
+        market_order_consumer_ = std::make_unique<order_ui::OrderStatusConsumer>(order_kafka, *control_->market_order_store(),
+                                                                                 "ktrader-nextgen-market-activity");
     }
     web::FeedHealthProviders health;
     health.accounts = [this]() -> json { return account_consumer_ ? account_consumer_->health().to_json() : json(nullptr); };
@@ -123,6 +155,16 @@ void Application::initialise() {
         out["topic"] = smart_consumer_->volume().topic();
         return out;
     };
+    auto feed_json = [](kafka::SmartSellingFeed& feed) {
+        json out;
+        out["state"] = feed.state();
+        out["messages"] = feed.messages();
+        out["rejected"] = feed.rejected_messages();
+        out["topic"] = feed.topic();
+        return out;
+    };
+    health.buying_orders = [this, feed_json]() -> json { return buying_consumer_ ? feed_json(buying_consumer_->orders()) : json(nullptr); };
+    health.buying_volume = [this, feed_json]() -> json { return buying_consumer_ ? feed_json(buying_consumer_->volume()) : json(nullptr); };
     control_->set_feed_health_providers(std::move(health));
 
     web::ServerOptions server_options;
@@ -155,8 +197,11 @@ void Application::initialise() {
 void Application::start() {
     if (started_) return;
     started_ = true;
+    if (market_order_consumer_) market_order_consumer_->start();
     if (account_consumer_) account_consumer_->start();
+    if (system_snapshots_) system_snapshots_->start();
     if (smart_consumer_) smart_consumer_->start();
+    if (buying_consumer_) buying_consumer_->start();
     if (market_consumer_) market_consumer_->start();
     control_->start_background();
     if (holdings_) holdings_->start();
@@ -194,8 +239,11 @@ int Application::run() {
     server_->stop();
     if (archive_) archive_->stop();
     if (holdings_) holdings_->stop();
+    if (system_snapshots_) system_snapshots_->stop();
     if (smart_consumer_) smart_consumer_->stop();
+    if (buying_consumer_) buying_consumer_->stop();
     if (market_consumer_) market_consumer_->stop();
+    if (market_order_consumer_) market_order_consumer_->stop();
     if (account_consumer_) account_consumer_->stop();
     control_->shutdown();
     if (auto* sink = dynamic_cast<web::KafkaCommandSink*>(control_->command_sink())) sink->producer().flush(2.0);

@@ -29,6 +29,8 @@ struct KafkaConfig {
     std::string market_data_group_id;
     std::string auto_offset_reset;
     std::string market_data_auto_offset_reset;
+    // Complete-snapshot records replayed per partition on every market-data assignment (0: new data only).
+    int market_data_replay_records = 100;
     double poll_timeout_sec = 1.0;
     std::string producer_acks = "all";
     bool producer_enable_idempotence = true;
@@ -48,7 +50,11 @@ struct ServerConfig {
 };
 
 struct MarketDataConfig {
-    std::string historical_prices_csv;
+    // Optional market-data publisher configuration (md_producer_config.json); its `symbols` list
+    // drives the Market Data page. Empty when not configured.
+    std::string publisher_config;
+    std::vector<std::string> symbols;  // upper-cased, de-duplicated publisher symbols
+    bool has_publisher_symbols = false;
     int market_insights_max_levels = 20;
 };
 
@@ -70,7 +76,8 @@ struct SmartSellingConfig {
     double quote_max_age = 10;
     double trade_max_age = 15;
     double account_max_age = 60;
-    // Percentage units as exact decimal strings: {"patient": "3", "normal": "6", "urgent": "10"}.
+    // Percentage units as exact decimal strings: {"patient": "6", "normal": "12", "urgent": "20", "ultra": "30"}
+    // for Smart selling; Smart buying is fixed at {"patient": "5", "normal": "8", "urgent": "15"}.
     std::map<std::string, std::string> participation_percentages;
     std::map<std::string, std::string> instrument_defaults;
     std::map<std::string, std::map<std::string, std::string>> instruments;
@@ -109,6 +116,12 @@ struct PersistenceConfig {
     HoldingsRecorderConfig account_snapshots;
 };
 
+// Durable activity reports shared by the control server and the order UI (reports/activity.sqlite3):
+// algorithm sessions, order tags, order executions, system snapshots and market activity samples.
+struct ReportingConfig {
+    std::string db_path;  // absolute
+};
+
 struct AuthUser {
     std::string password;
     std::string role;
@@ -127,14 +140,21 @@ struct AppConfig {
     MarketDataConfig market_data;
     FastTradingConfig fast_trading;
     SmartSellingConfig smart_selling;
+    SmartSellingConfig smart_buying;  // mode H; same shape, separate journal
+    ReportingConfig reporting;
     json order_ui = json::object();
     PersistenceConfig persistence;
     std::string operations_log_dir = "./logs";
     json raw;  // original document for diagnostics
 
-    // Currency conversion and trading-status controls are only available to the lmh account
+    // Trading-status controls are only available to the lmh account
     // (trading_ui/webserver.py::_has_lmh_feature_access); this is not configurable, as in the original.
     bool is_privileged(const std::string& user) const;
+    // Admin Control and the Market Data dashboard compare the exact username (no trimming), as upstream.
+    bool can_access_admin_control(const std::string& user) const { return user == "lmh"; }
+    bool can_access_market_data(const std::string& user) const { return user == "lmh"; }
+    // Symbols offered by the Market Data page: the publisher's list when configured, else `symbols`.
+    std::vector<std::string> market_data_symbols() const;
 };
 
 // Loads and validates the configuration (Python load_config semantics, including env overrides).
@@ -149,8 +169,9 @@ struct ConfigOverrides {
 };
 
 AppConfig load_config(const std::string& config_path, const ConfigOverrides& overrides = {});
-// Loads visible account metadata (hidden accounts skipped) from accounts_file or inline accounts.
-AccountDirectory load_account_metas(const AppConfig& config);
+// Loads account metadata from accounts_file or inline accounts; hidden accounts are skipped unless
+// `include_hidden` (system snapshots archive every configured trade account).
+AccountDirectory load_account_metas(const AppConfig& config, bool include_hidden = false);
 // Normalised, de-duplicated configured symbols in file order.
 std::vector<std::string> load_symbols(const AppConfig& config);
 // Default config path resolution: ACCOUNT_DASHBOARD_CONFIG, else <dir>/config.local.json, else <dir>/config.json.
@@ -162,6 +183,13 @@ FastTradingConfig normalize_fast_trading_config(const json* raw);
 // ACCOUNT_SNAPSHOTS_DIR override the file. The order topic defaults to smart_selling.order_status_topic.
 PersistenceConfig normalize_persistence_config(const json* raw, const std::string& config_dir, const SmartSellingConfig& smart);
 SmartSellingConfig normalize_smart_selling_config(const json* raw);
+// Mode H: Smart selling's shape with a separate default journal, fixed 5/8/15% participation, a
+// minimum quantity of at least 100 shares and a quantity step of at least 1.
+SmartSellingConfig normalize_smart_buying_config(const json* raw);
+// `reporting` section: only `db_path` is allowed; relative paths resolve against config_dir. Without
+// it the database is ./reports/activity.sqlite3 under the working directory (REPORTING_DB_PATH overrides).
+ReportingConfig normalize_reporting_config(const json* raw, const std::string& config_dir);
+json read_json_file(const std::string& path);
 std::string resolve_relative_path(const std::string& base_dir, const std::string& path);
 
 }  // namespace ng

@@ -14,11 +14,13 @@
 #include <vector>
 
 #include "algo/fast_trading/fast_trading.h"
+#include "algo/smart_buying/engine.h"
 #include "algo/smart_selling/engine.h"
 #include "algo/smart_selling/feedback.h"
 #include "algo/smart_selling/market_adapter.h"
 #include "core/decimal.h"
 #include "core/json.h"
+#include "core/time_util.h"
 #include "model/account.h"
 #include "model/market_data.h"
 
@@ -35,13 +37,16 @@ namespace {
 constexpr double kEpoch = 1800000000.0;
 
 const char* kParentKeys[] = {"state", "order_state", "active", "mode", "participation", "quantity", "earned", "free_credit",
-                             "reserved", "filled", "discarded", "remaining", "fallback", "child_cap", "reason", "deadline",
-                             "residual_provisional", "fills_after_cancel", "stop_requested", "symbol", "account_ids",
-                             "minimum_price", "imminent_event", "time_in_force"};
+                             "reserved", "filled", "discarded", "remaining", "fallback", "child_cap", "disable_child_cap", "reason",
+                             "start", "deadline", "residual_provisional", "fills_after_cancel", "stop_requested", "symbol",
+                             "account_id", "account_ids", "minimum_price", "maximum_price", "trading_mode", "capacity",
+                             "imminent_event", "time_in_force"};
+const char* kAccountKeys[] = {"quantity", "average_cost", "filled", "reserved", "remaining", "done", "cash_budget", "spent"};
 const char* kOrderKeys[] = {"account_id", "quantity", "limit_price", "state", "cumulative_filled", "cancel_intent",
-                            "broker_order_id", "prepared"};
+                            "broker_order_id", "prepared", "aggressive", "dispatch_prepared", "sequence"};
 const char* kActionKeys[] = {"type", "account_id", "symbol", "quantity", "limit_price", "side", "order_type", "time_in_force",
-                             "send_time", "deadline", "include_open_orders_and_executions"};
+                             "send_time", "send_timestamp", "deadline", "include_open_orders_and_executions", "trading_mode",
+                             "broker_order_id"};
 
 struct Session {
     std::string dir;
@@ -50,15 +55,21 @@ struct Session {
     std::unique_ptr<SmartSellingFeedback> feedback;
     std::unique_ptr<SmartSellingMarketAdapter> market;
     json config;
+    bool buying = false;                      // Smart buying (mode H) engine instead of Smart selling
     std::vector<std::string> parents;         // parent index -> parent id
     std::vector<std::string> orders;          // order index -> client order id
     std::map<std::string, int> order_index;   // client order id -> index
     std::map<std::string, json> submit_by_id; // client order id -> submit action
+    std::map<std::string, long long> report_sequence;  // client order id -> last generated report sequence
 
     double wall() const { return kEpoch + now; }
 
     void open() {
-        engine = std::make_unique<SmartSellingEngine>(dir + "/smart.sqlite3", [this] { return now; }, [this] { return wall(); });
+        if (buying) {
+            engine = std::make_unique<ng::smart::SmartBuyingEngine>(dir + "/smart.sqlite3", [this] { return now; }, [this] { return wall(); });
+        } else {
+            engine = std::make_unique<SmartSellingEngine>(dir + "/smart.sqlite3", [this] { return now; }, [this] { return wall(); });
+        }
         feedback = std::make_unique<SmartSellingFeedback>(*engine, 10000, dir + "/feedback.sqlite3");
         market = std::make_unique<SmartSellingMarketAdapter>(*engine, [this] { return now; }, [this] { return wall(); },
                                                              config.value("max_source_age", 10.0), config.value("rate_window", 300.0),
@@ -81,6 +92,22 @@ struct Session {
         }
         if (action.value("type", "") == "submit") submit_by_id[id] = action;
     }
+
+    // The outstanding child of a parent, resolved at run time (null when there is none).
+    json active_order(const json& step) {
+        int k = step.value("parent", 0);
+        if (k < 0 || k >= static_cast<int>(parents.size())) throw std::runtime_error("unknown parent index");
+        json parent = engine->get_parent(parents[static_cast<std::size_t>(k)]);
+        if (!parent.contains("active_order") || !parent.at("active_order").is_object()) return nullptr;
+        json order = parent.at("active_order");
+        std::string id = order.at("client_order_id").get<std::string>();
+        if (!order_index.count(id)) {
+            order_index[id] = static_cast<int>(orders.size());
+            orders.push_back(id);
+        }
+        return order;
+    }
+    long long next_sequence(const std::string& id) { return ++report_sequence[id]; }
 
     std::optional<std::string> order_id(const json& ref) const {
         if (!ref.is_number_integer()) return std::nullopt;
@@ -116,7 +143,7 @@ struct Session {
             json accounts = json::object();
             for (auto it = parent.at("accounts").begin(); it != parent.at("accounts").end(); ++it) {
                 json a = json::object();
-                for (const char* key : {"quantity", "filled", "reserved", "remaining", "done"}) {
+                for (const char* key : kAccountKeys) {
                     if (it.value().contains(key)) a[key] = it.value().at(key);
                 }
                 accounts[it.key()] = a;
@@ -225,7 +252,27 @@ json run_smart_step(Session& s, const json& step) {
         u.accessible = step.value("accessible", true);
         u.reset_sequence = step.value("reset_sequence", false);
         u.preserve_consumption = step.value("preserve_consumption", false);
+        if (step.contains("ask_size") && !step.at("ask_size").is_null()) u.ask_size = step.at("ask_size");
+        if (step.contains("bid_prices") && !step.at("bid_prices").is_null()) u.bid_prices = step.at("bid_prices").get<std::vector<json>>();
+        if (step.contains("ask_prices") && !step.at("ask_prices").is_null()) u.ask_prices = step.at("ask_prices").get<std::vector<json>>();
         s.engine->on_quote(step.value("symbol", "XYZ"), u);
+    } else if (op == "costs") {
+        int k = step.value("parent", 0);
+        if (k < 0 || k >= static_cast<int>(s.parents.size())) throw std::runtime_error("unknown parent index");
+        std::map<std::string, std::optional<ng::Decimal>> costs;
+        for (auto it = step.at("costs").begin(); it != step.at("costs").end(); ++it) {
+            if (it.value().is_null()) costs[it.key()] = std::nullopt;
+            else costs[it.key()] = ng::smart::parse_decimal(it.value(), "average cost", false, true);
+        }
+        s.engine->set_account_costs(s.parents[static_cast<std::size_t>(k)], costs);
+    } else if (op == "cash") {
+        auto* buying = dynamic_cast<ng::smart::SmartBuyingEngine*>(s.engine.get());
+        if (!buying) throw std::runtime_error("cash limits apply to Smart buying only");
+        for (auto it = step.at("limits").begin(); it != step.at("limits").end(); ++it) {
+            const json& value = it.value();
+            buying->set_cash_limit(it.key(), value.is_string() ? ng::Decimal::parse(value.get<std::string>())
+                                                                : ng::Decimal::from_python_float(value.get<double>()));
+        }
     } else if (op == "feed_health") {
         s.engine->set_feed_health(step.value("symbol", "XYZ"), step.value("healthy", true), step.value("reason", ""),
                                   step.value("reset_sequence", false));
@@ -323,6 +370,57 @@ json run_smart_step(Session& s, const json& step) {
         auto id = s.order_id(step.at("order"));
         if (!id) throw std::runtime_error("unknown order index");
         result["reconciled"] = s.feedback->reconcile(*id);
+    } else if (op == "prepare_active" || op == "abort_active" || op == "report_active" || op == "snapshot_active") {
+        json order = s.active_order(step);
+        if (order.is_null()) {
+            result["skipped"] = true;
+        } else {
+            std::string id = order.at("client_order_id").get<std::string>();
+            int index = s.order_index.at(id);
+            result["order"] = index;
+            json fraction_raw = get_or(step, "fraction", json("0"));
+            ng::Decimal fraction = fraction_raw.is_string() ? ng::Decimal::parse(fraction_raw.get<std::string>())
+                                                             : ng::Decimal::from_python_float(fraction_raw.get<double>());
+            ng::Decimal whole = (ng::smart::parse_decimal(order.at("quantity")) * fraction).round_down_to_step(ng::Decimal(1));
+            std::string whole_text = ng::Decimal(whole.to_int64()).str();
+            if (op == "prepare_active") {
+                auto prepared = s.engine->prepare_dispatch(id);
+                result["prepared"] = prepared ? s.normalise_action(*prepared) : json(nullptr);
+            } else if (op == "abort_active") {
+                result["aborted"] = s.engine->abort_dispatch(id, step.value("reason", "abort"), step.value("stop_parent", false));
+            } else if (op == "report_active") {
+                OrderReport r;
+                r.status = step.at("status").get<std::string>();
+                r.cumulative_filled = whole_text;
+                r.broker_order_id = "broker-" + std::to_string(index);
+                r.sequence = s.next_sequence(id);
+                r.authoritative = step.value("authoritative", true);
+                r.final = step.value("final", false);
+                s.engine->on_order_report(id, r);
+                result["cumulative"] = whole_text;
+            } else {
+                double send_wall = order.at("send_wall").get<double>();
+                double filled = static_cast<double>(whole.to_int64());
+                double limit = std::stod(order.at("limit_price").get<std::string>());
+                json payload = {{"schema_version", 1},
+                                {"account_id", order.at("account_id")},
+                                {"order_id", "broker-" + std::to_string(index)},
+                                {"sequence", s.next_sequence(id)},
+                                {"created_at", ng::iso_utc_offset(send_wall)},
+                                {"updated_at", ng::iso_utc_offset(std::max(s.wall(), send_wall))},
+                                {"symbol", "XYZ"},
+                                {"side", step.value("side", s.buying ? "BUY" : "SELL")},
+                                {"order_type", "LIMIT"},
+                                {"status", step.at("status")},
+                                {"quantity", std::stod(order.at("quantity").get<std::string>())},
+                                {"filled_quantity", filled},
+                                {"average_fill_price", filled != 0 ? json(limit) : json(nullptr)},
+                                {"limit_price", limit},
+                                {"command_id", id}};
+                result["applied"] = s.feedback->apply_snapshot(ng::smart::parse_smart_selling_snapshot(payload));
+                result["filled_quantity"] = whole_text;
+            }
+        }
     } else if (op == "status") {
         // parents snapshot is always recorded below
     } else {
@@ -339,6 +437,7 @@ json run_smart(const json& scenario) {
     if (!mkdtemp(tmpl.data())) throw std::runtime_error("mkdtemp failed");
     s.dir = tmpl.data();
     s.config = scenario.value("config", json::object());
+    s.buying = scenario.value("engine", "sell") == "buy";
     s.open();
     json trace = json::array();
     int index = 0;
@@ -418,8 +517,16 @@ json run_fast_case(const json& c) {
     in.last_action_monotonic_by_account = have_last ? &last_action : nullptr;
     if (c.contains("now") && !c.at("now").is_null()) in.now_monotonic = c.at("now").get<double>();
     in.cycle_id = "cycle";
+    if (c.contains("total_target_position") && !c.at("total_target_position").is_null()) {
+        in.total_target_position = c.at("total_target_position").get<long long>();
+    }
     ng::fast::CycleResult r = ng::fast::build_fast_trading_cycle_commands(in);
     json out;
+    out["total_position"] = r.total_position ? json(*r.total_position) : json(nullptr);
+    out["total_target_position"] = r.total_target_position ? json(*r.total_target_position) : json(nullptr);
+    out["target_position_reached"] = r.target_position_reached;
+    out["book_levels"] = r.book_levels;
+    out["target_percentage"] = r.target_percentage;
     out["resting_side"] = r.resting_side;
     out["order_side"] = r.order_side;
     out["total_resting_qty"] = r.total_resting_qty;
@@ -436,7 +543,8 @@ json run_fast_case(const json& c) {
         json n = json::object();
         for (const char* key : {"type", "account_id", "symbol", "side", "qty_shares", "limit_price", "trading_mode", "time_in_force",
                                 "fast_trading_resting_side", "fast_trading_total_resting_qty", "fast_trading_target_percentage",
-                                "fast_trading_book_levels", "fast_trading_price_limit", "broker", "test_mode"}) {
+                                "fast_trading_target_qty", "fast_trading_book_levels", "fast_trading_price_limit",
+                                "fast_trading_total_target_position", "algo_cycle_id", "cancel_unfilled", "broker", "test_mode"}) {
             if (cmd.contains(key)) n[key] = cmd.at(key);
         }
         out["commands"].push_back(n);

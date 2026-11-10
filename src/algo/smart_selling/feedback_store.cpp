@@ -4,8 +4,34 @@
 #include <set>
 
 #include "core/strings.h"
+#include "core/time_util.h"
 
 namespace ng::smart {
+
+const char* const kReconciliationSchema = R"SQL(
+    CREATE TABLE IF NOT EXISTS feedback_reconciled_orders (
+        account_id TEXT NOT NULL, order_id TEXT NOT NULL,
+        sequence INTEGER NOT NULL, created_at TEXT NOT NULL,
+        symbol TEXT NOT NULL, side TEXT NOT NULL,
+        reconciled_at TEXT NOT NULL, reason TEXT NOT NULL,
+        previous_data TEXT NOT NULL,
+        PRIMARY KEY(account_id, order_id)
+    );
+    CREATE TABLE IF NOT EXISTS feedback_reconciliation_audit (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, reconciled_at TEXT NOT NULL,
+        trading_day TEXT NOT NULL, timezone TEXT NOT NULL,
+        reason TEXT NOT NULL, data TEXT NOT NULL
+    );
+    CREATE TRIGGER IF NOT EXISTS feedback_ignore_reconciled_replay
+    BEFORE INSERT ON feedback_orders
+    WHEN EXISTS (
+        SELECT 1 FROM feedback_reconciled_orders r
+        WHERE r.account_id=NEW.account_id AND r.order_id=NEW.order_id
+            AND r.created_at=NEW.created_at AND r.symbol=NEW.symbol AND r.side=NEW.side
+            AND r.sequence>=NEW.sequence
+    )
+    BEGIN SELECT RAISE(IGNORE); END;
+)SQL";
 
 std::string canonical_order_symbol(const std::string& value) {
     std::string symbol = to_upper(trim(value));
@@ -51,6 +77,14 @@ OrderFeedbackStore::OrderFeedbackStore(const std::string& state_path) {
         CREATE INDEX IF NOT EXISTS feedback_pending_instrument
             ON feedback_pending_commands(account_id, symbol, pending);
     )SQL");
+    db_->exec(kReconciliationSchema);
+    // Timestamps are stored exactly like Python's datetime.isoformat() in UTC ("...+00:00") so both
+    // implementations (and the reconciliation trigger) compare them identically. Rows written by
+    // earlier builds of this server used a trailing "Z".
+    db_->exec("UPDATE feedback_orders SET created_at=substr(created_at,1,length(created_at)-1)||'+00:00' "
+              "WHERE created_at LIKE '%Z'");
+    db_->exec("UPDATE feedback_orders SET updated_at=substr(updated_at,1,length(updated_at)-1)||'+00:00' "
+              "WHERE updated_at LIKE '%Z'");
 }
 
 OrderFeedbackStore::~OrderFeedbackStore() { close(); }
@@ -114,9 +148,8 @@ std::optional<FeedbackRow> OrderFeedbackStore::record_snapshot(const OrderEvent&
     snapshot.status = payload.at("status").get<std::string>();
     snapshot.sequence = payload.at("sequence").is_number_float() ? static_cast<long long>(payload.at("sequence").get<double>())
                                                                  : payload.at("sequence").get<long long>();
-    // Python stores datetime.isoformat() with "+00:00"; keep an equivalent sortable form.
-    snapshot.created_at = event.created_at_iso;
-    snapshot.updated_at = event.updated_at_iso;
+    snapshot.created_at = iso_utc_offset(event.created_at);
+    snapshot.updated_at = iso_utc_offset(event.updated_at);
     std::lock_guard lock(mutex_);
     if (!db_) throw std::runtime_error("feedback store is closed");
     db_->begin_immediate();

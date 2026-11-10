@@ -78,10 +78,14 @@ std::optional<ParsedTimestamp> parse_iso8601(std::string_view text) {
     if (pos >= s.size() || s[pos] != '-') return std::nullopt;
     ++pos;
     if (!read_digits(s, pos, 2, day)) return std::nullopt;
-    if (month < 1 || month > 12 || day < 1 || day > 31) return std::nullopt;
+    // Impossible calendar dates (2026-02-30, year 0000) are rejected like datetime.fromisoformat().
+    static const int month_days[] = {31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
+    if (year < 1 || month < 1 || month > 12 || day < 1) return std::nullopt;
+    bool leap = (year % 4 == 0 && year % 100 != 0) || year % 400 == 0;
+    if (day > month_days[month - 1] + (month == 2 && leap ? 1 : 0)) return std::nullopt;
 
     int hour = 0, minute = 0, second = 0;
-    double fraction = 0.0;
+    std::int64_t micros = 0;  // fractional seconds; digits beyond microseconds are truncated like Python
     bool has_offset = false;
     int offset_seconds = 0;
     if (pos < s.size()) {
@@ -96,18 +100,17 @@ std::optional<ParsedTimestamp> parse_iso8601(std::string_view text) {
             if (!read_digits(s, pos, 2, second)) return std::nullopt;
             if (pos < s.size() && (s[pos] == '.' || s[pos] == ',')) {
                 ++pos;
-                double scale = 0.1;
-                bool any = false;
+                int count = 0;
                 while (pos < s.size() && s[pos] >= '0' && s[pos] <= '9') {
-                    fraction += (s[pos] - '0') * scale;
-                    scale /= 10.0;
+                    if (count < 6) micros = micros * 10 + (s[pos] - '0');
+                    ++count;
                     ++pos;
-                    any = true;
                 }
-                if (!any) return std::nullopt;
+                if (count == 0) return std::nullopt;
+                for (; count < 6; ++count) micros *= 10;
             }
         }
-        if (hour > 23 || minute > 59 || second > 60) return std::nullopt;
+        if (hour > 23 || minute > 59 || second > 59) return std::nullopt;
         if (pos < s.size()) {
             char c = s[pos];
             if (c == 'Z' || c == 'z') {
@@ -132,8 +135,10 @@ std::optional<ParsedTimestamp> parse_iso8601(std::string_view text) {
     }
     if (pos != s.size()) return std::nullopt;
     std::int64_t days = days_from_civil(year, static_cast<unsigned>(month), static_cast<unsigned>(day));
-    double epoch = static_cast<double>(days) * 86400.0 + hour * 3600.0 + minute * 60.0 + second + fraction;
-    epoch -= offset_seconds;
+    // One correctly rounded division of the exact microsecond count, identical to Python's
+    // datetime.timestamp() for aware datetimes (so epochs stored by either implementation compare equal).
+    std::int64_t seconds = days * 86400 + hour * 3600 + minute * 60 + second - offset_seconds;
+    double epoch = micros == 0 ? static_cast<double>(seconds) : static_cast<double>(seconds * 1000000 + micros) / 1e6;
     return ParsedTimestamp{epoch, has_offset};
 }
 
@@ -164,6 +169,12 @@ std::string iso_utc(double epoch_seconds) {
 }
 
 std::string iso_utc_now() { return iso_utc(wall_now()); }
+
+std::string iso_utc_offset(double epoch_seconds) {
+    std::string text = iso_utc(epoch_seconds);
+    text.pop_back();  // trailing 'Z'
+    return text + "+00:00";
+}
 
 std::string filename_timestamp(double epoch_seconds) {
     std::int64_t secs = static_cast<std::int64_t>(std::floor(epoch_seconds));

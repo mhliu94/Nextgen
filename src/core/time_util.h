@@ -27,6 +27,8 @@ std::optional<ParsedTimestamp> parse_iso8601(std::string_view text);
 // "2026-10-23T19:59:58Z" or "2026-10-23T19:59:58.123456Z" when microseconds are non-zero.
 std::string iso_utc(double epoch_seconds);
 std::string iso_utc_now();
+// Python's datetime.astimezone(timezone.utc).isoformat(): like iso_utc but with "+00:00".
+std::string iso_utc_offset(double epoch_seconds);
 // "%Y%m%dT%H%M%SZ" for file names.
 std::string filename_timestamp(double epoch_seconds);
 // Local-time log timestamp "%Y-%m-%dT%H:%M:%S%z".
