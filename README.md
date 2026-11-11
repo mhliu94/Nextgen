@@ -223,6 +223,10 @@ last-resort font so Chinese renders even on machines without a Chinese system fo
   Smart buying, order limits, reporting, market activity, system snapshots, reconciliation,
   order monitor), time zones against Python's zoneinfo, HTTP tests against live servers, and Kafka tests against librdkafka's
   in-process mock cluster. The suite also builds and passes with GCC 11.5.
+* `python3 tests/test_confirmations.py --browser /path/to/chromium` exercises Stop all,
+  Cancel all orders, and Turn trading off in a headless browser, including cancellation,
+  Escape, close-button, and backdrop dismissal. All API calls are mocked; it needs no
+  running application, credentials, Kafka connection, or Python packages.
 * **Differential tests against the original implementation.** `tools/algo_oracle/` drives the
   same randomly generated scenarios through this port (`nextgen-algo-driver`) and through the
   Python `trading_ui.services` code at `fec87a3`, then compares the traces step by step: every

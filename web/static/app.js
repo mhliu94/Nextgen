@@ -270,7 +270,8 @@
       openModal(t("confirm_title"), body, {
         actions: [
           h("button", { class: "btn gray", type: "button", onclick: () => { closeModal(); resolve(false); } }, t("fast_config_cancel")),
-          h("button", { class: "btn red", type: "button", onclick: () => { closeModal(); resolve(true); } }, t("confirm")),
+          // Settle confirmation before closeModal invokes the dismissal callback.
+          h("button", { class: "btn red", type: "button", onclick: () => { resolve(true); closeModal(); } }, t("confirm")),
         ],
         onClose: () => resolve(false),
       });
