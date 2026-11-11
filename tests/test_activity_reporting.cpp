@@ -139,7 +139,8 @@ TEST_CASE_FIXTURE(ReportingFixture, "tag summarizes buys, sells and only changed
     CHECK(report["accounts"][0]["broker"] == "Tiger");
     CHECK(report["accounts"][1]["shares_sold"] == 5.0);
     CHECK(report["totals"]["cash_by_currency"]["USD"] ==
-          json{{"buy_cost", 303.0}, {"sell_proceeds", 550.0}, {"cash_change", 247.0}, {"complete", true}});
+          json{{"buy_cost", 303.0}, {"sell_proceeds", 550.0}, {"cash_change", 247.0}, {"complete", true},
+               {"shares_bought", 3.0}, {"shares_sold", 5.0}, {"average_buy_price", 101.0}, {"average_sell_price", 110.0}});
     CHECK(report["active"] == true);
     CHECK(report["name"] == "Both sides");
     CHECK(report["symbol"] == "AAPL");
@@ -155,11 +156,13 @@ TEST_CASE_FIXTURE(ReportingFixture, "missing fill price stays unknown until auth
     CHECK(total["shares_bought"] == 2.0);
     CHECK(total["cash_complete"] == false);
     CHECK(total["cash_by_currency"]["USD"] ==
-          json{{"buy_cost", nullptr}, {"sell_proceeds", 120.0}, {"cash_change", nullptr}, {"complete", false}});
+          json{{"buy_cost", nullptr}, {"sell_proceeds", 120.0}, {"cash_change", nullptr}, {"complete", false},
+               {"shares_bought", 2.0}, {"shares_sold", 1.0}, {"average_buy_price", nullptr}, {"average_sell_price", 120.0}});
     reporting->record_order(order({{"sequence", 1}, {"average_fill_price", 100}}));
     total = tag_report(tag)["totals"];
     CHECK(total["cash_complete"] == true);
     CHECK(total["cash_by_currency"]["USD"]["cash_change"] == -80.0);
+    CHECK(total["cash_by_currency"]["USD"]["average_buy_price"] == 100.0);
 }
 
 TEST_CASE_FIXTURE(ReportingFixture, "cash is partitioned by currency and missing currency is explicit") {
@@ -174,6 +177,9 @@ TEST_CASE_FIXTURE(ReportingFixture, "cash is partitioned by currency and missing
     CHECK(cash["UNKNOWN"]["buy_cost"].is_null());
     CHECK(cash["UNKNOWN"]["cash_change"].is_null());
     CHECK(cash["UNKNOWN"]["complete"] == false);
+    CHECK(cash["UNKNOWN"]["average_buy_price"].is_null());
+    CHECK(cash["HKD"]["average_buy_price"].is_null());
+    CHECK(cash["HKD"]["average_sell_price"] == 800.0);
     CHECK(tag_report(tag)["totals"]["cash_complete"] == false);
 }
 
@@ -337,4 +343,24 @@ TEST_CASE_FIXTURE(ReportingFixture, "timestamps keep microseconds like Python da
     ng::Statement row(raw, "SELECT start_epoch FROM activity_tags");
     REQUIRE(row.step());
     CHECK(ng::python_float_repr(row.column_double(0)) == ng::python_float_repr(epoch("2026-10-28T14:00:00.25+00:00")));
+}
+
+TEST_CASE_FIXTURE(ReportingFixture, "execution averages weight fills across accounts and separate sides and currencies") {
+    std::vector<json> orders = {
+        order({{"filled_quantity", 2.5}, {"average_fill_price", 10}}).payload,
+        order({{"account_id", "B"}, {"filled_quantity", 7.5}, {"average_fill_price", 20}}).payload,
+        order({{"side", "SELL"}, {"filled_quantity", 2}, {"average_fill_price", 30}}).payload,
+        order({{"account_id", "B"}, {"side", "SELL"}, {"filled_quantity", 6}, {"average_fill_price", 40}}).payload,
+        order({{"currency", "HKD"}, {"filled_quantity", 1}, {"average_fill_price", 100}}).payload,
+        order({{"filled_quantity", 0}, {"average_fill_price", nullptr}, {"status", "NEW"}}).payload,
+    };
+    auto report = ng::reporting::summarize_executions(orders, accounts, {"A", "B"});
+    const auto& cash = report["totals"]["cash_by_currency"];
+    CHECK(cash["USD"]["shares_bought"] == 10.0);
+    CHECK(cash["USD"]["average_buy_price"] == 17.5);
+    CHECK(cash["USD"]["average_sell_price"] == 37.5);
+    CHECK(cash["HKD"]["average_buy_price"] == 100.0);
+    CHECK(cash["HKD"]["average_sell_price"].is_null());
+    CHECK(report["accounts"][0]["cash_by_currency"]["USD"]["average_buy_price"] == 10.0);
+    CHECK(report["accounts"][1]["cash_by_currency"]["USD"]["average_buy_price"] == 20.0);
 }

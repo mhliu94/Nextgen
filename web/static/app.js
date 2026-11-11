@@ -29,6 +29,31 @@
     return el;
   }
 
+  function updateScrollableTable(scroll, table) {
+    const left = scroll.scrollLeft, top = scroll.scrollTop;
+    const expanded = new Set($$("details[data-parent-id][open]", scroll).map((item) => item.dataset.parentId));
+    for (const detail of $$("details[data-parent-id]", table)) detail.open = expanded.has(detail.dataset.parentId);
+    scroll.replaceChildren(table);
+    scroll.scrollLeft = left;
+    scroll.scrollTop = top;
+  }
+
+  function algoReason(reason) {
+    const keys = {
+      "waiting for eligible tape volume": "algo_waiting_volume",
+      "earning volume credit": "algo_waiting_volume",
+      "earned credit below broker minimum": "algo_waiting_volume_minimum",
+      "waiting for volume credit and at least 100 shares of liquidity": "algo_waiting_volume_liquidity",
+      "waiting for live order and volume feeds": "algo_waiting_feeds",
+      "waiting for fresh trading-volume baseline": "algo_waiting_baseline",
+      "order reconciliation required": "algo_waiting_reconciliation",
+      "waiting for child terminal status": "algo_waiting_order",
+      "minimum five-second send spacing": "algo_waiting_spacing",
+      "account snapshot unavailable or trading disabled": "algo_waiting_account",
+    };
+    return keys[reason] ? t(keys[reason]) : (reason || "—");
+  }
+
   const fmt = {
     money(v, digits = 2) {
       const n = Number(v);
@@ -581,7 +606,13 @@
         h("td", { class: "right num", text: fmt.int(p.account_count) })));
       const coverage = h("div", { class: "card-sub" }, t("snapshot_coverage") + ": ", h("b", { text: portfolio.included_accounts + " / " + portfolio.total_accounts }),
         portfolio.included_accounts < portfolio.total_accounts ? h("div", { class: "warn", text: t("portfolio_incomplete") }) : null);
-      $("#portfolio-summary").replaceChildren(
+      let overview = $("#portfolio-overview");
+      if (!overview) {
+        overview = h("div", { id: "portfolio-overview" });
+        $("#portfolio-summary").replaceChildren(overview,
+          h("div", { class: "table-scroll", id: "portfolio-positions", tabindex: "0", role: "region", "aria-label": t("portfolio_totals") }));
+      }
+      overview.replaceChildren(
         h("div", { class: "card-head" }, h("h2", { class: "card-title", text: t("portfolio") }), coverage),
         h("div", { class: "help", text: t("portfolio_summary") }),
         h("div", { class: "section-heading", text: t("cash_holdings") }),
@@ -590,11 +621,11 @@
         h("div", { class: "chips" }, h("div", { class: "chip" }, h("div", { class: "chip-label", text: t("portfolio_total_market_value") }),
           h("div", { class: "chip-value num", id: "portfolio-market-value-total", text: fmt.num(portfolio.total_market_value || 0) }))),
         h("div", { class: "help", text: t("portfolio_total_market_value_help") }),
-        h("div", { class: "section-heading", text: t("positions") }),
-        h("div", { class: "table-scroll" }, h("table", { class: "data" },
+        h("div", { class: "section-heading", text: t("positions") }));
+      updateScrollableTable($("#portfolio-positions"), h("table", { class: "data" },
           h("thead", null, h("tr", null, h("th", { text: t("symbol") }), h("th", { class: "right", text: t("qty") }), h("th", { class: "right", title: t("weighted_avg_px"), text: t("avg_px") }),
             h("th", { class: "right", title: t("portfolio_last_help"), text: t("portfolio_last") }), h("th", { class: "right", title: t("portfolio_market_value_help"), text: t("portfolio_market_value") }), h("th", { class: "right", text: t("holding_accounts") }))),
-          h("tbody", null, rows.length ? rows : h("tr", null, h("td", { colspan: 6 }, h("em", { text: "—" })))))));
+          h("tbody", null, rows.length ? rows : h("tr", null, h("td", { colspan: 6 }, h("em", { text: "—" }))))));
 
       // Account cards
       const sorted = sortMetas(metas, byId, this.sort, this.security);
@@ -1001,7 +1032,7 @@
             h("div", null,
               h("div", { class: "status-title" }, h("span", { class: "pill info", text: cmd.trading_mode || "" }), " ", cmd.symbol || "", " ", s.stopping ? h("span", { class: "pill stale", text: t("smart_state_stopping") }) : h("span", { class: "pill on", text: t("smart_state_running") }), cmd.fast_trading_test_mode ? h("span", { class: "pill purple", text: t("test_mode_tag") }) : null),
               h("div", { class: "status-meta" }, t("algo_running_since") + " " + fmt.clock(s.started_at) + " · " + t("algo_cycles") + " " + s.cycles + " · " + t("algo_published") + " " + s.published_commands + " · " + t("fast_accounts") + ": " + (cmd.fast_trading_account_ids || []).join(", ")),
-              h("div", { class: "status-meta" }, t("fast_cycle_result") + ": " + (cycle.reason || (cycle.commands ? cycle.commands + " cmd" : "—")) + (cycle.limit_price ? " @" + fmt.price(cycle.limit_price) : "") + (cycle.total_resting_qty ? " · " + t("fast_target_percentage").split(" (")[0] + " " + fmt.int(cycle.target_quantity) + "/" + fmt.int(cycle.total_resting_qty) : "")),
+              h("div", { class: "status-meta" }, t("fast_cycle_result") + ": " + (cycle.reason ? algoReason(cycle.reason) : (cycle.commands ? cycle.commands + " cmd" : "—")) + (cycle.limit_price ? " @" + fmt.price(cycle.limit_price) : "") + (cycle.total_resting_qty ? " · " + t("fast_target_percentage").split(" (")[0] + " " + fmt.int(cycle.target_quantity) + "/" + fmt.int(cycle.total_resting_qty) : "")),
               position,
               h("div", { class: "status-meta faint mono", text: t("fast_session_id") + ": " + (s.session_id || "") })));
         }));
@@ -1015,12 +1046,27 @@
 
   function renderParentsTable(root, parents, buying) {
     if (!parents.length) { root.replaceChildren(h("div", { class: "empty", text: t(buying ? "smart_buying_status_empty" : "smart_status_empty") })); return; }
+    let summaries = $(".smart-session-summaries", root);
+    let scroll = $(".table-scroll", root);
+    if (!scroll) {
+      summaries = h("div", { class: "smart-session-summaries", "aria-live": "polite" });
+      scroll = h("div", { class: "table-scroll", tabindex: "0", role: "region", "aria-label": t(buying ? "smart_buying_status_title" : "smart_status_title") });
+      root.replaceChildren(summaries, scroll);
+    }
+    const active = parents.filter((p) => p.active);
+    const signature = JSON.stringify([state.lang, active.map((p) => [p.parent_id, p.symbol, p.state, p.reason, p.market_state, p.market_reason])]);
+    if (summaries.dataset.signature !== signature) {
+      summaries.replaceChildren(...active.map((p) => h("div", { class: "smart-session-summary", dataset: { parentId: p.parent_id } },
+        h("div", { class: "status-title" }, p.symbol, " · ", smartStateLabel(p.state)),
+        h("div", { class: "status-meta", text: [algoReason(p.reason), p.market_state !== "TRADING" ? p.market_reason : ""].filter(Boolean).join(" · ") }))));
+      summaries.dataset.signature = signature;
+    }
     const base = buying ? "/api/smart-buying/" : "/api/smart-selling/";
     const rows = parents.map((p) => {
       const childState = p.active_order && p.active_order.state;
       const marketKey = String(p.market_state || "").toLowerCase();
       const stateText = smartStateLabel(p.state) + (childState ? " / " + smartStateLabel(childState) : "") + (state.T["smart_market_" + marketKey] ? " / " + t("smart_market_" + marketKey) : "");
-      const reason = [p.reason, p.market_state !== "TRADING" ? p.market_reason : ""].filter(Boolean).join(" · ") || "—";
+      const reason = [algoReason(p.reason), p.market_state !== "TRADING" ? p.market_reason : ""].filter(Boolean).join(" · ") || "—";
       const accountLabel = Array.isArray(p.account_ids) ? p.account_ids.join(", ") : String(p.account_id || "");
       const total = Number(p.quantity), filled = Number(p.filled);
       const pct = Number.isFinite(total) && total > 0 && Number.isFinite(filled) ? Math.min(100, Math.max(0, (filled / total) * 100)) : 0;
@@ -1038,7 +1084,7 @@
         else if (a.average_cost !== null && a.average_cost !== undefined) text += " (" + t("smart_average_cost") + " " + fmt.decimal(a.average_cost) + ")";
         return text;
       }).join(", ");
-      const details = h("details", null, h("summary", { text: t("details") }), h("dl", { class: "kv" },
+      const details = h("details", { dataset: { parentId: p.parent_id } }, h("summary", { text: t("details") }), h("dl", { class: "kv" },
         h("dt", { text: t("smart_mode") }), h("dd", { text: t("smart_" + p.mode) + " · " + t("smart_participation") + " " + (Number(p.participation) * 100).toFixed(2) + "%" }),
         h("dt", { text: t("smart_credit") }), h("dd", { text: fmt.decimal(p.free_credit) }),
         buying ? null : [h("dt", { text: t("smart_child_cap") }), h("dd", { text: p.disable_child_cap ? t("smart_child_cap_disabled") : fmt.decimal(p.child_cap) })],
@@ -1047,18 +1093,18 @@
         h("dt", { text: t(buying ? "smart_maximum_price_short" : "smart_minimum_price_short") }), h("dd", { text: bound ? fmt.decimal(bound) : "—" }),
         h("dt", { text: t("smart_accounts_detail") }), h("dd", { text: perAccount })));
       return h("tr", null,
-        h("td", null, h("b", { text: accountLabel }), " / ", p.symbol, details),
+        h("td", { class: "smart-account-label" }, h("b", { text: accountLabel }), " / ", p.symbol, details),
         h("td", { class: "right num", text: fmt.decimal(p.quantity) }),
         h("td", { class: "right num" }, fmt.decimal(p.filled), h("div", { class: "progress", title: pct.toFixed(1) + "%" }, h("span", { style: "width:" + pct.toFixed(1) + "%" }))),
         h("td", { class: "right num", text: fmt.decimal(p.remaining) }),
         h("td", { class: "right num", text: fmt.decimal(p.reserved) }),
         h("td", { text: stateText }),
-        h("td", { text: reason }),
+        h("td", { class: "smart-reason", text: reason }),
         h("td", null, stopBtn));
     });
-    root.replaceChildren(h("div", { class: "table-scroll" }, h("table", { class: "data", id: buying ? "smart-buying-status-table" : "smart-status-table" },
+    updateScrollableTable(scroll, h("table", { class: "data", id: buying ? "smart-buying-status-table" : "smart-status-table" },
       h("thead", null, h("tr", null, h("th", { text: t("account") + " / " + t("symbol") }), h("th", { class: "right", text: t(buying ? "smart_target" : "smart_inventory") }), h("th", { class: "right", text: t("smart_filled") }), h("th", { class: "right", text: t("smart_remaining") }), h("th", { class: "right", text: t("smart_reserved") }), h("th", { text: t("smart_state") }), h("th", { text: t("smart_reason") }), h("th", { text: t("smart_stop") }))),
-      h("tbody", { id: buying ? "smart-buying-status-rows" : "smart-status-rows" }, rows))));
+      h("tbody", { id: buying ? "smart-buying-status-rows" : "smart-status-rows" }, rows)));
   }
   async function refreshAlgo() {
     try { state.algo = await api("/api/algo"); state.smart = state.algo.smart; queueRender("algo"); queueRender("smart"); } catch (e) { if (e instanceof AuthError) showLogin(e.message); }

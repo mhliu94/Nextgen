@@ -13,6 +13,9 @@ let generation = 0;
 let interval = 2000;
 let pageSize = 20;
 let currentPage = 1;
+let algoPage = 1;
+const algoPageSize = 10;
+let selectedAlgoSession = null;
 let unreconciledPage = 1;
 let unreconciledPageSize = 20;
 let refreshedAt = null;
@@ -26,6 +29,7 @@ let number = new Intl.NumberFormat(locale(), {maximumFractionDigits: 8});
 const label = (value) => value == null ? "—" : translations[language][`value_${value}`] ??
   String(value).replaceAll("_", " ").toLowerCase().replace(/^./, (c) => c.toUpperCase());
 const fmt = (value) => value == null ? "—" : number.format(value);
+const fmtAveragePrice = (value) => value == null ? "—" : new Intl.NumberFormat(locale(), {minimumFractionDigits: 2, maximumFractionDigits: 2}).format(value);
 
 const preferences = {
   get(key) { try { return window.localStorage.getItem(key); } catch (error) { return null; } },
@@ -53,6 +57,10 @@ function showLogin() {
   clearTimeout(timer);
   snapshot = null;
   currentPage = 1;
+  algoPage = 1;
+  selectedAlgoSession = null;
+  el("algo-search").value = "";
+  el("algo-status").value = "";
   unreconciledPage = 1;
   refreshedAt = null;
   connectionLost = false;
@@ -63,8 +71,8 @@ function showLogin() {
   selectedTab = "orders";
   el("tag-name").value = "";
   el("tag-symbol").value = "";
-  for (const id of ["algo-select", "tag-select", "algo-summary", "tag-summary", "algo-parameters", "algo-accounts", "tag-accounts"]) el(id).replaceChildren();
-  for (const id of ["algo-select", "tag-select"]) delete el(id).dataset.signature;
+  for (const id of ["algo-rows", "tag-select", "algo-summary", "tag-summary", "algo-parameters", "algo-accounts", "tag-accounts"]) el(id).replaceChildren();
+  for (const id of ["tag-select"]) delete el(id).dataset.signature;
   el("orders").replaceChildren();
   el("unreconciled-rows").replaceChildren();
   el("dashboard").hidden = true;
@@ -398,6 +406,65 @@ function reportSelection(id, reports, describe) {
   return reports.find((report) => report.id === select.value);
 }
 
+function sessionMode(session) {
+  const mode = session.parameters?.trading_mode;
+  return mode ? (translations[language][`session_mode_${mode}`] ?? mode) : "—";
+}
+
+function renderSessionList(sessions) {
+  const statuses = new Set(sessions.map((session) => session.status));
+  if (el("algo-status").value) statuses.add(el("algo-status").value);
+  options("algo-status", [...statuses].sort().map((status) => [status, label(status)]));
+  const status = el("algo-status").value;
+  const query = el("algo-search").value.trim().toLowerCase();
+  const matching = sessions.filter((session) => (!status || session.status === status) &&
+    (!query || [session.symbol, session.id, sessionMode(session), session.started_at,
+      reportTime(session.started_at), session.ended_at, ...(session.account_ids || [])]
+      .some((value) => value && String(value).toLowerCase().includes(query))));
+  const pages = Math.max(1, Math.ceil(matching.length / algoPageSize));
+  algoPage = Math.min(algoPage, pages);
+  const offset = (algoPage - 1) * algoPageSize;
+  const rows = matching.slice(offset, offset + algoPageSize);
+  const selected = matching.find((session) => session.id === selectedAlgoSession) || rows[0];
+  selectedAlgoSession = selected?.id || null;
+  el("algo-count").textContent = t("sessions_count", {start: fmt(matching.length ? offset + 1 : 0), end: fmt(offset + rows.length), count: fmt(matching.length), total: fmt(sessions.length)});
+  const summary = t("page_summary", {page: fmt(algoPage), pages: fmt(pages)});
+  if (el("algo-page").textContent !== summary) el("algo-page").textContent = summary;
+  el("algo-previous").disabled = algoPage === 1;
+  el("algo-next").disabled = algoPage === pages;
+  const focusedSession = document.activeElement?.dataset.algoSession;
+  const body = document.createDocumentFragment();
+  for (const session of rows) {
+    const row = document.createElement("tr");
+    const isSelected = session.id === selectedAlgoSession;
+    row.classList.toggle("selected-session", isSelected);
+    cell(row, reportTime(session.started_at), session.ended_at ? `${t("ended_at")}: ${reportTime(session.ended_at)}` : "", "order-time");
+    cell(row, session.symbol || "—", "", "symbol");
+    cell(row, sessionMode(session));
+    cell(row, label(session.status));
+    cell(row, (session.account_ids || []).join(", ") || "—", "", "session-accounts");
+    cell(row, session.id, "", "identifier");
+    const action = document.createElement("button");
+    action.type = "button";
+    action.className = "btn ghost sm session-select";
+    action.dataset.algoSession = session.id;
+    action.setAttribute("aria-pressed", String(isSelected));
+    action.setAttribute("aria-controls", "algo-report");
+    action.setAttribute("aria-label", t("view_session", {id: session.id}));
+    action.textContent = t(isSelected ? "selected_session" : "view_details");
+    cell(row, "").append(action);
+    body.append(row);
+  }
+  el("algo-rows").replaceChildren(body);
+  if (focusedSession) {
+    const button = [...el("algo-rows").querySelectorAll("button")].find((item) => item.dataset.algoSession === focusedSession);
+    button?.focus({preventScroll: true});
+  }
+  el("algo-empty").hidden = rows.length > 0;
+  el("algo-empty").textContent = t(sessions.length ? "no_matching_sessions" : "no_sessions");
+  return selected;
+}
+
 function reportSummary(target, entries) {
   const fragment = document.createDocumentFragment();
   for (const [key, value] of entries) {
@@ -412,31 +479,36 @@ function reportSummary(target, entries) {
 
 function cashCell(row, cash, field) {
   const td = cell(row, "", "", "number cash-lines", field);
+  const averageQuantity = {average_buy_price: "shares_bought", average_sell_price: "shares_sold"}[field];
   const entries = Object.entries(cash || {}).sort(([a], [b]) => a.localeCompare(b));
   if (!entries.length) { td.append("—"); return; }
   for (const [currency, values] of entries) {
     const line = document.createElement("div");
     const amount = values[field];
     const prefix = field === "cash_change" && amount != null && Number(amount) > 0 ? "+" : "";
-    line.textContent = `${currency === "UNKNOWN" ? t("unknown_currency") : currency} ${prefix}${fmt(amount)}`;
-    if (values.complete === false) {
+    line.textContent = `${currency === "UNKNOWN" ? t("unknown_currency") : currency} ${prefix}${averageQuantity ? fmtAveragePrice(amount) : fmt(amount)}`;
+    const incomplete = averageQuantity ? amount == null && values[averageQuantity] > 0 : values.complete === false;
+    if (incomplete) {
       const warning = document.createElement("span");
       warning.className = "incomplete";
-      warning.textContent = t("cash_incomplete");
+      warning.textContent = t(averageQuantity ? "average_price_unavailable" : "cash_incomplete");
       line.append(warning);
     }
     td.append(line);
   }
 }
 
-function accountReport(target, report, emptyKey) {
+function accountReport(target, report, emptyKey, showAveragePrices = false) {
   const table = document.createElement("table");
-  table.className = "report-table stacked";
+  table.className = "report-table" + (showAveragePrices ? "" : " stacked");
   const caption = table.createCaption();
   caption.className = "sr-only";
   caption.textContent = t("executions_by_account");
   const heading = table.createTHead().insertRow();
-  for (const key of ["account", "shares_bought", "shares_sold", "buy_cost", "sell_proceeds", "cash_change"]) {
+  const columns = showAveragePrices
+    ? ["account", "shares_bought", "average_buy_price", "shares_sold", "average_sell_price", "buy_cost", "sell_proceeds", "cash_change"]
+    : ["account", "shares_bought", "shares_sold", "buy_cost", "sell_proceeds", "cash_change"];
+  for (const key of columns) {
     const th = document.createElement("th");
     th.scope = "col";
     th.textContent = t(key);
@@ -446,17 +518,21 @@ function accountReport(target, report, emptyKey) {
   const fillRow = (row, account, total = false) => {
     cell(row, total ? t("all_accounts_total") : accountName(account), total ? "" : account.broker, "wide", total ? "" : "account");
     cell(row, fmt(account.shares_bought), "", "number key-number", "shares_bought");
+    if (showAveragePrices) cashCell(row, account.cash_by_currency, "average_buy_price");
     cell(row, fmt(account.shares_sold), "", "number key-number", "shares_sold");
+    if (showAveragePrices) cashCell(row, account.cash_by_currency, "average_sell_price");
     for (const field of ["buy_cost", "sell_proceeds", "cash_change"]) cashCell(row, account.cash_by_currency, field);
   };
   const body = table.createTBody();
   for (const account of report.accounts || []) fillRow(body.insertRow(), account);
   if (!report.accounts?.length) {
     const empty = cell(body.insertRow(), t(emptyKey), "", "report-empty");
-    empty.colSpan = 6;
+    empty.colSpan = columns.length;
   }
   fillRow(table.createTFoot().insertRow(), report.totals || {}, true);
+  const scrollLeft = el(target).scrollLeft;
   el(target).replaceChildren(table);
+  el(target).scrollLeft = scrollLeft;
 }
 
 function parameterValue(value) {
@@ -476,11 +552,10 @@ function renderReports() {
   const uncertain = sessions.some((session) => !session.ended_at && ["unknown", "stale", "interrupted"].includes(String(session.status).toLowerCase()));
   el("algo-current").textContent = connectionLost || uncertain ? t("session_status_unknown") : running.length ? t("sessions_running", {count: fmt(running.length)}) : t("no_running_session");
   el("algo-current").classList.toggle("warning", connectionLost || uncertain);
-  const session = reportSelection("algo-select", sessions, (item) => `${item.symbol || ""} · ${label(item.status)} · ${reportTime(item.started_at)}`);
-  el("algo-empty").hidden = Boolean(session);
+  const session = renderSessionList(sessions);
   el("algo-report").hidden = !session;
   if (session) {
-    reportSummary("algo-summary", [["status", label(session.status)], ["session_id", session.id], ["started_at", reportTime(session.started_at)], ["ended_at", reportTime(session.ended_at)], ["updated", reportTime(session.updated_at)], ["reason", session.reason]]);
+    reportSummary("algo-summary", [["symbol", session.symbol], ["status", label(session.status)], ["session_id", session.id], ["started_at", reportTime(session.started_at)], ["ended_at", reportTime(session.ended_at)], ["updated", reportTime(session.updated_at)], ["reason", session.reason]]);
     const parameters = document.createDocumentFragment();
     for (const [key, value] of Object.entries(session.parameters || {})) {
       const term = document.createElement("dt");
@@ -490,7 +565,7 @@ function renderReports() {
       parameters.append(term, definition);
     }
     el("algo-parameters").replaceChildren(parameters);
-    accountReport("algo-accounts", session, "no_participating_accounts");
+    accountReport("algo-accounts", session, "no_participating_accounts", true);
   }
   const tags = reports.tags || [];
   const active = tags.find((tag) => tag.id === reports.active_tag_id);
@@ -552,7 +627,22 @@ for (const button of document.querySelectorAll("[data-tab]")) {
     if (next !== null) { event.preventDefault(); selectReportTab(tabs[next], true); }
   });
 }
-for (const id of ["algo-select", "tag-select"]) el(id).addEventListener("change", renderReports);
+for (const id of ["algo-status", "algo-search"]) el(id).addEventListener("input", () => {
+  algoPage = 1;
+  selectedAlgoSession = null;
+  renderReports();
+});
+el("algo-previous").addEventListener("click", () => { algoPage = Math.max(1, algoPage - 1); selectedAlgoSession = null; renderReports(); });
+el("algo-next").addEventListener("click", () => { algoPage++; selectedAlgoSession = null; renderReports(); });
+el("algo-rows").addEventListener("click", (event) => {
+  const button = event.target.closest("button[data-algo-session]");
+  if (button) {
+    selectedAlgoSession = button.dataset.algoSession;
+    renderReports();
+    el("algo-report").scrollIntoView({behavior: "smooth", block: "start"});
+  }
+});
+el("tag-select").addEventListener("change", renderReports);
 el("tag-form").addEventListener("submit", (event) => {
   event.preventDefault();
   const name = el("tag-name").value.trim(), symbol = el("tag-symbol").value.trim().toUpperCase();

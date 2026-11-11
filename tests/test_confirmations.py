@@ -6,6 +6,7 @@ No application server, credentials, Kafka connection, or Python packages are nee
 """
 
 import argparse
+import mimetypes
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 import re
@@ -111,23 +112,20 @@ window.addEventListener("load", async () => {
 """
 
 
-def main():
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--browser", required=True, help="Chromium or Chrome executable")
-    args = parser.parse_args()
-    static = ROOT / "web/static"
+def run_browser(browser, harness, static=None, path="/control-panel", width=1280):
+    static = static or ROOT / "web/static"
     html = (static / "index.html").read_text().replace(
-        '<script src="/static/app.js" defer></script>',
-        "<script>" + HARNESS + '</script><script src="/static/app.js" defer></script>',
+        "<head>", "<head><script>" + harness + "</script>", 1,
     ).encode()
 
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self):
-            path = self.path.split("?", 1)[0]
-            if path == "/control-panel":
+            request_path = self.path.split("?", 1)[0]
+            asset = (static / request_path.removeprefix("/static/")).resolve()
+            if request_path == path:
                 data, content_type = html, "text/html"
-            elif path == "/static/app.js":
-                data, content_type = (static / "app.js").read_bytes(), "text/javascript"
+            elif request_path.startswith("/static/") and asset.is_relative_to(static.resolve()) and asset.is_file():
+                data, content_type = asset.read_bytes(), mimetypes.guess_type(asset)[0] or "application/octet-stream"
             else:
                 self.send_error(404)
                 return
@@ -145,10 +143,10 @@ def main():
         try:
             with tempfile.TemporaryDirectory(prefix="nextgen-confirmations-") as profile:
                 completed = subprocess.run(
-                    [args.browser, "--headless", "--no-sandbox", "--disable-gpu",
+                    [browser, "--headless", "--no-sandbox", "--disable-gpu", f"--window-size={width},900",
                      "--disable-background-networking", "--no-first-run",
                      "--user-data-dir=" + profile, "--dump-dom", "--virtual-time-budget=5000",
-                     f"http://127.0.0.1:{server.server_port}/control-panel"],
+                     f"http://127.0.0.1:{server.server_port}{path}"],
                     capture_output=True, text=True, timeout=20,
                 )
         finally:
@@ -158,6 +156,12 @@ def main():
     message = match[1] if match else "FAIL: browser did not complete the test\n" + completed.stderr
     print(message)
     return 0 if completed.returncode == 0 and message.startswith("PASS:") else 1
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--browser", required=True, help="Chromium or Chrome executable")
+    return run_browser(parser.parse_args().browser, HARNESS)
 
 
 if __name__ == "__main__":

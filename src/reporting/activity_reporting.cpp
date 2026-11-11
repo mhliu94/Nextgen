@@ -41,6 +41,7 @@ long long integer_field(const json& value) {
 }
 
 struct CashTotals {
+    Decimal shares_bought, shares_sold;
     std::optional<Decimal> buy_cost = Decimal::zero();
     std::optional<Decimal> sell_proceeds = Decimal::zero();
     bool complete() const { return buy_cost.has_value() && sell_proceeds.has_value(); }
@@ -60,6 +61,7 @@ struct Totals {
             currency = raw->get<std::string>();
         }
         CashTotals& cash = cash_by_currency[currency];
+        (buy ? cash.shares_bought : cash.shares_sold) += quantity;
         std::optional<Decimal>& field = buy ? cash.buy_cost : cash.sell_proceeds;
         const json* price = json_find(order, "average_fill_price");
         if (!price || price->is_null() || currency == "UNKNOWN") {
@@ -80,6 +82,12 @@ struct Totals {
             part["sell_proceeds"] = totals.sell_proceeds ? json(totals.sell_proceeds->to_double()) : json(nullptr);
             part["cash_change"] = totals.complete() ? json((*totals.sell_proceeds - *totals.buy_cost).to_double()) : json(nullptr);
             part["complete"] = totals.complete();
+            part["shares_bought"] = totals.shares_bought.to_double();
+            part["shares_sold"] = totals.shares_sold.to_double();
+            part["average_buy_price"] = totals.buy_cost && !totals.shares_bought.is_zero()
+                ? json(totals.buy_cost->div(totals.shares_bought, 30).to_double()) : json(nullptr);
+            part["average_sell_price"] = totals.sell_proceeds && !totals.shares_sold.is_zero()
+                ? json(totals.sell_proceeds->div(totals.shares_sold, 30).to_double()) : json(nullptr);
             all_complete = all_complete && totals.complete();
             cash[currency] = part;
         }

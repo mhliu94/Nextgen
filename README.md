@@ -227,6 +227,9 @@ last-resort font so Chinese renders even on machines without a Chinese system fo
   Cancel all orders, and Turn trading off in a headless browser, including cancellation,
   Escape, close-button, and backdrop dismissal. All API calls are mocked; it needs no
   running application, credentials, Kafka connection, or Python packages.
+* `python3 tests/test_ui_reports.py --browser /path/to/chromium` checks session pagination,
+  execution averages, translations, and mobile table scrolling during live updates using
+  synthetic API and event-stream data.
 * **Differential tests against the original implementation.** `tools/algo_oracle/` drives the
   same randomly generated scenarios through this port (`nextgen-algo-driver`) and through the
   Python `trading_ui.services` code at `fec87a3`, then compares the traces step by step: every

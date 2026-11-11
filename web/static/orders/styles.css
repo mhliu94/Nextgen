@@ -132,7 +132,7 @@ h2 { font-size: 18px; margin: 0; }
 .filters .field { flex: 0 1 220px; }
 .filters .search { flex: 1 1 280px; max-width: 420px; margin-left: auto; }
 .table-meta { display: flex; justify-content: space-between; flex-wrap: wrap; gap: 6px 16px; padding: 10px 16px; font-size: 12.5px; color: var(--text-dim); font-variant-numeric: tabular-nums; }
-.table-scroll { overflow-x: auto; -webkit-overflow-scrolling: touch; }
+.table-scroll { min-width: 0; max-width: 100%; overflow-x: auto; -webkit-overflow-scrolling: touch; }
 
 /* ---- tables ------------------------------------------------------------------ */
 table { border-collapse: collapse; width: 100%; text-align: left; font-size: 13px; }
@@ -191,6 +191,17 @@ table.data .account { min-width: 140px; }
 .parameters summary { cursor: pointer; font-weight: 800; }
 .kv { display: grid; grid-template-columns: minmax(140px, 1fr) 3fr; gap: 8px 20px; margin: 12px 0 0; }
 .kv dt { color: var(--text-dim); overflow-wrap: anywhere; }
+#algo-parameters dt { font-weight: 800; }
+.session-list { margin: 20px 0; border: 1px solid var(--border); border-radius: 10px; min-width: 0; }
+.session-table { min-width: 1100px; }
+.session-table .selected-session { background: var(--bg-hover); }
+.session-table .session-accounts { min-width: 140px; max-width: 230px; overflow-wrap: anywhere; }
+.session-table .identifier { min-width: 180px; }
+.session-select { white-space: nowrap; }
+.session-select[aria-pressed="true"] { color: var(--accent); border-color: var(--accent); }
+#algo-page { font-variant-numeric: tabular-nums; white-space: nowrap; }
+#algo-report h3 { font-size: 16px; margin: 22px 0 0; }
+#algo-accounts .report-table { min-width: 1100px; }
 .kv dd { margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; font-variant-numeric: tabular-nums; }
 .report-note { font-size: 12px; color: var(--text-faint); line-height: 1.6; margin: 16px 0 0; }
 .report-table { min-width: 860px; border: 1px solid var(--border); border-radius: 10px; }

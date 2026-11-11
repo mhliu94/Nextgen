@@ -15,6 +15,15 @@ struct KeyValue {
 
 // Keys added by the next-generation front end. Keep both languages in sync.
 static const KeyValue k_en_extra[] = {
+    {"algo_waiting_volume", "Waiting for market volume"},
+    {"algo_waiting_volume_minimum", "Waiting for market volume to reach the minimum order size"},
+    {"algo_waiting_volume_liquidity", "Waiting for market volume and available liquidity"},
+    {"algo_waiting_feeds", "Waiting for live order and market-volume feeds"},
+    {"algo_waiting_baseline", "Waiting for a fresh market-volume baseline"},
+    {"algo_waiting_reconciliation", "Waiting for broker order confirmation"},
+    {"algo_waiting_order", "Waiting for the current order to finish"},
+    {"algo_waiting_spacing", "Waiting for the next order interval"},
+    {"algo_waiting_account", "Waiting for a fresh account snapshot or trading to be enabled"},
     {"app_name", "KTrader"},
     {"app_subtitle", "Control Center"},
     {"nav_account", "Accounts"},
@@ -138,6 +147,15 @@ static const KeyValue k_en_extra[] = {
 };
 
 static const KeyValue k_zh_extra[] = {
+    {"algo_waiting_volume", "等待市场成交量"},
+    {"algo_waiting_volume_minimum", "等待市场成交量达到最小委托数量"},
+    {"algo_waiting_volume_liquidity", "等待市场成交量和可用流动性"},
+    {"algo_waiting_feeds", "等待实时订单和市场成交量数据"},
+    {"algo_waiting_baseline", "等待新的市场成交量基准"},
+    {"algo_waiting_reconciliation", "等待券商确认订单状态"},
+    {"algo_waiting_order", "等待当前订单结束"},
+    {"algo_waiting_spacing", "等待下一次下单间隔"},
+    {"algo_waiting_account", "等待最新账户快照或启用交易"},
     {"app_name", "KTrader"},
     {"app_subtitle", "控制中心"},
     {"nav_account", "账户"},
