@@ -34,8 +34,10 @@ snapshots, and no unresolved orders on those accounts for that symbol.
 * A deadline stops execution; it does not raise participation. Stopping cancels working
   children and keeps the accounts until reconciliation completes.
 
-Accounts cannot be shared with fast (E/F) or Smart selling (G) sessions or with manual
-orders while a session owns them. Children are ordinary `LIMIT_ORDER` commands with
+Each account may run at most one buyer (E or H), alongside any number of sellers (F or G),
+all on distinct symbols. Scheduled, paused, stopping and reconciling sessions retain their
+reservations. Manual orders remain blocked on any account with an algorithm session.
+Children are ordinary `LIMIT_ORDER` commands with
 `side: BUY` and `trading_mode: H`, so brokers need no change.
 
 ## Configuration and API

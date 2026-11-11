@@ -1,5 +1,5 @@
 // Application services and the control logic that used to live in trading_ui/webserver.py:
-// ownership guards between manual orders and algorithm sessions, the one-session-per-account rule
+// ownership guards between manual orders and algorithm sessions, shared session admission
 // across E/F/G/H, and the JSON views served to the browser.
 #pragma once
 
@@ -132,9 +132,8 @@ public:
     void publish_control_command(const json& command, const std::string& key);
     void publish_fast_trading_command(const json& command, const std::string& key);
     void publish_trading_command(const json& command, const std::string& key);
-    // Several algorithm sessions may run at once, across modes E, F, G and H, but each account
-    // participates in at most one. The managers check ownership across modes; one lock serializes
-    // starts so two sessions cannot claim the same account at the same time.
+    // Serialize starts with global stop notifications and order handoffs. The shared session
+    // coordinator also makes admission atomic for direct runtime starts across E/F/G/H.
     std::string start_fast_strategy(const json& command);
     json start_smart_parent(const json& settings);
     json stop_smart_parent(const std::string& parent_id);
@@ -190,6 +189,7 @@ private:
     std::unique_ptr<reporting::ActivityReporting> reporting_;
     std::unique_ptr<reporting::MarketActivity> market_activity_;
     std::unique_ptr<order_ui::OrderStore> market_order_store_;
+    std::shared_ptr<algo::SessionCoordinator> session_coordinator_ = std::make_shared<algo::SessionCoordinator>();
     std::unique_ptr<fast::StrategyManager> fast_;
     std::unique_ptr<smart::SmartSellingRuntime> smart_;
     std::unique_ptr<smart::SmartBuyingRuntime> buying_;

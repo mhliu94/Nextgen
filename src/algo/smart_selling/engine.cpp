@@ -469,7 +469,7 @@ std::vector<std::size_t> SmartSellingEngine::account_selection_indices(const jso
 
 void SmartSellingEngine::register_parent(const json& parent) {
     transaction([&] {
-        if (static_cast<int>(active().size()) >= max_active_parents_) {
+        if (max_active_parents_ >= 0 && static_cast<int>(active().size()) >= max_active_parents_) {
             throw ValueError("maximum active Smart selling parents reached");
         }
         {
@@ -1592,7 +1592,7 @@ std::vector<json> SmartSellingEngine::list_parents(bool active_only, int limit) 
     if (active_only) sql += " WHERE active=1";
     sql += " ORDER BY rowid DESC LIMIT ?";
     Statement stmt(*db_, sql);
-    stmt.bind(1, static_cast<long long>(std::max(1, std::min(limit, 1000))));
+    stmt.bind(1, static_cast<long long>(limit == -1 ? -1 : std::clamp(limit, 1, 1000)));
     while (stmt.step()) out.push_back(make_public(json::parse(stmt.column_text(0))));
     return out;
 }

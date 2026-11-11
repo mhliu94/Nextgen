@@ -157,6 +157,9 @@ run(async () => {
   check(scroll.scrollLeft === 0, "Cannot scroll back to first column");
   document.querySelector('#nav a[href="/control-panel"]').click();
   await until(() => document.querySelector("#smart-status-table"), "Algo table did not load");
+  for (const [mode, category] of [["e", "buying"], ["f", "selling"], ["g", "selling"], ["h", "buying"]])
+    check(document.querySelector("#algo-mode-" + mode).nextSibling.querySelector("small").dataset.algoCategory === category,
+      "Incorrect algorithm category for mode " + mode);
   scroll = document.querySelector("#smart-status .table-scroll");
   check(scroll.scrollWidth > scroll.clientWidth, "Algo table has no mobile scroll area");
   const details = scroll.querySelector("details");

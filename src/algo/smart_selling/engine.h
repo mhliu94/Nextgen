@@ -74,7 +74,7 @@ public:
     using Clock = std::function<double()>;
 
     explicit SmartSellingEngine(const std::string& db_path, Clock clock = nullptr, Clock wall_clock = nullptr,
-                                int max_active_parents = 100);
+                                int max_active_parents = -1);
     virtual ~SmartSellingEngine();
     void close();
 
@@ -105,6 +105,7 @@ public:
     std::optional<json> get_order_context(const std::string& client_order_id);
     std::optional<json> find_order_by_broker_id(const std::string& account_id, const std::string& broker_order_id);
     json get_parent(const std::string& parent_id);
+    // A limit of -1 returns all matching parents; active-session checks must be unbounded.
     std::vector<json> list_parents(bool active_only = false, int limit = 100);
     std::vector<json> events(const std::string& parent_id, int limit = 100);
 

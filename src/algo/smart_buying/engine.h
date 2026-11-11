@@ -18,7 +18,7 @@ namespace ng::smart {
 class SmartBuyingEngine : public SmartSellingEngine {
 public:
     explicit SmartBuyingEngine(const std::string& db_path, Clock clock = nullptr, Clock wall_clock = nullptr,
-                               int max_active_parents = 100);
+                               int max_active_parents = -1);
 
     const char* side() const override { return "BUY"; }
     // A quote without a positive displayed ask size cannot be bought from: it is recorded unhealthy.

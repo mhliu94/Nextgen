@@ -216,8 +216,7 @@ TEST_CASE("strategy manager publishes cycles, reserves its accounts and stops") 
     json retry = command;
     retry["command_id"] = "fast-2";
     CHECK_THROWS_WITH(manager.start_strategy(retry),
-                      "Account(s) A, B already belong to an algorithm session; stop it and await outstanding order confirmations "
-                      "before starting another");
+                      doctest::Contains("must use distinct symbols"));
     CHECK(manager.stop_all() == 1);
     for (int i = 0; i < 100 && manager.has_active_session(); ++i) std::this_thread::sleep_for(std::chrono::milliseconds(10));
     CHECK_FALSE(manager.has_active_session());
@@ -589,19 +588,17 @@ TEST_CASE("stop all stops both modes, all symbols and accounts outside the curre
     CHECK(publishes.load() == 0);
 }
 
-TEST_CASE("sessions run at once unless they share an account") {
+TEST_CASE("sessions share accounts only on distinct symbols with one buyer") {
     auto dir = ngtest::directory({ngtest::meta("A", 1), ngtest::meta("B", 2), ngtest::meta("C", 3)});
     MarketDataStore store;
     StrategyManager manager(store, [&]() -> const AccountDirectory& { return dir; }, [](const json&, const std::string&) {});
     manager.start_strategy(with(strategy_command(), {{"fast_trading_account_ids", json::array({"A", "B"})}}));
-    struct Attempt { const char* mode; const char* symbol; json accounts; const char* message; };
+    struct Attempt { const char* mode; const char* symbol; json accounts; doctest::Contains message; };
     for (const Attempt& attempt :
-         {Attempt{"F", "MSFT", json::array({"B"}),
-                  "Account(s) B already belong to an algorithm session; stop it and await outstanding order confirmations before "
-                  "starting another"},
+         {Attempt{"F", "AAPL", json::array({"B"}),
+                  doctest::Contains("must use distinct symbols")},
           Attempt{"E", "AAPL", json::array({"C", "A"}),
-                  "Account(s) A already belong to an algorithm session; stop it and await outstanding order confirmations before "
-                  "starting another"}}) {
+                  doctest::Contains("must use distinct symbols")}}) {
         INFO(std::string(attempt.mode) << " " << attempt.symbol);
         CHECK_THROWS_WITH_AS(manager.start_strategy(with(strategy_command(), {{"command_id", "second"},
                                                                               {"trading_mode", attempt.mode},
@@ -635,21 +632,22 @@ TEST_CASE("duplicate start command id is rejected while its session is active") 
     CHECK(manager.owns_account("B"));
 }
 
-TEST_CASE("accounts owned by smart sessions cannot join a fast session") {
+TEST_CASE("smart sessions reserve their account and symbol against fast starts") {
     auto dir = ngtest::directory({ngtest::meta("A", 1), ngtest::meta("B", 2)});
     MarketDataStore store;
     std::mutex mutex;
     std::set<std::string> smart_owned = {"B"};
+    auto coordinator = std::make_shared<ng::algo::SessionCoordinator>();
+    coordinator->register_provider(&smart_owned, [&] {
+        std::lock_guard lock(mutex);
+        return std::vector<ng::algo::Session>{{"smart", "G", "AAPL", {smart_owned.begin(), smart_owned.end()}}};
+    });
     StrategyManager manager(
         store, [&]() -> const AccountDirectory& { return dir; }, [](const json&, const std::string&) {}, nullptr, nullptr,
-        RuntimeSettings::defaults(), nullptr, nullptr, [&](const std::string& id) {
-            std::lock_guard lock(mutex);
-            return smart_owned.count(id) > 0;
-        });
+        RuntimeSettings::defaults(), nullptr, nullptr, coordinator);
     json both = with(strategy_command(), {{"fast_trading_account_ids", json::array({"A", "B"})}});
     CHECK_THROWS_WITH_AS(manager.start_strategy(both),
-                         "Account(s) B already belong to an algorithm session; stop it and await outstanding order confirmations "
-                         "before starting another",
+                         doctest::Contains("must use distinct symbols"),
                          std::invalid_argument);
     CHECK_FALSE(manager.has_active_session());
     {
@@ -686,8 +684,7 @@ TEST_CASE("stopping worker reserves only its accounts until the in-flight cycle 
     CHECK(manager.owns_account("A"));
     CHECK_FALSE(manager.has_running_strategy("A", "AAPL"));
     CHECK_THROWS_WITH_AS(manager.start_strategy(with(strategy_command(1), {{"command_id", "retry"}})),
-                         "Account(s) A already belong to an algorithm session; stop it and await outstanding order confirmations "
-                         "before starting another",
+                         doctest::Contains("must use distinct symbols"),
                          std::invalid_argument);
     // The stopping session reserves only its own accounts.
     manager.start_strategy(with(strategy_command(1), {{"command_id", "other"}, {"fast_trading_account_ids", json::array({"B"})}}));

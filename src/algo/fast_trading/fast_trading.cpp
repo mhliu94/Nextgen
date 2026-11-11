@@ -397,7 +397,7 @@ CycleResult build_fast_trading_cycle_commands(const CycleInputs& in) {
 
 StrategyManager::StrategyManager(MarketDataStore& market_data, MetasProvider metas, PublishCommand publish,
                                  SnapshotsProvider snapshots, OperationsLog* operations_log, const RuntimeSettings& settings,
-                                 Clock monotonic, reporting::SessionReporter* reporting, OwnsAccount smart_owns_account)
+                                 Clock monotonic, reporting::SessionReporter* reporting, std::shared_ptr<algo::SessionCoordinator> session_coordinator)
     : market_data_(market_data),
       metas_(std::move(metas)),
       snapshots_(std::move(snapshots)),
@@ -406,8 +406,7 @@ StrategyManager::StrategyManager(MarketDataStore& market_data, MetasProvider met
       settings_(settings),
       monotonic_(monotonic ? std::move(monotonic) : Clock(&mono_now)),
       reporting_(reporting),
-      // Smart selling/buying (modes G/H) sessions own accounts too; no account may be in two sessions.
-      smart_owns_account_(smart_owns_account ? std::move(smart_owns_account) : OwnsAccount([](const std::string&) { return false; })) {
+      session_coordinator_(session_coordinator ? std::move(session_coordinator) : std::make_shared<algo::SessionCoordinator>()) {
     for (int level : {1, 2, 3}) {
         if (!settings_.aggression_levels.count(level)) {
             throw std::invalid_argument("fast trading aggression level " + std::to_string(level) + " is missing");
@@ -423,6 +422,7 @@ StrategyManager::StrategyManager(MarketDataStore& market_data, MetasProvider met
             throw std::invalid_argument(std::string(medium) + " minimum cycle time must be a positive finite number");
         }
     }
+    session_coordinator_->register_provider(this, [this] { return algo_sessions(); });
 }
 
 StrategyManager::~StrategyManager() {
@@ -441,6 +441,7 @@ StrategyManager::~StrategyManager() {
         request_stop(*s);
         if (s->thread.joinable()) s->thread.join();
     }
+    session_coordinator_->unregister_provider(this);
 }
 
 std::string StrategyManager::strategy_key(const std::string& trading_mode, const std::string& symbol) {
@@ -482,13 +483,17 @@ bool StrategyManager::owns_account(const std::string& account_id) const {
     return false;
 }
 
-void StrategyManager::require_accounts_available(const std::vector<std::string>& account_ids) const {
-    // Stopping sessions and in-flight handoffs keep their accounts reserved.
-    std::vector<std::string> owned;
-    for (const auto& account_id : account_ids) {
-        if (owns_account(account_id) || smart_owns_account_(account_id)) owned.push_back(account_id);
+std::vector<algo::Session> StrategyManager::algo_sessions() const {
+    std::lock_guard lock(mutex_);
+    std::vector<algo::Session> sessions;
+    for (const auto* group : {&strategies_, &stopping_strategies_}) {
+        for (const auto& [id, strategy] : *group) {
+            const auto accounts = strategy_accounts(strategy->command);
+            sessions.push_back({id, to_upper(trim(strategy->command.at("trading_mode").get<std::string>())),
+                                strategy->command.at("symbol").get<std::string>(), {accounts.begin(), accounts.end()}});
+        }
     }
-    if (!owned.empty()) throw std::invalid_argument(orders::algo_account_conflict_error(owned));
+    return sessions;
 }
 
 bool StrategyManager::has_running_strategy(const std::string& account_id, const std::string& symbol) const {
@@ -561,11 +566,12 @@ std::string StrategyManager::start_strategy(const json& start_command) {
     strategy->command = strategy_command;
     strategy->started_at = iso_utc_now();
     {
+        std::lock_guard admission(session_coordinator_->mutex);
         std::lock_guard lock(mutex_);
         if (strategies_.count(session_id) || stopping_strategies_.count(session_id)) {
             throw std::invalid_argument("An algorithm session with this command id is already active");
         }
-        require_accounts_available(v.account_ids);
+        session_coordinator_->require_available(v.mode, v.symbol, v.account_ids);
         strategies_[session_id] = strategy;
         auto accounts = strategy_accounts(strategy->command);
         std::vector<std::string> sorted_accounts(accounts.begin(), accounts.end());

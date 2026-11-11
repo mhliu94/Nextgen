@@ -204,21 +204,14 @@ void ControlCenter::create_fast_trading_manager() {
         market_store_, [this]() -> const AccountDirectory& { return accounts_; },
         [this](const json& command, const std::string& key) { publish_fast_trading_command(command, key); },
         [this] { return served_snapshots(); }, operations_log_.get(), settings, nullptr, reporting_.get(),
-        [this](const std::string& account) {
-            for (auto* manager : smart_managers()) {
-                if (manager->owns_account(account)) return true;
-            }
-            return false;
-        });
+        session_coordinator_);
 }
 
 void ControlCenter::create_smart_selling_runtime(std::shared_ptr<smart::SmartSellingEngine> engine) {
     smart_ = std::make_unique<smart::SmartSellingRuntime>(
         config_.smart_selling, [this]() -> const AccountDirectory& { return accounts_; }, [this] { return served_snapshots(); },
         [this](const json& command, const std::string& key) { publish_trading_command(command, key); },
-        [this](const std::string& account) {
-            return (fast_ && fast_->owns_account(account)) || (buying_ && buying_->owns_account(account));
-        },
+        session_coordinator_,
         std::move(engine), nullptr, nullptr, reporting_.get());
 }
 
@@ -227,9 +220,7 @@ void ControlCenter::create_smart_buying_runtime(std::shared_ptr<smart::SmartBuyi
         config_.smart_buying, market_store_, [this]() -> const AccountDirectory& { return accounts_; },
         [this] { return served_snapshots(); },
         [this](const json& command, const std::string& key) { publish_trading_command(command, key); },
-        [this](const std::string& account) {
-            return (fast_ && fast_->owns_account(account)) || (smart_ && smart_->owns_account(account));
-        },
+        session_coordinator_,
         std::move(engine), nullptr, nullptr, reporting_.get());
 }
 
@@ -309,8 +300,10 @@ void ControlCenter::publish_fast_trading_command(const json& command, const std:
     std::string symbol = json_to_string(json_find(command, "symbol")).value_or("");
     if (!fast_ || !fast_->has_running_strategy(account, symbol)) return;
     for (auto* manager : smart_managers()) {
-        // Sessions never share an account.
-        if (manager->owns_account(account)) throw std::invalid_argument(orders::algo_account_conflict_error({account}));
+        // Shared accounts are permitted only on distinct instruments.
+        if (manager->owns(account, symbol)) throw std::invalid_argument(
+            "Cannot publish algorithm order: account " + account + " already has a Smart algorithm session on symbol " +
+            symbol + "; all strategies on an account must use distinct symbols");
         manager->track_external_order(command);
     }
     publish_trading_command(command, key);

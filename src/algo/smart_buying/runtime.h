@@ -14,7 +14,7 @@ class SmartBuyingRuntime : public SmartSellingRuntime {
 public:
     // `config` is the normalised `smart_buying` section (normalize_smart_buying_config).
     SmartBuyingRuntime(const SmartSellingConfig& config, MarketDataStore& market_data_store, MetasProvider metas,
-                       SnapshotsProvider snapshots, PublishCommand publish, OwnsAccount fast_owns_account = nullptr,
+                       SnapshotsProvider snapshots, PublishCommand publish, std::shared_ptr<algo::SessionCoordinator> session_coordinator = nullptr,
                        std::shared_ptr<SmartBuyingEngine> engine = nullptr, Clock clock = nullptr, Clock wall_clock = nullptr,
                        reporting::SessionReporter* reporting = nullptr);
 

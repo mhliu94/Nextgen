@@ -392,10 +392,10 @@ TEST_CASE("algorithm sessions share the server and block manual orders on their 
     CHECK(start["strategy_key"] == "E:AAPL");
     CHECK(start["command"]["type"] == "START_ALGO_TRADING");
     CHECK(start["command"]["fast_trading_total_target_position"] == 2500);
-    // The same account cannot join a second session, in any mode.
-    auto again = c.Post("/api/submit-algo", json{{"trading_mode", "F"}, {"symbol", "MSFT"}, {"fast_trading_price_limit", 10}, {"fast_trading_account_ids", json::array({"A"})}, {"fast_trading_book_levels", 1}, {"fast_trading_target_percentage", 100}, {"fast_trading_cycle_seconds", 5}}.dump(), "application/json");
-    CHECK(again->status == 500);  // like the Python API: a start conflict is not an input validation error
-    CHECK(body(again)["error"].get<std::string>().find("Account(s) A already belong to an algorithm session") == 0);
+    // The same account cannot reuse a symbol, in any mode.
+    auto again = c.Post("/api/submit-algo", json{{"trading_mode", "F"}, {"symbol", "AAPL"}, {"fast_trading_price_limit", 10}, {"fast_trading_account_ids", json::array({"A"})}, {"fast_trading_book_levels", 1}, {"fast_trading_target_percentage", 100}, {"fast_trading_cycle_seconds", 5}}.dump(), "application/json");
+    CHECK(again->status == 400);
+    CHECK(body(again)["error"].get<std::string>().find("Account(s) A: symbol AAPL is already in use") != std::string::npos);
     auto smart_blocked = c.Post("/api/smart-selling", json{{"account_ids", json::array({"A"})}, {"symbol", "AAPL"}, {"deadline", nullptr}}.dump(), "application/json");
     CHECK(smart_blocked->status == 400);
     auto bad_target = c.Post("/api/submit-algo", json{{"trading_mode", "E"}, {"symbol", "MSFT"}, {"fast_trading_price_limit", 10}, {"fast_trading_account_ids", json::array({"B"})}, {"fast_trading_book_levels", 1}, {"fast_trading_target_percentage", 100}, {"fast_trading_cycle_seconds", 5}, {"total_target_position", "1.5"}}.dump(), "application/json");
@@ -480,10 +480,10 @@ TEST_CASE("authenticated same-origin API starts and stops mode H") {
     json listed = body(c.Get("/api/smart-buying"));
     CHECK(listed["parents"][0]["parent_id"] == parent["parent_id"]);
     CHECK(listed["available"] == true);
-    // The account is now owned by the session: no other mode and no manual order may use it.
+    // The buyer reserves cash on this account; manual orders also remain blocked.
     auto fast = c.Post("/api/submit-algo", json{{"trading_mode", "E"}, {"symbol", "AAPL"}, {"fast_trading_price_limit", 10}, {"fast_trading_account_ids", json::array({"A"})}, {"fast_trading_book_levels", 1}, {"fast_trading_target_percentage", 100}, {"fast_trading_cycle_seconds", 5}}.dump(), "application/json");
-    CHECK(fast->status == 500);
-    CHECK(body(fast)["error"].get<std::string>().find("already belong to an algorithm session") != std::string::npos);
+    CHECK(fast->status == 400);
+    CHECK(body(fast)["error"].get<std::string>().find("at most 1 buying strategy") != std::string::npos);
     CHECK(c.Post("/api/submit-order", json{{"account_id", "A"}, {"symbol", "XYZ"}, {"side", "BUY"}, {"shares", 1}}.dump(), "application/json")->status == 500);
     json algo = body(c.Get("/api/algo"));
     CHECK(algo["active"] == true);

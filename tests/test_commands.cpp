@@ -333,10 +333,3 @@ TEST_CASE("broker orders today follows the New York calendar") {
     // Today is accepted, tomorrow is not (whatever the wall clock is).
     CHECK(validate_broker_orders_inputs(today, {"A"}, broker_metas(), {"d", "f", "a", "p"}).ok());
 }
-
-TEST_CASE("algorithm account conflict message lists the accounts") {
-    CHECK(algo_account_conflict_error({"A"}) ==
-          "Account(s) A already belong to an algorithm session; stop it and await outstanding order confirmations before "
-          "starting another");
-    CHECK(algo_account_conflict_error({"B", "A"}).rfind("Account(s) B, A already belong", 0) == 0);
-}

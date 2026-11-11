@@ -869,7 +869,12 @@
       if (state.boot.smart_selling_available) modes.push({ value: "G", label: t("mode_g") });
       if (state.boot.smart_buying_available) modes.push({ value: "H", label: t("mode_h") });
       const algoMode = radioGroup("algo-mode", modes, "E");
-      algoMode.inputs.forEach((i) => { i.id = "algo-mode-" + i.value.toLowerCase(); i.nextSibling.setAttribute("for", i.id); });
+      algoMode.inputs.forEach((i) => {
+        i.id = "algo-mode-" + i.value.toLowerCase();
+        i.nextSibling.setAttribute("for", i.id);
+        const category = ["E", "H"].includes(i.value) ? "buying" : "selling";
+        i.nextSibling.append(" ", h("small", { dataset: { algoCategory: category }, text: "(" + t("algo_category_" + category) + ")" }));
+      });
       const algoSymbol = h("select", { id: "algo_symbol", required: true }, symbolOptions());
       const algoMsg = h("div", { class: "help", id: "smart-selling-message", role: "status" });
       const algoForm = h("form", { id: "algo-form", onsubmit: (e) => {
@@ -880,6 +885,7 @@
         else openFastModal(mode, algoSymbol.value, algoMsg);
       } },
         h("div", { class: "row" }, h("div", { class: "field" }, h("label", { text: t("trading_mode") }), algoMode.el), h("div", { class: "field" }, h("label", { for: "algo_symbol", text: t("symbol") }), algoSymbol)),
+        h("p", { class: "help", text: t("algo_session_rules") }),
         h("button", { class: "btn green", id: "algo-submit", type: "submit" }, t("algo_submit")));
       const algoStatus = h("div", { id: "algo-status" });
       const smartStatus = h("div", { id: "smart-status" });

@@ -10,10 +10,10 @@
 namespace ng::smart {
 
 SmartBuyingRuntime::SmartBuyingRuntime(const SmartSellingConfig& config, MarketDataStore& market_data_store, MetasProvider metas,
-                                       SnapshotsProvider snapshots, PublishCommand publish, OwnsAccount fast_owns_account,
+                                       SnapshotsProvider snapshots, PublishCommand publish, std::shared_ptr<algo::SessionCoordinator> session_coordinator,
                                        std::shared_ptr<SmartBuyingEngine> engine, Clock clock, Clock wall_clock,
                                        reporting::SessionReporter* reporting)
-    : SmartSellingRuntime(config, std::move(metas), std::move(snapshots), std::move(publish), std::move(fast_owns_account),
+    : SmartSellingRuntime(config, std::move(metas), std::move(snapshots), std::move(publish), std::move(session_coordinator),
                           engine, std::move(clock), std::move(wall_clock), reporting, "H",
                           [](const std::string& path, const Clock& c, const Clock& w) -> std::shared_ptr<SmartSellingEngine> {
                               return std::make_shared<SmartBuyingEngine>(path, c, w);
@@ -72,12 +72,9 @@ json SmartBuyingRuntime::start_parent(const json& settings) {
                              : std::string();
     if (symbol.empty()) throw ValueError("A symbol is required");
 
+    std::lock_guard admission(session_coordinator_->mutex);
     std::lock_guard lock(mutex_);
-    std::vector<std::string> owned;
-    for (const auto& a : accounts) {
-        if (owns_account(a) || fast_owns_account_(a)) owned.push_back(a);
-    }
-    if (!owned.empty()) throw ValueError(orders::algo_account_conflict_error(owned));
+    session_coordinator_->require_available(trading_mode_, symbol, accounts);
     if (!feeds_live()) throw ValueError("Wait for live order-status and trading-volume feeds");
     OrderBookSnapshot book = market_data_store_.get_book(symbol, 1);
     double age = book.asof_epoch ? wall_clock_() - static_cast<double>(*book.asof_epoch) : 0.0;

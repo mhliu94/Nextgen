@@ -21,17 +21,17 @@ constexpr const char* kLog = "trading-ui.smart-selling";
 }
 
 SmartSellingRuntime::SmartSellingRuntime(const SmartSellingConfig& config, MetasProvider metas, SnapshotsProvider snapshots,
-                                         PublishCommand publish, OwnsAccount fast_owns_account,
+                                         PublishCommand publish, std::shared_ptr<algo::SessionCoordinator> session_coordinator,
                                          std::shared_ptr<SmartSellingEngine> engine, Clock clock, Clock wall_clock,
                                          reporting::SessionReporter* reporting)
-    : SmartSellingRuntime(config, std::move(metas), std::move(snapshots), std::move(publish), std::move(fast_owns_account),
+    : SmartSellingRuntime(config, std::move(metas), std::move(snapshots), std::move(publish), std::move(session_coordinator),
                           std::move(engine), std::move(clock), std::move(wall_clock), reporting, "G",
                           [](const std::string& path, const Clock& c, const Clock& w) {
                               return std::make_shared<SmartSellingEngine>(path, c, w);
                           }) {}
 
 SmartSellingRuntime::SmartSellingRuntime(const SmartSellingConfig& config, MetasProvider metas, SnapshotsProvider snapshots,
-                                         PublishCommand publish, OwnsAccount fast_owns_account,
+                                         PublishCommand publish, std::shared_ptr<algo::SessionCoordinator> session_coordinator,
                                          std::shared_ptr<SmartSellingEngine> engine, Clock clock, Clock wall_clock,
                                          reporting::SessionReporter* reporting, std::string trading_mode,
                                          EngineFactory engine_factory)
@@ -39,8 +39,7 @@ SmartSellingRuntime::SmartSellingRuntime(const SmartSellingConfig& config, Metas
       metas_(std::move(metas)),
       snapshots_(std::move(snapshots)),
       publish_(std::move(publish)),
-      // Fast trading (modes E/F) and the other Smart controller own accounts too; no account may be in two sessions.
-      fast_owns_account_(fast_owns_account ? std::move(fast_owns_account) : OwnsAccount([](const std::string&) { return false; })),
+      session_coordinator_(session_coordinator ? std::move(session_coordinator) : std::make_shared<algo::SessionCoordinator>()),
       clock_(clock ? std::move(clock) : Clock(&mono_now)),
       wall_clock_(wall_clock ? std::move(wall_clock) : Clock(&wall_now)),
       reporting_(reporting),
@@ -73,9 +72,13 @@ SmartSellingRuntime::SmartSellingRuntime(const SmartSellingConfig& config, Metas
     market_ = std::make_unique<SmartSellingMarketAdapter>(*engine_, clock_, wall_clock_, config_.trade_max_age);
     worker_ = std::thread([this] { worker_loop(); });
     sync_reporting();
+    session_coordinator_->register_provider(this, [this] { return algo_sessions(); });
 }
 
-SmartSellingRuntime::~SmartSellingRuntime() { close(); }
+SmartSellingRuntime::~SmartSellingRuntime() {
+    close();
+    session_coordinator_->unregister_provider(this);
+}
 
 bool SmartSellingRuntime::report(const char* method, const std::function<void(reporting::SessionReporter&)>& call) {
     if (!reporting_) return false;
@@ -99,7 +102,14 @@ void SmartSellingRuntime::sync_reporting(const std::vector<json>* parents_in, co
     if (!reporting_) return;
     try {
         std::vector<json> loaded;
-        if (!parents_in) loaded = engine_->list_parents(false, 1000);
+        if (!parents_in) {
+            loaded = engine_->list_parents(false, 1000);
+            std::set<std::string> listed;
+            for (const auto& parent : loaded) listed.insert(parent.at("parent_id").get<std::string>());
+            for (auto& parent : engine_->list_parents(true, -1)) {
+                if (listed.insert(parent.at("parent_id").get<std::string>()).second) loaded.push_back(std::move(parent));
+            }
+        }
         const std::vector<json>& parents = parents_in ? *parents_in : loaded;
         for (const json& parent : parents) {
             std::string session_id = parent.at("parent_id").get<std::string>();
@@ -287,14 +297,9 @@ json SmartSellingRuntime::start_parent(const json& settings_in) {
     if (settings.contains("imminent_event") && !settings.at("imminent_event").is_boolean()) {
         throw ValueError("imminent_event must be boolean");
     }
+    std::lock_guard admission(session_coordinator_->mutex);
     std::lock_guard lock(mutex_);
-    // Each account may participate in at most one algorithm session (E, F, G or H). Stopping and
-    // reconciling sessions keep their accounts reserved.
-    std::vector<std::string> owned;
-    for (const auto& a : accounts) {
-        if (owns_account(a) || fast_owns_account_(a)) owned.push_back(a);
-    }
-    if (!owned.empty()) throw ValueError(orders::algo_account_conflict_error(owned));
+    session_coordinator_->require_available(trading_mode_, symbol, accounts);
     if (feeds_.at("orders") != "live") {
         throw ValueError("Wait for the order-status feed to finish reconciliation before starting Smart selling");
     }
@@ -364,8 +369,17 @@ std::vector<std::string> SmartSellingRuntime::parent_accounts(const json& parent
 
 bool SmartSellingRuntime::has_active_session() { return !engine_->list_parents(true, 1).empty(); }
 
+std::vector<algo::Session> SmartSellingRuntime::algo_sessions() {
+    std::vector<algo::Session> sessions;
+    for (const auto& parent : engine_->list_parents(true, -1)) {
+        sessions.push_back({parent.at("parent_id").get<std::string>(), trading_mode_,
+                            parent.at("symbol").get<std::string>(), parent_accounts(parent)});
+    }
+    return sessions;
+}
+
 bool SmartSellingRuntime::owns_account(const std::string& account_id) {
-    for (const json& parent : engine_->list_parents(true, 1000)) {
+    for (const json& parent : engine_->list_parents(true, -1)) {
         auto accounts = parent_accounts(parent);
         if (std::find(accounts.begin(), accounts.end(), account_id) != accounts.end()) return true;
     }
@@ -374,7 +388,7 @@ bool SmartSellingRuntime::owns_account(const std::string& account_id) {
 
 bool SmartSellingRuntime::owns(const std::string& account_id, const std::string& symbol) {
     std::string canonical = canonical_symbol(symbol);
-    for (const json& parent : engine_->list_parents(true, 1000)) {
+    for (const json& parent : engine_->list_parents(true, -1)) {
         auto accounts = parent_accounts(parent);
         if (std::find(accounts.begin(), accounts.end(), account_id) != accounts.end() &&
             parent.at("symbol").get<std::string>() == canonical) {
@@ -389,7 +403,7 @@ std::vector<json> SmartSellingRuntime::list_parents() {
     // Older active sessions must remain visible beyond the recent-history limit.
     std::set<std::string> listed;
     for (const json& parent : parents) listed.insert(parent.at("parent_id").get<std::string>());
-    std::vector<json> active = engine_->list_parents(true, 1000);
+    std::vector<json> active = engine_->list_parents(true, -1);
     for (json& parent : active) {
         std::string id = parent.at("parent_id").get<std::string>();
         if (listed.insert(id).second) {
@@ -419,7 +433,7 @@ json SmartSellingRuntime::stop_parent(const std::string& parent_id) {
 
 int SmartSellingRuntime::stop_all() {
     std::lock_guard lock(mutex_);
-    std::vector<json> parents = engine_->list_parents(true, 1000);
+    std::vector<json> parents = engine_->list_parents(true, -1);
     for (const json& parent : parents) stop_parent(parent.at("parent_id").get<std::string>());
     return static_cast<int>(parents.size());
 }
@@ -458,7 +472,7 @@ void SmartSellingRuntime::on_feed_state(const std::string& feed, const std::stri
     feeds_[feed] = state;
     if (feed == "volume") market_->set_volume_connected(state == "live");
     if (state != "live") {
-        for (const json& parent : engine_->list_parents(true, 1000)) {
+        for (const json& parent : engine_->list_parents(true, -1)) {
             engine_->set_feed_health(parent.at("symbol").get<std::string>(), false, feed + " feed " + state);
         }
     }
@@ -477,7 +491,7 @@ void SmartSellingRuntime::set_feed_states_for_test(const std::map<std::string, s
 
 void SmartSellingRuntime::tick() {
     std::lock_guard lock(mutex_);
-    std::vector<json> parents = engine_->list_parents(true, 1000);
+    std::vector<json> parents = engine_->list_parents(true, -1);
     bool live = feeds_live();
     for (const json& parent : parents) {
         std::string symbol = parent.at("symbol").get<std::string>();

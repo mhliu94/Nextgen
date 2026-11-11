@@ -148,11 +148,6 @@ json build_algo_start_command(const std::string& trading_mode, const std::string
     return cmd;
 }
 
-std::string algo_account_conflict_error(const std::vector<std::string>& account_ids) {
-    return "Account(s) " + join(account_ids, ", ") +
-           " already belong to an algorithm session; stop it and await outstanding order confirmations before starting another";
-}
-
 std::string broker_orders_today() {
     return TimeZone::find(kBrokerOrdersTimezone)->date(wall_now());
 }

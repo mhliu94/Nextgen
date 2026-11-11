@@ -36,11 +36,17 @@ struct BuyingFixture {
     MarketDataStore md;
     std::vector<json> published;
     bool fast_owns = false;
+    std::shared_ptr<ng::algo::SessionCoordinator> coordinator = std::make_shared<ng::algo::SessionCoordinator>();
     std::shared_ptr<SmartBuyingEngine> engine;
     std::unique_ptr<TestBuyingRuntime> runtime;
     json parent;
 
     BuyingFixture() {
+        coordinator->register_provider(&fast_owns, [this] {
+            std::vector<ng::algo::Session> sessions;
+            if (fast_owns) sessions.push_back({"fast", "E", "OTHER", {"A"}});
+            return sessions;
+        });
         snapshots["A"] = account("A", 10000);
         OrderBookSnapshot book;
         book.symbol = "XYZ";
@@ -51,7 +57,7 @@ struct BuyingFixture {
         runtime = std::make_unique<TestBuyingRuntime>(
             ng::normalize_smart_buying_config(nullptr), md, [this]() -> const AccountDirectory& { return metas; },
             [this] { return snapshots; }, [this](const json& command, const std::string&) { published.push_back(command); },
-            [this](const std::string&) { return fast_owns; }, engine, [this] { return clock; }, [this] { return clock; });
+            coordinator, engine, [this] { return clock; }, [this] { return clock; });
         runtime->set_feed_states_for_test({{"orders", "live"}, {"volume", "live"}});
     }
     ~BuyingFixture() { runtime->close(); }
@@ -213,10 +219,13 @@ TEST_CASE_FIXTURE(BuyingFixture, "partial fills and cancel reserve cash until te
     CHECK(status()["accounts"]["A"]["spent"] == "3000");
     runtime->stop_parent(S(parent["parent_id"]));
     CHECK(runtime->owns_account("A"));
+    CHECK_THROWS_WITH(coordinator->require_available("E", "OTHER", {"A"}), doctest::Contains("at most 1 buying strategy"));
+    CHECK_NOTHROW(coordinator->require_available("F", "OTHER", {"A"}));
     report(command, "CANCELED", 175, 2);
     CHECK(status()["accounts"]["A"]["spent"] == "3500");
     CHECK_FALSE(runtime->owns_account("A"));
     CHECK(status()["reserved"] == "0");
+    CHECK_NOTHROW(coordinator->require_available("E", "OTHER", {"A"}));
 }
 
 TEST_CASE_FIXTURE(BuyingFixture, "one child at a time and subminimum tail stays unspent") {

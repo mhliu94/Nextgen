@@ -15,6 +15,9 @@ struct KeyValue {
 
 // Keys added by the next-generation front end. Keep both languages in sync.
 static const KeyValue k_en_extra[] = {
+    {"algo_category_buying", "buying"},
+    {"algo_category_selling", "selling"},
+    {"algo_session_rules", "Each account can run one buying session and multiple selling sessions, all on different symbols. Stopping sessions keep their reservations until outstanding orders are confirmed."},
     {"algo_waiting_volume", "Waiting for market volume"},
     {"algo_waiting_volume_minimum", "Waiting for market volume to reach the minimum order size"},
     {"algo_waiting_volume_liquidity", "Waiting for market volume and available liquidity"},
@@ -147,6 +150,9 @@ static const KeyValue k_en_extra[] = {
 };
 
 static const KeyValue k_zh_extra[] = {
+    {"algo_category_buying", "买入"},
+    {"algo_category_selling", "卖出"},
+    {"algo_session_rules", "每个账户最多运行一个买入会话，可同时运行多个卖出会话，所有会话须使用不同标的。正在停止的会话将保留预占，直至未完成订单得到确认。"},
     {"algo_waiting_volume", "等待市场成交量"},
     {"algo_waiting_volume_minimum", "等待市场成交量达到最小委托数量"},
     {"algo_waiting_volume_liquidity", "等待市场成交量和可用流动性"},

@@ -15,6 +15,7 @@
 #include <vector>
 
 #include "core/json.h"
+#include "algo/session_coordinator.h"
 #include "model/account.h"
 #include "model/market_data.h"
 #include "ops/operations_log.h"
@@ -99,23 +100,23 @@ public:
     using SnapshotsProvider = std::function<std::map<std::string, AccountSnapshot>()>;
     using PublishCommand = std::function<void(const json& command, const std::string& key)>;
     using Clock = std::function<double()>;
-    using OwnsAccount = std::function<bool(const std::string& account_id)>;
 
     StrategyManager(MarketDataStore& market_data, MetasProvider metas, PublishCommand publish,
                     SnapshotsProvider snapshots = nullptr, OperationsLog* operations_log = nullptr,
                     const RuntimeSettings& settings = RuntimeSettings::defaults(), Clock monotonic = nullptr,
-                    reporting::SessionReporter* reporting = nullptr, OwnsAccount smart_owns_account = nullptr);
+                    reporting::SessionReporter* reporting = nullptr, std::shared_ptr<algo::SessionCoordinator> session_coordinator = nullptr);
     ~StrategyManager();
 
     static std::string strategy_key(const std::string& trading_mode, const std::string& symbol);
 
     bool has_active_session() const;
+    std::vector<algo::Session> algo_sessions() const;
     // True while a running or stopping session, or an in-flight handoff, uses the account.
     bool owns_account(const std::string& account_id) const;
     bool has_running_strategy(const std::string& account_id, const std::string& symbol) const;
 
-    // Several sessions may run at once as long as no account participates in more than one algorithm
-    // session (E, F, G or H). Returns the strategy key ("E:SYMBOL"); the session is identified by the
+    // Accounts may share distinct symbols, with at most one buyer across E/F/G/H.
+    // Returns the strategy key ("E:SYMBOL"); the session is identified by the
     // start command id. Throws std::invalid_argument / std::runtime_error.
     std::string start_strategy(const json& start_command);
     // Stops every running session for this mode and symbol.
@@ -161,7 +162,6 @@ private:
 
     ValidatedValues validated_strategy_values(const json& command) const;
     static std::set<std::string> strategy_accounts(const json& command);
-    void require_accounts_available(const std::vector<std::string>& account_ids) const;
     int stop_sessions(const std::vector<std::string>& session_ids, const std::string& reason);
     void run_strategy(std::shared_ptr<Strategy> strategy);
     // Waits up to `seconds` for a stop request, refreshing the session heartbeat at most every 10 s.
@@ -183,7 +183,7 @@ private:
     RuntimeSettings settings_;
     Clock monotonic_;
     reporting::SessionReporter* reporting_;
-    OwnsAccount smart_owns_account_;
+    std::shared_ptr<algo::SessionCoordinator> session_coordinator_;
     CycleWaiter cycle_waiter_;
     WorkerSpawner worker_spawner_;
     mutable std::recursive_mutex mutex_;

@@ -71,11 +71,16 @@ service (see `trading_ui_kafka_command_schema_en.docx` in the KTrader repository
 | POST | `/api/smart-buying` | `account_ids[]`, `symbol`, `mode` (`patient`/`normal`/`urgent` or 1–3), `deadline`, `start_time`, `maximum_price` | Starts a mode-H parent sized from available USD cash and the best ask — see [SMART_BUYING.md](SMART_BUYING.md) |
 | POST | `/api/smart-buying/{parent_id}/stop` | — | Requests a stop (404 for unknown ids) |
 
-Several algorithm sessions may run at once as long as no account is shared: a fast session,
-a Smart selling parent or a Smart buying parent owns its accounts until its orders reach a
-final status. Starting another session on an owned account fails with
-`Account(s) A, B already belong to an algorithm session; stop it and await outstanding order
-confirmations before starting another`, and manual orders on an owned account fail with
+Each account may run one buying session (E or H) and any number of selling sessions
+(F or G), all on distinct symbols. Symbol aliases such as `US.XYZ/USD` and `XYZ` share a
+reservation. Admission is atomic across all selected accounts and all four modes, including
+direct runtime starts. Scheduled, paused, stopping and reconciling sessions retain their
+symbol and buying reservations until they end. There is no default Smart session count cap;
+status, ownership checks and Stop all include every active session, beyond history limits.
+
+Start conflicts return HTTP 400 and identify the account, existing session ID, mode, symbol
+and violated rule. A failed start reserves nothing. Manual orders, cancellations and currency
+conversions remain blocked for an account with any algorithm session, with the message
 `An algorithm session owns this account; stop it and await outstanding order confirmations first`.
 
 ### Legacy form endpoints

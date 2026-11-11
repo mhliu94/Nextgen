@@ -76,9 +76,6 @@ json build_algo_start_command(const std::string& trading_mode, const std::string
                               int cycle_seconds, bool test_mode,
                               std::optional<long long> total_target_position = std::nullopt);
 json build_algo_stop_command(const std::optional<std::string>& reason);
-// "Account(s) A, B already belong to an algorithm session; stop it and await outstanding order
-// confirmations before starting another": each account participates in at most one session (E, F, G or H).
-std::string algo_account_conflict_error(const std::vector<std::string>& account_ids);
 // Optional fast-trading position target: nullopt when absent/blank, else a whole number of shares in
 // [0, 2^53-1]. Throws std::invalid_argument(kFastTotalTargetPositionError) for anything else.
 std::optional<long long> parse_total_target_position(const json& value);

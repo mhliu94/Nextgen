@@ -19,6 +19,7 @@
 
 #include "core/config.h"
 #include "core/json.h"
+#include "algo/session_coordinator.h"
 #include "model/account.h"
 #include "algo/smart_selling/engine.h"
 #include "algo/smart_selling/feedback.h"
@@ -32,12 +33,10 @@ public:
     using MetasProvider = std::function<const AccountDirectory&()>;
     using SnapshotsProvider = std::function<std::map<std::string, AccountSnapshot>()>;
     using PublishCommand = std::function<void(const json& command, const std::string& key)>;
-    // True when another algorithm (fast trading E/F or the other Smart controller) owns the account.
-    using OwnsAccount = std::function<bool(const std::string& account_id)>;
     using Clock = std::function<double()>;
 
     SmartSellingRuntime(const SmartSellingConfig& config, MetasProvider metas, SnapshotsProvider snapshots,
-                        PublishCommand publish, OwnsAccount fast_owns_account = nullptr,
+                        PublishCommand publish, std::shared_ptr<algo::SessionCoordinator> session_coordinator = nullptr,
                         std::shared_ptr<SmartSellingEngine> engine = nullptr, Clock clock = nullptr, Clock wall_clock = nullptr,
                         reporting::SessionReporter* reporting = nullptr);
     virtual ~SmartSellingRuntime();
@@ -50,6 +49,7 @@ public:
 
     virtual json start_parent(const json& settings);
     bool has_active_session();
+    std::vector<algo::Session> algo_sessions();
     // Stopping and reconciling sessions retain ownership until all children resolve.
     bool owns_account(const std::string& account_id);
     bool owns(const std::string& account_id, const std::string& symbol);
@@ -86,7 +86,7 @@ protected:
         std::function<std::shared_ptr<SmartSellingEngine>(const std::string& path, const Clock& clock, const Clock& wall_clock)>;
     // Shared constructor: `engine_factory` builds the file-backed engine when none is injected.
     SmartSellingRuntime(const SmartSellingConfig& config, MetasProvider metas, SnapshotsProvider snapshots,
-                        PublishCommand publish, OwnsAccount fast_owns_account, std::shared_ptr<SmartSellingEngine> engine,
+                        PublishCommand publish, std::shared_ptr<algo::SessionCoordinator> session_coordinator, std::shared_ptr<SmartSellingEngine> engine,
                         Clock clock, Clock wall_clock, reporting::SessionReporter* reporting, std::string trading_mode,
                         EngineFactory engine_factory);
 
@@ -111,7 +111,7 @@ protected:
     MetasProvider metas_;
     SnapshotsProvider snapshots_;
     PublishCommand publish_;
-    OwnsAccount fast_owns_account_;
+    std::shared_ptr<algo::SessionCoordinator> session_coordinator_;
     Clock clock_;
     Clock wall_clock_;
     reporting::SessionReporter* reporting_;

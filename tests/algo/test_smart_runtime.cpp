@@ -26,6 +26,7 @@ struct RuntimeFixture {
     std::unique_ptr<SmartSellingRuntime> runtime;
     std::string parent_id;
     std::set<std::string> fast_owned;
+    std::shared_ptr<ng::algo::SessionCoordinator> coordinator = std::make_shared<ng::algo::SessionCoordinator>();
     ng::reporting::SessionReporter* reporting = nullptr;
 
     RuntimeFixture() {
@@ -37,6 +38,9 @@ struct RuntimeFixture {
         snap.trading_enabled = true;
         snapshots["A"] = snap;
         engine = std::make_shared<SmartSellingEngine>(dir.file("state.sqlite3"), [this] { return now; }, [this] { return epoch + now; });
+        coordinator->register_provider(&fast_owned, [this] {
+            return std::vector<ng::algo::Session>{{"fast", "E", "XYZ", {fast_owned.begin(), fast_owned.end()}}};
+        });
         build_runtime(json::object());
     }
     ~RuntimeFixture() { runtime->close(); }
@@ -50,7 +54,7 @@ struct RuntimeFixture {
                 published.push_back(command);
                 keys.push_back(key);
             },
-            [this](const std::string& account) { return fast_owned.count(account) > 0; }, engine, [this] { return now; },
+            coordinator, engine, [this] { return now; },
             [this] { return epoch + now; }, reporting);
         runtime->set_feed_states_for_test({{"orders", "live"}, {"volume", "live"}});
     }
@@ -208,13 +212,16 @@ TEST_CASE_FIXTURE(RuntimeFixture, "stopping parent reserves its account while ot
     runtime->wait_idle();
     CHECK(runtime->has_active_session());
     CHECK(runtime->owns_account("A"));
-    const char* owned = "Account(s) A already belong to an algorithm session; stop it and await outstanding order confirmations "
-                        "before starting another";
-    CHECK_THROWS_WITH(runtime->start_parent(json{{"account_ids", json::array({"A"})}, {"symbol", "OTHER"}}), owned);
+    const auto owned = doctest::Contains("must use distinct symbols");
+    snap().positions.push_back(Position{"OTHER", 1000, std::nullopt, 1000});
+    auto other_symbol = runtime->start_parent(json{{"account_ids", json::array({"A"})}, {"symbol", "OTHER"}});
     CHECK_THROWS_WITH(runtime->start_parent(json{{"account_ids", json::array({"B", "A"})}, {"symbol", "XYZ"}}), owned);
     json other = runtime->start_parent(json{{"account_ids", json::array({"B"})}, {"symbol", "XYZ"}});
     CHECK(runtime->owns_account("B"));
     order_payload(snapshot(command, {{"status", "CANCELED"}, {"sequence", 2}}));
+    CHECK_FALSE(runtime->owns("A", "XYZ"));
+    CHECK(runtime->owns("A", "OTHER"));
+    runtime->stop_parent(S(other_symbol["parent_id"]));
     CHECK_FALSE(runtime->owns_account("A"));
     CHECK(runtime->has_active_session());
     runtime->stop_parent(S(other["parent_id"]));
@@ -230,18 +237,17 @@ TEST_CASE_FIXTURE(RuntimeFixture, "parents on disjoint accounts run at once acro
     std::set<std::string> active;
     for (const json& parent : engine->list_parents(true)) active.insert(S(parent["parent_id"]));
     CHECK(active == std::set<std::string>{S(first["parent_id"]), S(second["parent_id"])});
-    CHECK_THROWS_WITH(runtime->start_parent(json{{"account_ids", json::array({"B"})}, {"symbol", "XYZ"}}),
-                      "Account(s) B already belong to an algorithm session; stop it and await outstanding order confirmations "
-                      "before starting another");
-    CHECK(runtime->stop_all() == 2);
+    CHECK_NOTHROW(runtime->start_parent(json{{"account_ids", json::array({"B"})}, {"symbol", "XYZ"}}));
+    CHECK_THROWS_WITH(runtime->start_parent(json{{"account_ids", json::array({"B"})}, {"symbol", "OTHER"}}),
+                      doctest::Contains("must use distinct symbols"));
+    CHECK(runtime->stop_all() == 3);
 }
 
 TEST_CASE_FIXTURE(RuntimeFixture, "fast sessions block only the accounts they own") {
     add_account();
     fast_owned = {"B"};
     CHECK_THROWS_WITH(runtime->start_parent(json{{"account_ids", json::array({"A", "B"})}, {"symbol", "XYZ"}}),
-                      "Account(s) B already belong to an algorithm session; stop it and await outstanding order confirmations "
-                      "before starting another");
+                      doctest::Contains("must use distinct symbols"));
     start();
 }
 
@@ -603,11 +609,39 @@ TEST_CASE_FIXTURE(RuntimeFixture, "http cannot override execution rules or choos
 }
 
 TEST_CASE_FIXTURE(RuntimeFixture, "one account symbol and conflicting fast strategy are rejected") {
-    const char* owned = "Account(s) A already belong to an algorithm session; stop it and await outstanding order confirmations "
-                        "before starting another";
+    const auto owned = doctest::Contains("must use distinct symbols");
     fast_owned = {"A"};
     CHECK_THROWS_WITH(start(), owned);
     fast_owned.clear();
     start();
     CHECK_THROWS_WITH(start({{"symbol", "XYZ"}}), owned);
+}
+
+TEST_CASE_FIXTURE(RuntimeFixture, "all active Smart sessions remain reserved and stoppable beyond history limits") {
+    for (int index = 0; index < 1001; ++index) {
+        engine->start_parent(json{{"account_id", "A"}, {"symbol", "STOCK" + std::to_string(index)},
+            {"quantity", "1000"}, {"deadline", nullptr}, {"tick_size", ".01"}, {"quantity_step", "1"},
+            {"min_quantity", "100"}, {"min_notional", "0"}});
+    }
+    CHECK(runtime->algo_sessions().size() == 1001);
+    CHECK(runtime->list_parents().size() == 1001);
+    CHECK(runtime->owns("A", "US.STOCK0"));
+    CHECK_THROWS_WITH(coordinator->require_available("F", "STOCK0", {"A"}),
+                      doctest::Contains("symbol STOCK0 is already in use"));
+    CHECK_NOTHROW(start());
+    CHECK(runtime->stop_all() == 1002);
+    CHECK_FALSE(runtime->has_active_session());
+    CHECK_NOTHROW(coordinator->require_available("F", "STOCK0", {"A"}));
+}
+
+TEST_CASE_FIXTURE(RuntimeFixture, "recovered unresolved sessions keep symbol reservations across runtimes") {
+    submit();
+    runtime->close(); // the working child still awaits terminal broker evidence
+    engine->close();
+    engine = std::make_shared<SmartSellingEngine>(dir.file("state.sqlite3"), [this] { return now; }, [this] { return epoch + now; });
+    build_runtime(json::object());
+    REQUIRE(runtime->has_active_session());
+    CHECK_THROWS_WITH(coordinator->require_available("F", " us.xyz/USD ", {"A"}),
+                      doctest::Contains("must use distinct symbols"));
+    CHECK_NOTHROW(coordinator->require_available("E", "OTHER", {"A"}));
 }

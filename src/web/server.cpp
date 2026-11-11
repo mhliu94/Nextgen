@@ -944,7 +944,7 @@ void Server::start() {
             }
             json_response(res, json{{"ok", true}, {"command", outcome.extra.at("command")}, {"strategy_key", outcome.extra.at("strategy_key")}});
         } catch (const std::invalid_argument& e) {
-            api_error(res, e.what(), 500);
+            api_error(res, e.what(), 400);
         } catch (const std::exception& e) {
             api_error(res, e.what(), 500);
         }

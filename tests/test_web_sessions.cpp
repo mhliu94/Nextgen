@@ -1,4 +1,4 @@
-// One-session-per-account rule across modes E/F/G/H and the manual-order guards
+// Shared session admission across modes E/F/G/H and the manual-order guards
 // (tests/test_algo_sessions.py), exercised through the application's ControlCenter.
 #include "web_fixture.h"
 
@@ -15,7 +15,7 @@ using ngtest::WebFixture;
 
 namespace {
 
-const char* kConflict = "already belong to an algorithm session";
+const char* kConflict = "must use distinct symbols";
 
 struct SessionFixture : WebFixture {
     json smart_settings = {{"account_ids", json::array({"B"})}, {"symbol", "XYZ"}, {"deadline", nullptr}};
@@ -25,10 +25,36 @@ struct SessionFixture : WebFixture {
             {"string_id": "A", "numeric_id": 1, "broker": "Tiger", "trading_medium": "API"},
             {"string_id": "B", "numeric_id": 2, "broker": "Tiger", "trading_medium": "API"},
             {"string_id": "C", "numeric_id": 3, "broker": "Tiger", "trading_medium": "API"}]})") {
-        for (const char* account : {"A", "B", "C"}) upsert_account(account, 10000, 1000, true, "XYZ");
+        for (const char* account : {"A", "B", "C"}) {
+            ng::AccountSnapshot snapshot;
+            snapshot.account_id = account;
+            snapshot.cash = 10000;
+            snapshot.ts = ng::iso_utc_now();
+            snapshot.trading_enabled = true;
+            for (const char* symbol : {"XYZ", "OTHER", "AAPL", "MSFT"})
+                snapshot.positions.push_back(ng::Position{symbol, 1000, 9.0, 1000});
+            control->account_store().upsert(snapshot);
+        }
+        for (const char* symbol : {"XYZ", "OTHER", "AAPL", "MSFT"}) upsert_book(symbol, 10, 10.01);
     }
     json fast(const std::string& command_id, const std::string& mode, const std::string& symbol, std::vector<std::string> accounts) {
-        return fast_start(command_id, mode, symbol, std::move(accounts), false);
+        return fast_start(command_id, mode, symbol, std::move(accounts), true);
+    }
+    std::atomic<int> sequence{0};
+    json start_mode(const std::string& mode, const std::string& symbol, const std::vector<std::string>& accounts) {
+        if (mode == "E" || mode == "F") {
+            auto command = fast("matrix-" + std::to_string(++sequence), mode, symbol, accounts);
+            control->fast_manager()->start_strategy(command); // exercise direct admission, outside ControlCenter's lock
+            return command;
+        }
+        auto* runtime = mode == "G" ? control->smart_runtime() : control->buying_runtime();
+        return runtime->start_parent(json{{"account_ids", accounts}, {"symbol", symbol}, {"deadline", nullptr}});
+    }
+    void stop_modes() {
+        control->fast_manager()->stop_all();
+        control->smart_runtime()->stop_all();
+        control->buying_runtime()->stop_all();
+        REQUIRE(wait_until([&] { return !control->any_algorithm_active(); }));
     }
     json fast_command() { return fast("fast-session", "E", "AAPL", {"A"}); }
     bool conflicts(const std::function<void()>& start) {
@@ -94,30 +120,121 @@ TEST_CASE_FIXTURE(SessionFixture, "sessions in every mode run at once when their
     CHECK(control->fast_manager()->stop_all() == 2);
 }
 
-TEST_CASE_FIXTURE(SessionFixture, "an account in one session cannot join another in any mode") {
-    control->start_fast_strategy(fast("buy", "E", "AAPL", {"A"}));
-    json parent = control->start_smart_parent(smart_settings);
-    CHECK(conflicts([&] { control->start_fast_strategy(fast("sell", "F", "MSFT", {"C", "A"})); }));
-    CHECK(conflicts([&] { control->start_fast_strategy(fast("again", "E", "AAPL", {"B"})); }));
-    json both = smart_settings;
-    both["account_ids"] = json::array({"C", "A"});
-    CHECK(conflicts([&] { control->start_smart_parent(both); }));
-    json other_symbol = smart_settings;
-    other_symbol["symbol"] = "OTHER";
-    CHECK(conflicts([&] { control->start_smart_parent(other_symbol); }));
-    json buying = {{"account_ids", json::array({"B"})}, {"symbol", "XYZ"}, {"deadline", nullptr}};
-    CHECK(conflicts([&] { control->start_smart_buying_parent(buying); }));
+TEST_CASE_FIXTURE(SessionFixture, "one account runs one buyer and multiple sellers independently") {
+    start_mode("E", "AAPL", {"A"});
+    start_mode("F", "MSFT", {"A"});
+    auto parent = start_mode("G", "XYZ", {"A"});
+    start_mode("G", "OTHER", {"A"});
+    CHECK(control->fast_manager()->statuses().size() == 2);
+    CHECK(control->smart_runtime()->algo_sessions().size() == 2);
+    CHECK(conflicts([&] { start_mode("F", "MSFT", {"C", "A"}); }));
+    CHECK(conflicts([&] { start_mode("H", "XYZ", {"C", "A"}); }));
     CHECK_FALSE(control->fast_manager()->owns_account("C"));
-    CHECK_FALSE(control->smart_runtime()->owns_account("C"));
-    // A released account is available to every mode again.
-    control->fast_manager()->stop_all();
-    REQUIRE(wait_until([&] { return !control->fast_manager()->has_active_session(); }));
-    json only_a = smart_settings;
-    only_a["account_ids"] = json::array({"A"});
-    control->start_smart_parent(only_a);
+    CHECK_FALSE(control->buying_runtime()->owns_account("C"));
     control->stop_smart_parent(parent["parent_id"].get<std::string>());
-    control->start_fast_strategy(fast("buy-b", "E", "AAPL", {"B"}));
-    CHECK(control->fast_manager()->owns_account("B"));
+    CHECK_NOTHROW(start_mode("G", "XYZ", {"A"}));
+    auto stopped = control->stop_all_algorithms("test");
+    CHECK(stopped.fast_stopped == 2);
+    CHECK(stopped.smart_stopped == 2);
+    CHECK(wait_until([&] { return !control->any_algorithm_active(); }));
+}
+
+TEST_CASE_FIXTURE(SessionFixture, "every algorithm mode pair rejects the same canonical symbol") {
+    for (const auto& first : {"E", "F", "G", "H"}) {
+        for (const auto& second : {"E", "F", "G", "H"}) {
+            CAPTURE(first); CAPTURE(second);
+            start_mode(first, "XYZ", {"A"});
+            try {
+                start_mode(second, " us.xyz/USD ", {"B", "A"});
+                FAIL("Overlapping symbol admitted");
+            } catch (const std::invalid_argument& error) {
+                std::string message = error.what();
+                CHECK(message.find("Account(s) A:") != std::string::npos);
+                CHECK(message.find(kConflict) != std::string::npos);
+                CHECK(message.find(std::string("mode ") + first + ", symbol XYZ") != std::string::npos);
+            }
+            CHECK_FALSE(control->fast_manager()->owns_account("B"));
+            CHECK_FALSE(control->smart_runtime()->owns_account("B"));
+            CHECK_FALSE(control->buying_runtime()->owns_account("B"));
+            stop_modes();
+        }
+    }
+}
+
+TEST_CASE_FIXTURE(SessionFixture, "distinct symbols permit every mode pair except two buyers") {
+    for (const std::string first : {"E", "F", "G", "H"}) {
+        for (const std::string second : {"E", "F", "G", "H"}) {
+            CAPTURE(first); CAPTURE(second);
+            start_mode(first, "XYZ", {"A"});
+            if ((first == "E" || first == "H") && (second == "E" || second == "H")) {
+                CHECK_THROWS_WITH(start_mode(second, "OTHER", {"B", "A"}), doctest::Contains("at most 1 buying strategy"));
+                CHECK_FALSE(control->fast_manager()->owns_account("B"));
+                CHECK_FALSE(control->buying_runtime()->owns_account("B"));
+            } else {
+                CHECK_NOTHROW(start_mode(second, "OTHER", {"B", "A"}));
+            }
+            CHECK_NOTHROW(start_mode(second, "XYZ", {"C"}));
+            stop_modes();
+        }
+    }
+}
+
+TEST_CASE_FIXTURE(SessionFixture, "simultaneous direct runtime starts obey symbol and buying reservations") {
+    struct Pair { std::string first, second, symbol; int admitted; };
+    for (const Pair& pair : {Pair{"E", "H", "OTHER", 1}, {"H", "H", "OTHER", 1}, {"F", "G", "XYZ", 1},
+                           {"G", "G", "XYZ", 1}, {"E", "G", "OTHER", 2}, {"H", "F", "OTHER", 2},
+                           {"F", "G", "OTHER", 2}, {"G", "G", "OTHER", 2}}) {
+        CAPTURE(pair.first); CAPTURE(pair.second); CAPTURE(pair.symbol);
+        std::atomic<int> ready{0};
+        std::atomic<bool> go{false};
+        auto attempt = [&](const std::string& mode, const std::string& symbol) {
+            ++ready;
+            while (!go.load()) std::this_thread::yield();
+            try { start_mode(mode, symbol, {"A"}); return 1; }
+            catch (const std::invalid_argument&) { return 0; }
+        };
+        auto first = std::async(std::launch::async, attempt, pair.first, "XYZ");
+        auto second = std::async(std::launch::async, attempt, pair.second, pair.symbol);
+        REQUIRE(wait_until([&] { return ready == 2; }));
+        go = true;
+        CHECK(first.get() + second.get() == pair.admitted);
+        stop_modes();
+    }
+}
+
+TEST_CASE_FIXTURE(SessionFixture, "scheduled paused buyers keep cash reserved and failed starts reserve nothing") {
+    auto parent = control->buying_runtime()->start_parent(json{{"account_ids", {"A"}}, {"symbol", "XYZ"},
+        {"start_time", ng::wall_now() + 3600}, {"deadline", nullptr}});
+    control->buying_runtime()->on_feed_state("orders", "disconnected");
+    CHECK_THROWS_WITH(start_mode("E", "OTHER", {"A"}), doctest::Contains("at most 1 buying strategy"));
+    CHECK_NOTHROW(start_mode("F", "OTHER", {"A"}));
+    control->stop_smart_buying_parent(parent["parent_id"].get<std::string>());
+    control->buying_runtime()->on_feed_state("orders", "live");
+    CHECK_THROWS_WITH(control->buying_runtime()->start_parent(json{{"account_ids", {"A"}}, {"symbol", "XYZ"}, {"mode", "invalid"}}),
+                      doctest::Contains("mode must"));
+    CHECK_NOTHROW(start_mode("E", "XYZ", {"A"}));
+}
+
+TEST_CASE_FIXTURE(SessionFixture, "all start APIs identify the account mode symbol and conflicting rule") {
+    start_mode("E", "AAPL", {"A"});
+    auto c = client();
+    for (const std::string mode : {"E", "F", "G", "H"}) {
+        CAPTURE(mode);
+        bool buying = mode == "E" || mode == "H";
+        std::string symbol = buying ? "MSFT" : "AAPL";
+        json payload = mode == "E" || mode == "F" ? fast("api", mode, symbol, {"B", "A"})
+            : json{{"account_ids", {"B", "A"}}, {"symbol", symbol}, {"deadline", nullptr}};
+        std::string path = mode == "E" || mode == "F" ? "/api/submit-algo" : mode == "G" ? "/api/smart-selling" : "/api/smart-buying";
+        auto response = c.Post(path, payload.dump(), "application/json");
+        REQUIRE(response);
+        CHECK(response->status == 400);
+        auto result = body(response);
+        CHECK(result["ok"] == false);
+        std::string error = result["error"].get<std::string>();
+        CHECK(error.find("Account(s) A:") != std::string::npos);
+        CHECK(error.find("mode E, symbol AAPL") != std::string::npos);
+        CHECK(error.find(buying ? "at most 1 buying strategy" : kConflict) != std::string::npos);
+    }
 }
 
 TEST_CASE_FIXTURE(SessionFixture, "concurrent starts on one account admit exactly one session") {
@@ -136,6 +253,7 @@ TEST_CASE_FIXTURE(SessionFixture, "concurrent starts on one account admit exactl
         };
         json contested = smart_settings;
         contested["account_ids"] = json::array({"A"});
+        contested["symbol"] = "AAPL";
         std::string id = "fast-" + std::to_string(round);
         auto first = std::async(std::launch::async, attempt, [&] { control->start_fast_strategy(fast(id, "E", "AAPL", {"A"})); });
         auto second = std::async(std::launch::async, attempt, [&] { control->start_smart_parent(contested); });
@@ -262,18 +380,18 @@ TEST_CASE_FIXTURE(SessionFixture, "algorithm order handoff bypasses the manual g
     CHECK(sink->count() == 0);
 }
 
-TEST_CASE_FIXTURE(SessionFixture, "fast handoff proceeds while smart selling owns other accounts") {
+TEST_CASE_FIXTURE(SessionFixture, "fast handoff proceeds while Smart shares the account on another symbol") {
     control->start_fast_strategy(fast_command());
-    control->start_smart_parent(smart_settings);
+    start_mode("G", "XYZ", {"A"});
     json command = {{"type", "LIMIT_ORDER_FOK"}, {"account_id", "A"}, {"symbol", "AAPL"}, {"command_id", "child-1"}};
     control->publish_fast_trading_command(command, "A");
     REQUIRE(sink->count() == 1);
     CHECK(sink->history()[0].key == "A");
-    // Ownership is exclusive: a Smart selling claim on the same account halts the handoff. (The
-    // runtime never admits such a parent; the engine is driven directly to model the conflict.)
+    // A conflicting claim on the same account AND symbol still halts the handoff.
+    // Drive the engine directly to model such an inconsistent claim.
     sink->clear();
     control->smart_runtime()->engine().start_parent(
-        json{{"account_id", "A"}, {"symbol", "ZZZ"}, {"quantity", "1000"}, {"mode", "urgent"}, {"deadline", nullptr},
+        json{{"account_id", "A"}, {"symbol", "AAPL"}, {"quantity", "1000"}, {"mode", "urgent"}, {"deadline", nullptr},
              {"tick_size", ".01"}, {"quantity_step", "1"}, {"min_quantity", "100"}, {"min_notional", "0"}});
     REQUIRE(control->smart_runtime()->owns_account("A"));
     CHECK(conflicts([&] { control->publish_fast_trading_command(command, "A"); }));
