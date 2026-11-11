@@ -9,6 +9,38 @@ using namespace ng::web;
 using ngtest::body;
 using ngtest::WebFixture;
 
+TEST_CASE("HTTP redirector serves requests and preserves the path and query") {
+    WebFixture f;
+    httplib::Server port_probe;
+    int redirect_port = port_probe.bind_to_any_port("127.0.0.1");
+    REQUIRE(redirect_port > 0);
+    port_probe.stop();
+
+    ServerOptions options;
+    options.host = "127.0.0.1";
+    options.port = 0;
+    options.threads = 2;
+    options.redirect_host = "127.0.0.1";
+    options.redirect_port = redirect_port;
+    options.redirect_target_host = "example.test";
+    Server server(*f.control, f.sessions, options);
+    server.start();
+
+    httplib::Client client("127.0.0.1", redirect_port);
+    client.set_connection_timeout(2, 0);
+    client.set_read_timeout(2, 0);
+    auto get = client.Get("/login?next=/admin-control&lang=en");
+    REQUIRE(get);
+    CHECK(get->status == 308);
+    CHECK(get->get_header_value("Location") == "https://example.test/login?next=/admin-control&lang=en");
+
+    auto post = client.Post("/login", "", "application/x-www-form-urlencoded");
+    REQUIRE(post);
+    CHECK(post->status == 308);
+    CHECK(post->get_header_value("Location") == "https://example.test/login");
+    CHECK(f.sink->count() == 0);
+}
+
 TEST_CASE("pages are served and APIs require authentication") {
     WebFixture f;
     auto anon = f.client("");

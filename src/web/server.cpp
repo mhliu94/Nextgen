@@ -1278,6 +1278,8 @@ void Server::start() {
 
     if (options_.redirect_port > 0) {
         impl_->redirector = std::make_unique<httplib::Server>();
+        // The global default pool is disabled; the redirector needs its own workers.
+        impl_->redirector->new_task_queue = [] { return new httplib::ThreadPool(4); };
         std::string target_host = options_.redirect_target_host.empty() ? "127.0.0.1" : options_.redirect_target_host;
         int target_port = options_.redirect_target_port;
         auto handler = [target_host, target_port](const Request& req, Response& res) {
