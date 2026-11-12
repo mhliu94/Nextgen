@@ -181,6 +181,8 @@ public:
     int max_insight_levels() const { return config_.market_data.market_insights_max_levels; }
 
 private:
+    void require_online_accounts(const json& account_ids) const;
+    std::map<std::string, AccountSnapshot> algo_snapshots() const;
     bool owned_by_algorithm(const std::string& account_id) const;
     // Smart selling and Smart buying, whichever are enabled.
     std::vector<smart::SmartSellingRuntime*> smart_managers() const;

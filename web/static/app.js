@@ -1127,7 +1127,19 @@
       return h("label", { class: "check-row" }, input, h("span", null, "#" + m.num_id + " " + m.id + " (" + m.broker + ") ", bal));
     });
     const el = h("div", { class: "check-list" }, rows);
-    return { el, selected: () => $$("input:checked", el).map((i) => i.dataset[dataAttr]), render: () => { $$("[data-" + dataAttr.replace(/[A-Z]/g, (c) => "-" + c.toLowerCase()) + "-balance]", el).forEach((b) => { const id = b.dataset[dataAttr + "Balance"]; const a = ((state.accounts && state.accounts.accounts) || []).find((x) => x.account_id === id); b.textContent = balanceFn(a); }); } };
+    return { el, selected: () => $$("input:checked", el).map((i) => i.dataset[dataAttr]), render: () => {
+      $$(".check-row", el).forEach(row => {
+        const input = $("input", row), balance = $(".bal", row);
+        const account = ((state.accounts && state.accounts.accounts) || []).find(a => a.account_id === input.dataset[dataAttr]);
+        const timestamp = account && account.ts ? Date.parse(account.ts) : NaN;
+        const age = Date.now() - timestamp;
+        const offline = !Number.isFinite(age) || age > 300000 || age < -30000;
+        // Keep an already selected account explicit: the server rejects the whole start if it
+        // goes offline, rather than silently running the session on a smaller account set.
+        input.disabled = offline && !input.checked;
+        balance.textContent = offline ? t("algo_account_offline") : balanceFn(account);
+      });
+    } };
   }
 
   function openFastModal(mode, symbol, msgEl) {

@@ -106,3 +106,26 @@ TEST_CASE("Smart stop translation requires and uses the exact owned broker ID") 
     CHECK(cmd["type"]=="CANCEL_ORDER");CHECK(cmd["order_id"]=="owned");
     action["broker_order_id"]=nullptr;CHECK_THROWS(ng::smart::build_smart_selling_command(action,f.control->accounts()));
 }
+
+TEST_CASE("every algo mode rejects missing and stale selected accounts before starting") {
+    for (const auto* mode:{"E","F","G","H"}) for (bool stale:{false,true}) {
+        WebFixture f;f.upsert_account("A",10000,1000,true,"TANH");f.upsert_book("TANH",39,40);
+        if(stale){ng::AccountSnapshot s;s.account_id="B";s.ts="2026-01-01T00:00:00Z";s.trading_enabled=true;f.control->account_store().upsert(s);}
+        auto attempt=[&]{
+            if(std::string(mode)=="E" || std::string(mode)=="F") f.control->start_fast_strategy(f.fast_start("offline",mode,"TANH",{"A","B"},true));
+            else if(std::string(mode)=="G") f.control->start_smart_parent({{"account_ids",{"A","B"}},{"symbol","TANH"}});
+            else f.control->start_smart_buying_parent({{"account_ids",{"A","B"}},{"symbol","TANH"}});
+        };
+        CHECK_THROWS_WITH_AS(attempt(),doctest::Contains("B"),std::invalid_argument);
+        CHECK(f.control->reporting()->session_labels().empty());CHECK(f.sink->count()==0);
+    }
+}
+
+TEST_CASE("algo publication rechecks account freshness and invalid timestamps are offline") {
+    WebFixture f;
+    for(const auto& stamp:{std::string(""),std::string("bad"),std::string("2026-01-01T00:00:00Z"),std::string("2099-01-01T00:00:00Z")}) {
+        ng::AccountSnapshot s;s.account_id="A";s.ts=stamp;s.trading_enabled=true;f.control->account_store().upsert(s);
+        CHECK_THROWS(f.control->publish_trading_command({{"type","LIMIT_ORDER"},{"trading_mode","G"},{"account_id","A"}},"A"));
+        CHECK(f.sink->count()==0);
+    }
+}

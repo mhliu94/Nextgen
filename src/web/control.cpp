@@ -62,10 +62,10 @@ std::size_t RecordingCommandSink::count() const {
 // ---------------------------------------------------------------------------
 
 bool snapshot_is_stale(const std::optional<std::string>& ts, double now_epoch) {
-    if (!ts || ts->empty()) return false;
+    if (!ts || ts->empty()) return true;
     auto parsed = parse_iso8601(*ts);
-    if (!parsed) return false;
-    return now_epoch - parsed->epoch_seconds > 5 * 60;
+    if (!parsed || !parsed->has_offset) return true;
+    return now_epoch - parsed->epoch_seconds > 5 * 60 || parsed->epoch_seconds > now_epoch + 30;
 }
 
 json account_meta_view(const AccountMeta& meta) {
@@ -207,13 +207,13 @@ void ControlCenter::create_fast_trading_manager() {
     fast_ = std::make_unique<fast::StrategyManager>(
         market_store_, [this]() -> const AccountDirectory& { return accounts_; },
         [this](const json& command, const std::string& key) { publish_fast_trading_command(command, key); },
-        [this] { return served_snapshots(); }, operations_log_.get(), settings, nullptr, reporting_.get(),
+        [this] { return algo_snapshots(); }, operations_log_.get(), settings, nullptr, reporting_.get(),
         session_coordinator_);
 }
 
 void ControlCenter::create_smart_selling_runtime(std::shared_ptr<smart::SmartSellingEngine> engine) {
     smart_ = std::make_unique<smart::SmartSellingRuntime>(
-        config_.smart_selling, [this]() -> const AccountDirectory& { return accounts_; }, [this] { return served_snapshots(); },
+        config_.smart_selling, [this]() -> const AccountDirectory& { return accounts_; }, [this] { return algo_snapshots(); },
         [this](const json& command, const std::string& key) { publish_trading_command(command, key); },
         session_coordinator_,
         std::move(engine), nullptr, nullptr, reporting_.get());
@@ -222,7 +222,7 @@ void ControlCenter::create_smart_selling_runtime(std::shared_ptr<smart::SmartSel
 void ControlCenter::create_smart_buying_runtime(std::shared_ptr<smart::SmartBuyingEngine> engine) {
     buying_ = std::make_unique<smart::SmartBuyingRuntime>(
         config_.smart_buying, market_store_, [this]() -> const AccountDirectory& { return accounts_; },
-        [this] { return served_snapshots(); },
+        [this] { return algo_snapshots(); },
         [this](const json& command, const std::string& key) { publish_trading_command(command, key); },
         session_coordinator_,
         std::move(engine), nullptr, nullptr, reporting_.get());
@@ -294,6 +294,31 @@ bool ControlCenter::owned_by_algorithm(const std::string& account_id) const {
         if (order.at("account_id") == account_id && order.at("origin") == "algo") return true;
     }
     return false;
+}
+
+std::map<std::string, AccountSnapshot> ControlCenter::algo_snapshots() const {
+    auto snapshots = served_snapshots();
+    const double now = wall_now();
+    for (auto it = snapshots.begin(); it != snapshots.end();) {
+        if (snapshot_is_stale(it->second.ts, now)) it = snapshots.erase(it);
+        else ++it;
+    }
+    return snapshots;
+}
+
+void ControlCenter::require_online_accounts(const json& ids) const {
+    auto snapshots = algo_snapshots();
+    std::vector<std::string> offline;
+    for (const auto& item : ids) {
+        auto id = item.get<std::string>();
+        if (!accounts_.contains(id)) throw std::invalid_argument("Unknown account: " + id);
+        if (!snapshots.count(id)) offline.push_back(id);
+    }
+    if (!offline.empty()) {
+        std::string reason = "Cannot start or submit algo orders: offline accounts (missing, invalid or stale snapshot): ";
+        for (std::size_t i = 0; i < offline.size(); ++i) reason += (i ? ", " : "") + offline[i];
+        throw std::invalid_argument(reason);
+    }
 }
 
 json ControlCenter::normalize_trading_command(const json& command) const {
@@ -401,6 +426,9 @@ void ControlCenter::reconcile_session_cancellations() {
 void ControlCenter::publish_trading_command(const json& command, const std::string& key) {
     if (!sink_) throw std::runtime_error("Kafka producer is unavailable");
     const auto type = command.value("type", "");
+    if ((type == "LIMIT_ORDER" || type == "LIMIT_ORDER_FOK" || type == "MARKET_ORDER") &&
+        (command.contains("parent_id") || command.contains("trading_mode")))
+        require_online_accounts(json::array({command.at("account_id")}));
     bool cancellation = type == "CANCEL_ORDER";
     json outgoing = normalize_trading_command(command);
     if (cancellation && reporting_) {
@@ -467,6 +495,7 @@ void ControlCenter::publish_control_command(const json& command, const std::stri
 std::string ControlCenter::start_fast_strategy(const json& command) {
     std::lock_guard lock(algo_lock_);
     if (!fast_) throw std::runtime_error("The algorithm trading manager is unavailable");
+    require_online_accounts(command.at("fast_trading_account_ids"));
     std::string key = fast_->start_strategy(command);
     notify_hub(kTopicAlgo);
     return key;
@@ -475,6 +504,7 @@ std::string ControlCenter::start_fast_strategy(const json& command) {
 json ControlCenter::start_smart_parent(const json& settings) {
     std::lock_guard lock(algo_lock_);
     if (!smart_) throw std::runtime_error("Smart selling is unavailable");
+    require_online_accounts(settings.at("account_ids"));
     json parent = smart_->start_parent(settings);
     notify_hub(kTopicSmart | kTopicAlgo);
     return parent;
@@ -491,6 +521,7 @@ json ControlCenter::stop_smart_parent(const std::string& parent_id) {
 json ControlCenter::start_smart_buying_parent(const json& settings) {
     std::lock_guard lock(algo_lock_);
     if (!buying_) throw std::runtime_error("Smart buying is unavailable");
+    require_online_accounts(settings.at("account_ids"));
     json parent = buying_->start_parent(settings);
     notify_hub(kTopicSmart | kTopicAlgo);
     return parent;
@@ -668,7 +699,7 @@ json ControlCenter::accounts_view(const std::string& lang) const {
         json m = account_meta_view(*meta);
         auto it = snapshots.find(meta->id);
         m["has_snapshot"] = it != snapshots.end();
-        m["stale"] = it != snapshots.end() && snapshot_is_stale(it->second.ts, now);
+        m["stale"] = it == snapshots.end() || snapshot_is_stale(it->second.ts, now);
         out["metas"].push_back(m);
     }
     out["version"] = account_store_.version();

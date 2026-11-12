@@ -35,6 +35,13 @@ handles broker acknowledgments arriving after the session ends. Ended-session
 cleanup continues on the control server's status loop after reconnection/replay.
 Other sessions' orders and manual orders are excluded.
 
+All E/F/G/H starts reject the entire request if any selected account has a missing,
+invalid, future-dated, or older-than-five-minutes account snapshot. The checklist
+marks those accounts offline. Snapshot eligibility is rechecked during algorithm
+operation and before publication. G/H additionally retain their stricter configured
+account-age checks. Account ownership remains reserved against manual UI entry
+while confirmed algorithm orders remain open.
+
 Broker rollout must precede activating this control-server build. Bosco,
 GigaMoney, Fangde and Star need the exact-cancellation dispatcher changes;
 Zhuorui needs strict exact-ID parsing and creation-day history lookup for older
