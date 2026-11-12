@@ -328,7 +328,7 @@ ReportingConfig normalize_reporting_config(const json* raw_in, const std::string
     return cfg;
 }
 
-bool AppConfig::is_privileged(const std::string& user) const { return trim(user) == "lmh"; }
+bool AppConfig::is_privileged(const std::string& user) const { return user == "lmh"; }
 
 std::vector<std::string> AppConfig::market_data_symbols() const {
     if (market_data.has_publisher_symbols) return market_data.symbols;

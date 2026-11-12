@@ -92,8 +92,7 @@ TEST_CASE("admin control and market data pages require the exact lmh user") {
         json boot = body(c.Get("/api/bootstrap"));
         CHECK(boot["can_access_admin_control"] == false);
         CHECK(boot["can_access_market_data"] == false);
-        // Trading-status control keeps its older, whitespace-tolerant check (_has_lmh_feature_access).
-        CHECK(boot["can_manage_trading"] == (std::string(user) == " lmh "));
+        CHECK(boot["can_manage_trading"] == false);
         // Everyone signed in keeps the ordinary pages and price lookups.
         CHECK(c.Get("/control-panel")->status == 200);
         CHECK(c.Get("/api/quotes?symbol=AAPL")->status == 200);

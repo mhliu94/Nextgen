@@ -147,8 +147,7 @@ struct AppConfig {
     std::string operations_log_dir = "./logs";
     json raw;  // original document for diagnostics
 
-    // Trading-status controls are only available to the lmh account
-    // (trading_ui/webserver.py::_has_lmh_feature_access); this is not configurable, as in the original.
+    // Trading-status controls are only available to the exact lmh account.
     bool is_privileged(const std::string& user) const;
     // Admin Control and the Market Data dashboard compare the exact username (no trimming), as upstream.
     bool can_access_admin_control(const std::string& user) const { return user == "lmh"; }

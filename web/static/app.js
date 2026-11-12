@@ -1615,7 +1615,9 @@
       root.append(h("div", { class: "page-head" }, h("h1", { class: "page-title", text: t("trading_status") }), h("div", { class: "inline-actions" }, offAll)),
         h("section", { class: "card", style: "max-width:920px" }, h("div", { class: "card-head" }, h("h2", { class: "card-title", text: t("current_status") })), msg, h("div", { class: "status-list", id: "trading-status-list" })));
       this.update(new Set(["accounts"]));
+      this.timer = setInterval(() => this.update(new Set(["accounts"])), 1000);
     },
+    destroy() { clearInterval(this.timer); },
     update(topics) {
       if (!topics.has("accounts")) return;
       const list = $("#trading-status-list");
@@ -1624,13 +1626,17 @@
       const msg = $("#ts-msg");
       list.replaceChildren(...state.boot.accounts.map((m) => {
         const a = accounts.find((x) => x.account_id === m.id);
-        const known = !!a, enabled = !!(a && a.trading_enabled);
+        const known = !!a && typeof a.trading_enabled === "boolean", enabled = known && a.trading_enabled;
+        const timestamp = a && a.ts ? Date.parse(a.ts) : NaN, age = Date.now() - timestamp;
+        const meta = ((state.accounts && state.accounts.metas) || []).find(x => x.id === m.id);
+        const stale = !Number.isFinite(age) || age > 300000 || age < -30000 || !!(meta && meta.stale);
+        const unreachable = !known || stale;
         const metaLine = [m.broker, m.trading_medium, m.machine_alias, m.ip_address, m.broker_id].filter(Boolean).join(" · ");
         return h("div", { class: "status-item trading-status-row", dataset: { accountId: m.id } },
-          h("div", null, h("div", { class: "status-title", text: "#" + m.num_id + " " + m.id }), h("div", { class: "status-meta", text: metaLine }), h("div", { class: "status-row" }, t("trading") + ":", h("span", { class: "pill " + (known ? (enabled ? "on" : "off") : "unknown"), text: known ? t(enabled ? "trading_on" : "trading_off") : t("trading_unknown") }))),
+          h("div", null, h("div", { class: "status-title", text: "#" + m.num_id + " " + m.id }), h("div", { class: "status-meta", text: metaLine }), h("div", { class: "status-row" }, t("trading") + ":", h("span", { class: "pill " + (!known ? "unknown" : stale ? "stale" : enabled ? "on" : "off"), text: !known ? t("trading_unknown") : stale ? t("trading_stale") : t(enabled ? "trading_on" : "trading_off") }))),
           h("div", { class: "inline-actions" },
-            h("button", { class: "btn sm green", type: "button", disabled: known && enabled, onclick: (e) => submitForm(e, "/api/trading-status", () => ({ account_id: m.id, trading_enabled: true }), msg) }, t("turn_on")),
-            h("button", { class: "btn sm red", type: "button", disabled: known && !enabled, onclick: (e) => submitForm(e, "/api/trading-status", () => ({ account_id: m.id, trading_enabled: false }), msg) }, t("turn_off"))));
+            h("button", { class: "btn sm " + (unreachable ? "gray" : "green"), type: "button", disabled: unreachable || enabled, title: unreachable ? t("trading_unreachable") : null, onclick: (e) => submitForm(e, "/api/trading-status", () => ({ account_id: m.id, trading_enabled: true }), msg) }, t("turn_on")),
+            h("button", { class: "btn sm " + (unreachable ? "gray" : "red"), type: "button", disabled: unreachable || !enabled, title: unreachable ? t("trading_unreachable") : null, onclick: (e) => submitForm(e, "/api/trading-status", () => ({ account_id: m.id, trading_enabled: false }), msg) }, t("turn_off"))));
       }));
     },
   };

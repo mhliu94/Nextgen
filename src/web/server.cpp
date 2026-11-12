@@ -703,7 +703,7 @@ void Server::start() {
 
     // --- static & pages ----------------------------------------------------------------------
     svr.Get("/", [=, this](const Request&, Response& res) { redirect(res, "/account-details", 302); });
-    for (const char* page : {"/account-details", "/control-panel", "/algo", "/market-insights", "/working-orders", "/trading-status", "/login"}) {
+    for (const char* page : {"/account-details", "/control-panel", "/algo", "/market-insights", "/working-orders", "/login"}) {
         svr.Get(page, [serve_app](const Request&, Response& res) { serve_app(res); });
     }
     // Admin Control and Market Data are only available to the lmh account: other signed-in users get
@@ -721,6 +721,10 @@ void Server::start() {
     svr.Get("/admin-control", [=, this](const Request& req, Response& res) {
         auto user = current_user(req);
         restricted_page(req, res, user && control_.config().can_access_admin_control(*user), "admin_control_forbidden");
+    });
+    svr.Get("/trading-status", [=, this](const Request& req, Response& res) {
+        auto user = current_user(req);
+        restricted_page(req, res, user && control_.config().is_privileged(*user), "trading_status_forbidden");
     });
     svr.Get("/market-data", [=, this](const Request& req, Response& res) {
         auto user = current_user(req);
