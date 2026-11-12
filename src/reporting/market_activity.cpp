@@ -313,6 +313,7 @@ json MarketActivity::snapshot(const std::string& symbol, const AccountDirectory&
     std::vector<QuoteSample> quotes;
     std::vector<OrderSample> orders;
     std::optional<QuoteSample> latest;
+    json volume_activity={{"interval_start",nullptr},{"observed_at",nullptr},{"quantity",nullptr}};
     {
         std::lock_guard lock(mutex_);
         if (!db_) throw std::runtime_error("market activity is closed");
@@ -353,6 +354,25 @@ json MarketActivity::snapshot(const std::string& symbol, const AccountDirectory&
                 row.bind(1, symbol).bind(2, now);
                 if (row.step()) latest = read_quote(row);
             }
+            {
+                // Find the newest increase between adjacent valid observations.
+                // This is an observation interval, not an exchange execution time.
+                Statement rows(*db_,
+                    "SELECT q.observed,q.volume,p.observed,p.volume FROM market_quote_samples q "
+                    "JOIN market_quote_samples p ON p.symbol=q.symbol AND p.observed=("
+                    "SELECT MAX(b.observed) FROM market_quote_samples b WHERE b.symbol=q.symbol AND b.observed<q.observed) "
+                    "WHERE q.symbol=? AND q.observed>=? AND q.observed<=? "
+                    "AND q.error IS NULL AND p.error IS NULL AND q.volume>p.volume "
+                    "AND q.observed-p.observed<=? ORDER BY q.observed DESC");
+                rows.bind(1,symbol).bind(2,now-kHistorySeconds).bind(3,now).bind(4,kQuoteMaxAge);
+                while(rows.step()) {
+                    double observed=rows.column_double(0),previous=rows.column_double(2);
+                    if (market_day(observed)!=market_day(previous)) continue;
+                    volume_activity={{"interval_start",previous},{"observed_at",observed},
+                                     {"quantity",rows.column_int(1)-rows.column_int(3)}};
+                    break;
+                }
+            }
         } catch (...) {
             db_->rollback();
             throw;
@@ -382,6 +402,9 @@ json MarketActivity::snapshot(const std::string& symbol, const AccountDirectory&
     last_trade["quantity"] = live && latest->last_size ? json(*latest->last_size) : json(nullptr);
     last_trade["price"] = live && latest->price ? json(*latest->price) : json(nullptr);
     out["last_trade"] = last_trade;
+    out["last_volume_activity"]=live ? volume_activity : json{{"interval_start",nullptr},{"observed_at",nullptr},{"quantity",nullptr}};
+    out["volume_newer_than_reported_trade"]=live && !volume_activity["interval_start"].is_null() &&
+        (!latest->trade_time || volume_activity["interval_start"].get<double>()>*latest->trade_time);
     out["windows"] = json::array();
     bool our_unknown = !feed_live && orders.empty();
     for (const Window& window : windows) {

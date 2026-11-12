@@ -120,6 +120,37 @@ TEST_CASE_FIXTURE(History, "no history and no trades are distinct") {
     CHECK(row["market_complete"] == true);
 }
 
+TEST_CASE_FIXTURE(History, "volume activity advances while the reported trade timestamp stays old") {
+    auto first=quote(START,100),second=quote(START+10,125),last=quote(START+20,125);
+    first.trade_time=second.trade_time=last.trade_time=START-86400;
+    db->record_quote(first);db->record_quote(second);db->record_quote(last);
+    auto result=snapshot(START+20);
+    CHECK(result["last_trade"]["time"]==START-86400);
+    CHECK(result["last_volume_activity"]==json{{"interval_start",START},{"observed_at",START+10},{"quantity",25}});
+    CHECK(result["volume_newer_than_reported_trade"]==true);
+    db->close();reopen();
+    CHECK(snapshot(START+20)["last_volume_activity"]==result["last_volume_activity"]);
+}
+
+TEST_CASE_FIXTURE(History, "volume observation never invents activity across gaps errors or daily resets") {
+    now=START+200;
+    db->record_quote(quote(START,100));db->record_quote(quote(START+120,200));
+    CHECK(snapshot(START+120)["last_volume_activity"]["observed_at"].is_null());
+    db->record_quote(quote(START+130,300,10,"XYZ",std::string("unavailable")));
+    db->record_quote(quote(START+140,400));
+    CHECK(snapshot(START+140)["last_volume_activity"]["observed_at"].is_null());
+    db->record_quote(quote(START+150,50));
+    CHECK(snapshot(START+150)["last_volume_activity"]["observed_at"].is_null());
+    db->record_quote(quote(START+160,60));
+    CHECK(snapshot(START+160)["last_volume_activity"]["quantity"]==10);
+    CHECK(snapshot(START+191)["last_volume_activity"]["observed_at"].is_null());
+    History day;const double midnight=1794286800.0;day.now=midnight+20;
+    day.db->record_quote(quote(midnight-1,100));day.db->record_quote(quote(midnight+1,110));
+    CHECK(day.snapshot(midnight+1)["last_volume_activity"]["observed_at"].is_null());
+    day.db->record_quote(quote(midnight+10,115));
+    CHECK(day.snapshot(midnight+10)["last_volume_activity"]["quantity"]==5);
+}
+
 TEST_CASE_FIXTURE(History, "market volume at a boundary is not double counted") {
     struct Sample { double at; long long volume; };
     for (Sample s : {Sample{-20, 100}, Sample{0, 120}, Sample{20, 150}}) db->record_quote(quote(START + s.at, s.volume));

@@ -1273,6 +1273,7 @@
           h("div", null, h("h1", { class: "page-title", text: t("md_title") }), h("div", { class: "help", text: t("md_window_note") })),
           h("div", { class: "toolbar" }, h("div", { class: "field" }, h("label", { for: "md-symbol", text: t("symbol") }), select))),
         h("div", { class: "kpis", id: "md-trade" }),
+        h("div", { class: "warn", id: "md-trade-time-note", role: "status", hidden:true }),
         h("div", { class: "warn", id: "md-error", role: "status", "aria-live": "polite" }),
         h("section", { class: "card" },
           h("div", { class: "table-scroll" }, h("table", { class: "data", id: "md-windows" },
@@ -1305,11 +1306,19 @@
     },
     renderTrade(data) {
       const trade = data ? data.last_trade : null;
+      const activity = data ? data.last_volume_activity : null;
       const zone = data ? data.timezone : "America/New_York";
+      const observed = activity && activity.observed_at !== null && activity.observed_at !== undefined;
+      const interval = observed ? this.zoneTime(activity.interval_start, zone, true) + " – " + this.zoneTime(activity.observed_at, zone, true) : "";
       $("#md-trade").replaceChildren(
+        kpi(t("md_latest_volume_activity"), observed ? this.zoneTime(activity.observed_at, zone, true) : "—",
+          observed ? fmt.qty(activity.quantity) + " " + t("md_activity_shares") + " · " + interval : t("md_no_observed_activity")),
         kpi(t("md_last_trade_time"), trade ? this.zoneTime(trade.time, zone, true) : "—", ""),
         kpi(t("md_last_trade_quantity"), trade ? fmt.qty(trade.quantity) : "—", ""),
         kpi(t("md_last_trade_price"), trade && trade.price !== null ? fmt.price(trade.price) : "—", ""));
+      const note = $("#md-trade-time-note");
+      note.hidden = !(data && data.volume_newer_than_reported_trade);
+      note.textContent = note.hidden ? "" : t("md_trade_time_lags_volume");
     },
     showEmpty(message) {
       const rows = $("#md-window-rows");
