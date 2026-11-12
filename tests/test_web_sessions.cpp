@@ -312,7 +312,7 @@ TEST_CASE_FIXTURE(SessionFixture, "empty manual cancel-all never publishes a bro
 TEST_CASE_FIXTURE(SessionFixture, "stop all stops smart even if the notification transport fails") {
     control->start_smart_parent(smart_settings);
     sink->fail_next("transport unavailable");
-    auto response = client().Post("/submit-algo-stop", "", "application/x-www-form-urlencoded");
+    auto response = client_for("lmh").Post("/submit-algo-stop", "", "application/x-www-form-urlencoded");
     REQUIRE(response);
     CHECK(response->status == 303);
     CHECK_FALSE(control->smart_runtime()->has_active_session());
@@ -325,7 +325,7 @@ TEST_CASE_FIXTURE(SessionFixture, "stop all ends every running session") {
     control->start_fast_strategy(fast("buy", "E", "AAPL", {"A"}));
     control->start_fast_strategy(fast("sell", "F", "MSFT", {"C"}));
     control->start_smart_parent(smart_settings);
-    auto response = client().Post("/submit-algo-stop", "", "application/x-www-form-urlencoded");
+    auto response = client_for("lmh").Post("/submit-algo-stop", "", "application/x-www-form-urlencoded");
     REQUIRE(response);
     CHECK(response->status == 303);
     CHECK(response->get_header_value("Location").find("ok=") != std::string::npos);
@@ -343,7 +343,7 @@ TEST_CASE_FIXTURE(SessionFixture, "a new start waits until the previous global s
     control->start_smart_parent(smart_settings);
     auto c = client();
     auto stop = std::async(std::launch::async, [&] {
-        auto response = c.Post("/submit-algo-stop", "", "application/x-www-form-urlencoded");
+        auto response = client_for("lmh").Post("/submit-algo-stop", "", "application/x-www-form-urlencoded");
         return response ? response->status : -1;
     });
     REQUIRE(gate->wait_for_stop_notification());

@@ -33,7 +33,7 @@ window.fetch = async (url, options = {}) => {
       "/api/i18n": {confirm: "Confirm", fast_config_cancel: "Cancel"},
       "/api/bootstrap": {user: "lmh", symbols: ["TANH"], market_data_symbols: ["TANH"],
         limit_share_shortcuts: [100], through_market_choices: [1, 5],
-        accounts: [], can_manage_trading: true, can_access_admin_control: true,
+        accounts: [], can_manage_trading: true, can_stop_all_algorithms: true, can_access_admin_control: true,
         can_access_market_data: true, smart_selling_available: true, smart_buying_available: true},
       "/api/accounts/view": {accounts: [], portfolio: {}},
       "/api/quotes": {rows: {}},

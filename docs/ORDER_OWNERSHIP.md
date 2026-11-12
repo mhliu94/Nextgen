@@ -46,7 +46,8 @@ The Algo / 算法 tab sits beside Trading and is available to every authenticate
 user. It lists only active sessions across E/F/G/H, including paused and stopping
 sessions; concluded sessions stay in the order UI reports. Individual stops target
 the durable session ID (including E/F sessions sharing a ticker), and are available
-to every authenticated user. Initial sell inventory and
+to every authenticated user. Only the exact username `lmh` may stop all sessions;
+both the API and legacy form enforce that restriction. Initial sell inventory and
 per-account initial quantities/costs are omitted from the active-session display.
 
 Broker rollout must precede activating this control-server build. Bosco,

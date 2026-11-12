@@ -787,6 +787,7 @@ void Server::start() {
             out["privileged"] = control_.config().is_privileged(*user);
             out["can_access_admin_control"] = control_.config().can_access_admin_control(*user);
             out["can_access_market_data"] = control_.config().can_access_market_data(*user);
+            out["can_stop_all_algorithms"] = control_.config().can_stop_all_algorithms(*user);
         }
         json_response(res, out, user ? 200 : 401);
     });
@@ -943,7 +944,11 @@ void Server::start() {
         guarded(res, [=, this] { return do_trading_status(in, lang, *user); });
     });
     svr.Post("/api/algo/stop", [=, this](const Request& req, Response& res) {
-        if (!require_api_user(req, res)) return;
+        auto user = require_api_user(req, res);
+        if (!user) return;
+        if (!control_.config().can_stop_all_algorithms(*user)) {
+            api_error(res, i18n::t(lang_of(req), "algo_stop_all_forbidden"), 403); return;
+        }
         RequestInput in(req);
         std::string lang = lang_of(req);
         guarded(res, [=, this] { return do_algo_stop(in.str("reason"), lang); });
@@ -1194,6 +1199,10 @@ void Server::start() {
         });
     });
     svr.Post("/submit-algo-stop", [=, this](const Request& req, Response& res) {
+        auto user = current_user(req);
+        if (user && !control_.config().can_stop_all_algorithms(*user)) {
+            api_error(res, i18n::t(lang_of(req), "algo_stop_all_forbidden"), 403); return;
+        }
         RequestInput in(req);
         std::string lang = lang_of(req);
         legacy(req, res, "/algo", [=, this] { return do_algo_stop(in.str("reason"), lang); });

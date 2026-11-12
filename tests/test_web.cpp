@@ -415,7 +415,7 @@ TEST_CASE("algorithm sessions share the server and block manual orders on their 
     for (const auto& session : algo["fast"]) session_ids.insert(session["session_id"].get<std::string>());
     CHECK(session_ids == std::set<std::string>{start["command"]["command_id"].get<std::string>(),
                                                second["command"]["command_id"].get<std::string>()});
-    json stop = body(c.Post("/api/algo/stop", json{{"reason", "test"}}.dump(), "application/json"));
+    json stop = body(f.client_for("lmh").Post("/api/algo/stop", json{{"reason", "test"}}.dump(), "application/json"));
     CHECK(stop["ok"] == true);
     CHECK(stop["fast_stopped"] == 2);
     CHECK(stop["buying_stopped"] == 0);
@@ -449,7 +449,7 @@ TEST_CASE("algorithm sessions share the server and block manual orders on their 
     f.upsert_account("B", 100000, 1000);
     body(c.Post("/api/smart-selling", json{{"account_ids", json::array({"B"})}, {"symbol", "AAPL"}, {"deadline", nullptr}}.dump(), "application/json"));
     f.sink->fail_next("transport unavailable");
-    json stop_all = body(c.Post("/api/algo/stop", "{}", "application/json"));
+    json stop_all = body(f.client_for("lmh").Post("/api/algo/stop", "{}", "application/json"));
     CHECK(stop_all["ok"] == true);
     CHECK(stop_all["smart_stopped"] == 1);
     CHECK(stop_all["warning"] == ng::i18n::t("en", "algo_stop_notification_failed"));
@@ -501,7 +501,7 @@ TEST_CASE("authenticated same-origin API starts and stops mode H") {
     // Stop-all reports Smart buying sessions separately.
     f.upsert_account("A", 10000, 0);
     REQUIRE(c.Post("/api/smart-buying", payload, "application/json")->status == 200);
-    json stop_all = body(c.Post("/api/algo/stop", "{}", "application/json"));
+    json stop_all = body(f.client_for("lmh").Post("/api/algo/stop", "{}", "application/json"));
     CHECK(stop_all["buying_stopped"] == 1);
     CHECK(stop_all["message"].get<std::string>().find("Smart buying") != std::string::npos);
 }

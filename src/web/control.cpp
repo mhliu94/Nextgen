@@ -876,6 +876,7 @@ json ControlCenter::bootstrap(const std::string& lang, const std::string& user) 
     out["privileged"] = config_.is_privileged(user);
     out["can_access_admin_control"] = config_.can_access_admin_control(user);
     out["can_access_market_data"] = config_.can_access_market_data(user);
+    out["can_stop_all_algorithms"] = config_.can_stop_all_algorithms(user);
     out["can_manage_trading"] = config_.is_privileged(user);
     out["symbols"] = symbols_;
     out["market_data_symbols"] = config_.market_data_symbols();

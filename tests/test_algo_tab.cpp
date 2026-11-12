@@ -3,6 +3,23 @@ using ng::json;
 using ngtest::WebFixture;
 using ngtest::body;
 
+TEST_CASE("Algo view is available to every signed-in user but global stop belongs only to lmh") {
+    WebFixture f;f.upsert_account("A",10000,1000,true,"AAPL");f.upsert_book("AAPL",10,10.01);
+    f.control->start_fast_strategy(f.fast_start("kept-running","E","AAPL",{"A"},true));
+    for(const auto* user:{"trader","admin","LMH"," lmh "}) {
+        auto c=f.client_for(user);CHECK(c.Get("/algo")->status==200);CHECK(c.Get("/api/algo")->status==200);
+        CHECK(body(c.Get("/api/bootstrap"))["can_stop_all_algorithms"]==false);
+        for(const auto* route:{"/api/algo/stop","/submit-algo-stop"}) {
+            auto response=c.Post(route,"{}","application/json");REQUIRE(response);CHECK(response->status==403);
+            CHECK(f.control->fast_manager()->has_active_session());
+        }
+    }
+    CHECK(f.client("").Post("/api/algo/stop","{}","application/json")->status==401);
+    auto owner=f.client_for("lmh");CHECK(body(owner.Get("/api/bootstrap"))["can_stop_all_algorithms"]==true);
+    CHECK(owner.Post("/api/algo/stop","{}","application/json")->status==200);
+    CHECK_FALSE(f.control->fast_manager()->has_active_session());
+}
+
 TEST_CASE("individual E and F stops target one session despite shared mode and ticker") {
     for(const auto* mode:{"E","F"}) {
         WebFixture f;for(const auto* id:{"A","B"})f.upsert_account(id,10000,1000,true,"AAPL");

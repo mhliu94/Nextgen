@@ -1028,6 +1028,7 @@
         section.dataset.algoMode=mode;section.style.marginBottom="var(--gap)";
         this.sections[mode]=section;this.roots[mode]=body;root.append(section);
       }
+      if(state.boot.can_stop_all_algorithms) {
         const reason=h("input",{id:"stop_reason",type:"text",placeholder:t("stop_reason_placeholder")});
         const msg=h("div",{class:"warn"});
         const form=h("form",{id:"algo-stop-all-form",onsubmit:async e=>{
@@ -1037,6 +1038,7 @@
           h("div",{class:"field"},h("label",{for:"stop_reason",text:t("stop_reason")}),reason),msg,
           h("button",{class:"btn red",type:"submit",text:t("algo_stop")}));
         root.append(card(t("algo_stop_title"),form));
+      }
       this.update(new Set(["algo"]));
     },
     update(topics) {

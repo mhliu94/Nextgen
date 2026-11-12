@@ -68,7 +68,7 @@ window.addEventListener('load',async()=>{
 if __name__=='__main__':
     p=argparse.ArgumentParser();p.add_argument('--browser',required=True);args=p.parse_args()
     codes=[]
-    for user,label in [('lmh','算法')]:
+    for user,label in [('trader','Algo'),('lmh','算法')]:
         harness=HARNESS.replace('TEST_USER',user).replace('ALGO_LABEL',label).replace('STOP_ALL','true' if user=='lmh' else 'false')
         codes.append(run_browser(args.browser,harness,path='/algo',width=390))
     raise SystemExit(max(codes))

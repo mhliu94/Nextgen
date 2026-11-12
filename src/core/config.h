@@ -153,6 +153,7 @@ struct AppConfig {
     // Admin Control and the Market Data dashboard compare the exact username (no trimming), as upstream.
     bool can_access_admin_control(const std::string& user) const { return user == "lmh"; }
     bool can_access_market_data(const std::string& user) const { return user == "lmh"; }
+    bool can_stop_all_algorithms(const std::string& user) const { return user == "lmh"; }
     // Symbols offered by the Market Data page: the publisher's list when configured, else `symbols`.
     std::vector<std::string> market_data_symbols() const;
 };
