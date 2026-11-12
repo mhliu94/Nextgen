@@ -72,7 +72,6 @@ private:
         std::string credited_session;
         std::optional<Decimal> credited_cumulative;
         std::optional<double> credited_at;
-        bool counter_conflict = false;
 
         std::deque<std::tuple<double, double, Decimal>> observations;
         std::deque<std::string> seen_trades;
@@ -99,14 +98,12 @@ private:
     void observation(SymbolState& state, double start, double end, const Decimal& quantity);
     std::optional<VolumeEnvelope> parse_volume_envelope(const std::string& symbol, const json& payload);
     bool accept_volume_status(SymbolState& state, const VolumeEnvelope& envelope, const json& payload);
-    void check_credited_watermark(SymbolState& state, const VolumeEnvelope& envelope);
+    void log_counter_decrease(const SymbolState& state, const VolumeEnvelope& envelope);
     bool prepare_volume_baseline(SymbolState& state, const VolumeEnvelope& envelope, const json& payload);
     void update_blocked_baseline(SymbolState& state, const VolumeEnvelope& envelope, const json& payload);
     void admit_volume(SymbolState& state, const VolumeEnvelope& envelope, const json& payload);
     void cumulative(const std::string& symbol, SymbolState& state, const json& payload, double source, long long sequence);
     static std::string event_id(const std::string& symbol, const SymbolState& state, const std::optional<long long>& sequence);
-    void unknown_correction(const std::string& symbol, SymbolState& state, const Decimal& delta, double source,
-                            const std::optional<long long>& sequence);
     void trades(const std::string& symbol, SymbolState& state, const json& trades, bool corrections_only = false);
 
     SmartSellingEngine& engine_;

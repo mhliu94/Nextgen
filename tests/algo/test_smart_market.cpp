@@ -167,29 +167,54 @@ TEST_CASE_FIXTURE(MarketFixture, "unhealthy observation and session or feed chan
     CHECK(reason().find("correction") == std::string::npos);
 }
 
-TEST_CASE_FIXTURE(MarketFixture, "unknown negative correction remains held after quotes recover") {
+TEST_CASE_FIXTURE(MarketFixture, "cumulative volume decrease continues without holding or double crediting the rebound") {
     market->apply_price_book(book());
     market->apply_volume(volume(1, 1000));
     now = 1;
     market->apply_volume(volume(2, 1100));
     now = 2;
     market->apply_volume(volume(3, 1000));
+    CHECK(earned()==Dec(20));
+    CHECK(market->market_status("XYZ").state=="TRADING");
     now = 3;
     market->apply_price_book(book());
-    market->apply_volume(volume(4, 1200));
-    CHECK(engine->tick().empty());
+    market->apply_volume(volume(4, 1050));
+    CHECK(earned()==Dec(20));
+    now=4;
+    market->apply_volume(volume(5,1200));
+    CHECK(earned()==Dec(40));
+    engine->tick();
     json p = engine->get_parent(parent);
-    CHECK(p["state"] == "HOLD");
-    CHECK(p["reason"].get<std::string>().find("unknown tape correction") != std::string::npos);
+    CHECK(p["state"] != "HOLD");
+    CHECK(p["reason"].get<std::string>().find("unknown tape correction") == std::string::npos);
 }
 
-TEST_CASE_FIXTURE(MarketFixture, "cumulative decrease across sequence gap still requires reconciliation") {
+TEST_CASE_FIXTURE(MarketFixture, "stopping after an aggregate volume decrease does not block a replacement session") {
+    market->apply_volume(volume(1,1000));now=1;market->apply_volume(volume(2,1100));
+    now=2;market->apply_volume(volume(3,1000));
+    engine->request_stop(parent);
+    CHECK_NOTHROW(start());
+}
+
+TEST_CASE_FIXTURE(MarketFixture, "pre-open zero reset after midnight does not reuse yesterday's credit watermark") {
+    market->apply_volume(volume(1,1000));now=1;market->apply_volume(volume(2,2000));
+    CHECK(earned()==Dec(200));
+    now=2;market->apply_volume(volume(3,2000,{{"session","2027-01-16"}}));
+    now=3;market->apply_volume(volume(4,0,{{"session","2027-01-16"}}));
+    now=4;market->apply_volume(volume(5,100,{{"session","2027-01-16"}}));
+    CHECK(earned()==Dec(220));
+    CHECK(reason().find("correction")==std::string::npos);
+}
+
+TEST_CASE_FIXTURE(MarketFixture, "cumulative decrease across a sequence gap preserves the credit watermark") {
     market->apply_volume(volume(1, 1000));
     now = 1;
     market->apply_volume(volume(2, 1100));
     now = 2;
     market->apply_volume(volume(4, 1050));
-    CHECK(reason().find("unknown tape correction") != std::string::npos);
+    CHECK(reason().find("unknown tape correction") == std::string::npos);
+    now=3;market->apply_volume(volume(5,1100));CHECK(earned()==Dec(20));
+    now=4;market->apply_volume(volume(6,1150));CHECK(earned()==Dec(30));
 }
 
 TEST_CASE_FIXTURE(MarketFixture, "genuine trade ids and corrections are used without cumulative double credit") {
@@ -288,7 +313,7 @@ TEST_CASE_FIXTURE(MarketFixture, "new adapter after restart discards first cumul
     CHECK(earned() == Dec(40));
 }
 
-TEST_CASE_FIXTURE(MarketFixture, "reconnect or restart cannot hide same session volume correction") {
+TEST_CASE_FIXTURE(MarketFixture, "reconnect and restart retain the high-water mark without a permanent counter hold") {
     market->apply_volume(volume(1, 1000));
     now = 1;
     market->apply_volume(volume(2, 2000));
@@ -299,10 +324,21 @@ TEST_CASE_FIXTURE(MarketFixture, "reconnect or restart cannot hide same session 
     auto restarted = fresh_adapter();
     restarted->apply_price_book(book());
     restarted->apply_volume(volume(1, 1900, {{"feed_id", "restarted-producer"}}));
-    CHECK(engine->tick().empty());
-    CHECK(reason().find("unknown tape correction") != std::string::npos);
-    CHECK(restarted->market_status("XYZ").state == "UNKNOWN");
-    CHECK((*engine->get_market_checkpoint("XYZ"))["counter_conflict"] == true);
+    CHECK(reason().find("unknown tape correction") == std::string::npos);
+    CHECK(restarted->market_status("XYZ").state == "TRADING");
+    now=3;restarted->apply_volume(volume(2,1950,{{"feed_id","restarted-producer"}}));CHECK(earned()==Dec(200));
+    now=4;restarted->apply_volume(volume(3,2100,{{"feed_id","restarted-producer"}}));CHECK(earned()==Dec(220));
+    CHECK((*engine->get_market_checkpoint("XYZ"))["counter_conflict"] == false);
+}
+
+TEST_CASE_FIXTURE(MarketFixture, "legacy counter flags cannot poison a new session or a new trading day") {
+    engine->set_market_checkpoint("XYZ",{{"session","2027-01-15"},{"cumulative","2000"},{"counter_conflict",true}});
+    auto restarted=fresh_adapter();restarted->apply_price_book(book());
+    restarted->apply_volume(volume(1,1900));
+    CHECK(restarted->market_status("XYZ").state=="TRADING");
+    now=1;restarted->apply_volume(volume(2,1950));CHECK(earned()==Dec(0));
+    now=2;restarted->apply_volume(volume(3,0,{{"session","2027-01-16"}}));
+    now=3;restarted->apply_volume(volume(4,100,{{"session","2027-01-16"}}));CHECK(earned()==Dec(20));
 }
 
 TEST_CASE_FIXTURE(MarketFixture, "unknown or delayed flags do not earn credit") {

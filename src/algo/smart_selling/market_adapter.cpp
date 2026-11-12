@@ -4,6 +4,7 @@
 #include <cmath>
 
 #include "core/strings.h"
+#include "core/logging.h"
 #include "core/time_util.h"
 
 namespace ng::smart {
@@ -111,8 +112,8 @@ SmartSellingMarketAdapter::SymbolState& SmartSellingMarketAdapter::symbol_state(
         if (const json* s = json_find(*checkpoint, "session"); !s || s->is_null()) state.credited_session = "";
         state.credited_cumulative = market_decimal(json_find(*checkpoint, "cumulative"));
         state.credited_at = market_timestamp(json_find(*checkpoint, "observed_at"));
-        const json* conflict = json_find(*checkpoint, "counter_conflict");
-        state.counter_conflict = conflict && conflict->is_boolean() && conflict->get<bool>();
+        // Legacy cumulative-counter conflict flags are no longer a trading gate.
+        // Order/fill conflicts remain protected separately in the engine ledger.
         const json* halted = json_find(*checkpoint, "halted");
         if (halted && halted->is_boolean() && halted->get<bool>()) {
             state.halt_latched = true;
@@ -129,7 +130,7 @@ void SmartSellingMarketAdapter::save_checkpoint(const std::string& symbol, Symbo
     checkpoint["cumulative"] = state.credited_cumulative ? json(state.credited_cumulative->str()) : json(nullptr);
     checkpoint["observed_at"] = state.credited_at ? json(*state.credited_at) : json(nullptr);
     checkpoint["halted"] = state.halt_latched;
-    checkpoint["counter_conflict"] = state.counter_conflict;
+    checkpoint["counter_conflict"] = false;
     engine_.set_market_checkpoint(symbol, checkpoint);
 }
 
@@ -177,7 +178,7 @@ void SmartSellingMarketAdapter::set_volume_connected(bool connected) {
 
 bool SmartSellingMarketAdapter::volume_is_healthy(const SymbolState& state) const {
     return volume_connected_ && state.volume_healthy && fresh(state.volume_time) && fresh(state.status_time) &&
-           state.market_state == "TRADING" && !state.counter_conflict;
+           state.market_state == "TRADING";
 }
 
 void SmartSellingMarketAdapter::refresh_health(const std::string& symbol, SymbolState& state) {
@@ -190,9 +191,6 @@ void SmartSellingMarketAdapter::refresh_health(const std::string& symbol, Symbol
 MarketStatus SmartSellingMarketAdapter::market_status(const std::string& symbol_in) {
     std::lock_guard lock(mutex_);
     SymbolState& state = symbol_state(to_upper(trim(symbol_in)));
-    if (state.counter_conflict && state.market_state != "HALTED") {
-        return {"UNKNOWN", "cumulative volume correction requires reconciliation"};
-    }
     if (state.market_state == "TRADING" && !volume_is_healthy(state)) {
         return {"UNKNOWN", "trading-volume status is stale or unavailable"};
     }
@@ -395,11 +393,11 @@ bool SmartSellingMarketAdapter::apply_volume(const json& payload, const std::opt
         return false;
     }
     if (!accept_volume_status(state, *envelope, payload)) return false;
-    check_credited_watermark(state, *envelope);
+    log_counter_decrease(state, *envelope);
     if (!prepare_volume_baseline(state, *envelope, payload)) return false;
     bool admit = halt_gate(symbol, state, payload, envelope->observed_at);
     bool accepted;
-    if (admit && !state.counter_conflict) {
+    if (admit) {
         admit_volume(state, *envelope, payload);
         accepted = true;
     } else {
@@ -457,14 +455,15 @@ bool SmartSellingMarketAdapter::accept_volume_status(SymbolState& state, const V
     return true;
 }
 
-void SmartSellingMarketAdapter::check_credited_watermark(SymbolState& state, const VolumeEnvelope& envelope) {
-    if (envelope.session != state.credited_session || !envelope.total_volume) return;
-    if (!state.credited_cumulative || *envelope.total_volume >= *state.credited_cumulative) return;
-    state.counter_conflict = true;
-    save_checkpoint(envelope.symbol, state);
-    state.volume_feed_id = envelope.feed_id;
-    unknown_correction(envelope.symbol, state, *envelope.total_volume - *state.credited_cumulative, envelope.observed_at,
-                       envelope.sequence);
+void SmartSellingMarketAdapter::log_counter_decrease(const SymbolState& state, const VolumeEnvelope& envelope) {
+    if (!envelope.total_volume || envelope.total_volume->is_negative()) return;
+    std::optional<Decimal> previous;
+    if (state.session == envelope.session && state.volume) previous = state.volume;
+    else if (state.credited_session == envelope.session) previous = state.credited_cumulative;
+    if (previous && *envelope.total_volume < *previous) {
+        NG_LOG_ERROR("smart.market", "cumulative_volume_decrease symbol={} session={} previous={} current={} feed={} sequence={}; continuing without a ledger hold",
+                     envelope.symbol,envelope.session,previous->str(),envelope.total_volume->str(),envelope.feed_id,envelope.sequence);
+    }
 }
 
 bool SmartSellingMarketAdapter::prepare_volume_baseline(SymbolState& state, const VolumeEnvelope& envelope, const json& payload) {
@@ -479,12 +478,6 @@ bool SmartSellingMarketAdapter::prepare_volume_baseline(SymbolState& state, cons
     bool sequence_gap = state.volume_sequence && envelope.sequence != *state.volume_sequence + 1;
     bool time_gap = state.volume_time && envelope.observed_at - *state.volume_time > max_source_age_;
     if (sequence_gap || time_gap) {
-        const json* trades_field = json_find(payload, "trades");
-        bool has_trades = trades_field && trades_field->is_array();
-        if (!has_trades && envelope.total_volume && state.volume && *envelope.total_volume < *state.volume) {
-            unknown_correction(envelope.symbol, state, *envelope.total_volume - *state.volume, envelope.observed_at,
-                               envelope.sequence);
-        }
         reset_volume(state);
         state.resume_count = 0;
     }
@@ -493,9 +486,6 @@ bool SmartSellingMarketAdapter::prepare_volume_baseline(SymbolState& state, cons
 
 void SmartSellingMarketAdapter::update_blocked_baseline(SymbolState& state, const VolumeEnvelope& envelope, const json& payload) {
     const std::optional<Decimal>& current = envelope.total_volume;
-    if (state.volume && current && *current < *state.volume) {
-        unknown_correction(envelope.symbol, state, *current - *state.volume, envelope.observed_at, envelope.sequence);
-    }
     reset_volume(state);
     const json* trades_field = json_find(payload, "trades");
     if (trades_field && trades_field->is_array()) {
@@ -540,12 +530,12 @@ void SmartSellingMarketAdapter::cumulative(const std::string& symbol, SymbolStat
     state.volume_time = source;
     state.volume_sequence = sequence;
     if (!previous) return;
-    Decimal delta = *volume - *previous;
-    if (delta.is_negative()) {
-        unknown_correction(symbol, state, delta, source, sequence);
-        state.observations.clear();
-        return;
-    }
+    // A counter revision is not a referenced trade cancellation. Ignore negative
+    // deltas and do not credit the rebound below the last credited high-water mark.
+    Decimal baseline=*previous;
+    if (state.credited_session==state.session && state.credited_cumulative && *state.credited_cumulative>baseline)
+        baseline=*state.credited_cumulative;
+    Decimal delta=*volume>baseline ? *volume-baseline : Decimal::zero();
     observation(state, *previous_time, source, delta);
     if (delta.is_zero()) return;
     std::optional<double> interval_start = market_timestamp(json_find(payload, "interval_start"));
@@ -566,18 +556,6 @@ void SmartSellingMarketAdapter::cumulative(const std::string& symbol, SymbolStat
 std::string SmartSellingMarketAdapter::event_id(const std::string& symbol, const SymbolState& state,
                                                 const std::optional<long long>& sequence) {
     return state.volume_feed_id + ":" + symbol + ":" + (sequence ? std::to_string(*sequence) : "None");
-}
-
-void SmartSellingMarketAdapter::unknown_correction(const std::string& symbol, SymbolState& state, const Decimal& delta,
-                                                   double source, const std::optional<long long>& sequence) {
-    std::string id = event_id(symbol, state, sequence);
-    TradeUpdate trade;
-    trade.quantity = json(delta.str());
-    trade.event_id = id;
-    trade.source_time = json(source);
-    trade.correction_of = "unreconstructable:" + id;
-    trade.received_at = clock_();
-    engine_.on_trade(symbol, trade);
 }
 
 void SmartSellingMarketAdapter::trades(const std::string& symbol, SymbolState& state, const json& trade_list,
