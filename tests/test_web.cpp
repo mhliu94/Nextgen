@@ -342,12 +342,11 @@ TEST_CASE("order APIs validate, localize and publish once per account") {
     json limit = body(c.Post("/api/orders/limit", json{{"account_ids", json::array({"A"})}, {"symbol", "AAPL"}, {"side", "SELL"}, {"shares", "10"}, {"limit_price", ""}, {"through_market_pct", "10"}}.dump(), "application/json"));
     CHECK(limit["ok"] == true);
     CHECK(f.sink->history().back().command["limit_price"] == 90.0);
+    f.control->market_order_store()->update_feed("live", "caught up");
+    auto before_cancel = f.sink->count();
     json cancel = body(c.Post("/api/orders/cancel", json{{"account_ids", json::array({"__ALL__"})}, {"symbol", ""}}.dump(), "application/json"));
     CHECK(cancel["ok"] == true);
-    auto hist = f.sink->history();
-    CHECK(hist[hist.size() - 1].command["type"] == "CANCEL_OPEN_ORDERS");
-    CHECK(hist[hist.size() - 2].command["type"] == "CANCEL_OPEN_ORDERS");
-    CHECK_FALSE(hist.back().command.contains("symbol"));
+    CHECK(f.sink->count() == before_cancel); // no confirmed open orders, no bulk command
     auto quick_form = c.Post("/api/account-orders/quick-market", "account_id=A&symbol=aapl&side=BUY&shares=5", "application/x-www-form-urlencoded");
     CHECK(quick_form->status == 200);
     CHECK(body(quick_form)["command_id"].get<std::string>().rfind("cmd_", 0) == 0);

@@ -1,0 +1,30 @@
+# Order ownership and cancellation
+
+The control server owns the distinction between algorithm and manual orders. It
+persists algorithm command/session mappings and UI manual command mappings before
+publishing submissions. Broker-app orders are external manual orders when no
+unresolved algorithm submission could explain them. Ambiguous ownership is shown
+separately and cannot be cancelled through manual controls. Exact command identity
+survives later status-only snapshots and process restarts.
+
+`POST /api/orders/cancel` accepts `account_ids`, optional `symbol`, and optional
+`order_id` for an individual order on exactly one account. `__ALL__` selects every
+visible configured account. The server selects confirmed manual orders and emits
+one `CANCEL_ORDER` per exact broker ID. It never emits a broad broker cancel-all.
+Caller-supplied ownership is ignored. An algorithm owning the account does not
+prevent cancellation of existing manual orders; it still prevents new manual UI
+submissions. Broker-app submission itself is outside the server's control.
+
+The independent order feed must finish replay before manual cancellations are
+accepted. Batch results distinguish queued, already pending, excluded algorithm,
+unresolved, and publication-error orders. A durable cancellation claim prevents
+HTTP retries or restarts from duplicating a request. A queued/uncertain request
+remains visible until terminal broker feedback; an acknowledgment is not a fill or
+a confirmed cancellation. Uncertain requests need reconciliation rather than a
+new cancellation ID.
+
+Broker rollout must precede activating this control-server build. Bosco,
+GigaMoney, Fangde and Star need the exact-cancellation dispatcher changes;
+Zhuorui needs strict exact-ID parsing and creation-day history lookup for older
+orders. Bitget already supports exact-ID cancellation. Do not restart the admin
+service until the operator releases the current hold. BOSCO-WJY stays stopped.

@@ -163,13 +163,12 @@ TEST_CASE("fast long cycle heartbeats without changing the deadline") {
     CHECK(running_heartbeats == 7);
 }
 
-TEST_CASE("fast reporting failure does not prevent order publication") {
+TEST_CASE("fast ownership persistence failure prevents order publication") {
     RecordingReporter reporting;
     reporting.fail("register_command");
     FastHarness h(&reporting);
-    ng::fast::CycleResult result = h.manager->run_cycle(fast_command());
-    CHECK(result.commands.size() == 2);
-    CHECK(h.count() == 2);
+    CHECK_THROWS(h.manager->run_cycle(fast_command()));
+    CHECK(h.count() == 0);
 }
 
 namespace {
@@ -303,7 +302,7 @@ TEST_CASE("smart registers a confirmable child before publication") {
     CHECK(reporting.calls("end_session").empty());
 }
 
-TEST_CASE("smart reporting failure preserves session and orders") {
+TEST_CASE("smart ownership persistence failure blocks new orders but heartbeat failure does not") {
     for (const char* failing : {"start_session", "register_command", "heartbeat_session"}) {
         CAPTURE(std::string(failing));
         RecordingReporter reporting;
@@ -312,6 +311,10 @@ TEST_CASE("smart reporting failure preserves session and orders") {
         json parent = h.start();
         CHECK(h.runtime->has_active_session());
         h.trade_and_tick();
+        if (std::string(failing) != "heartbeat_session") {
+            CHECK(h.published.empty());
+            continue;
+        }
         REQUIRE(h.published.size() == 1);
         CHECK(h.published[0]["parent_id"] == parent["parent_id"]);
     }

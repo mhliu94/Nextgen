@@ -165,6 +165,19 @@ ActivityReporting::ActivityReporting(const std::string& db_path, Clock now) {
             session_id TEXT, payload TEXT NOT NULL, PRIMARY KEY(account_id, order_id)
         );
         CREATE INDEX IF NOT EXISTS activity_orders_session ON activity_orders(session_id);
+        CREATE INDEX IF NOT EXISTS activity_open_orders ON activity_orders(updated_epoch DESC,account_id,order_id)
+            WHERE json_extract(payload,'$.status') NOT IN ('FILLED','CANCELED','REJECTED','EXPIRED');
+        CREATE INDEX IF NOT EXISTS activity_orders_command ON activity_orders(account_id,json_extract(payload,'$.command_id'));
+        CREATE INDEX IF NOT EXISTS activity_orders_client ON activity_orders(account_id,json_extract(payload,'$.client_order_id'));
+        CREATE TABLE IF NOT EXISTS activity_manual_commands (
+            account_id TEXT NOT NULL, command_id TEXT NOT NULL,
+            PRIMARY KEY(account_id, command_id)
+        );
+        CREATE TABLE IF NOT EXISTS activity_cancellations (
+            account_id TEXT NOT NULL, order_id TEXT NOT NULL, command TEXT NOT NULL,
+            state TEXT NOT NULL, requested_at TEXT NOT NULL,
+            PRIMARY KEY(account_id, order_id)
+        );
         CREATE INDEX IF NOT EXISTS activity_orders_symbol_time ON activity_orders(symbol, created_epoch);
         CREATE TABLE IF NOT EXISTS activity_tags (
             id TEXT PRIMARY KEY, name TEXT NOT NULL, symbol TEXT NOT NULL,
@@ -300,6 +313,9 @@ void ActivityReporting::register_command(const std::string& session_id, const js
     }
     transaction(true, [&] {
         for (const auto& identifier : identifiers) {
+            Statement manual(*db_, "SELECT 1 FROM activity_manual_commands WHERE account_id=? AND command_id=?");
+            manual.bind(1, account_id).bind(2, identifier);
+            if (manual.step()) throw std::invalid_argument("A manual command cannot become an algorithm command.");
             Statement owner(*db_, "SELECT session_id FROM activity_commands WHERE account_id=? AND command_id=?");
             owner.bind(1, account_id).bind(2, identifier);
             if (owner.step() && owner.column_text(0) != session_id) {
@@ -334,8 +350,104 @@ void ActivityReporting::register_command(const std::string& session_id, const js
     });
 }
 
+void ActivityReporting::register_manual_command(const json& command) {
+    const std::string account = command.at("account_id").get<std::string>();
+    transaction(true, [&] {
+        for (const char* key : {"command_id", "client_order_id"}) {
+            auto value = json_to_string(json_find(command, key)).value_or("");
+            if (value.empty()) continue;
+            Statement owner(*db_, "SELECT 1 FROM activity_commands WHERE account_id=? AND command_id=?");
+            owner.bind(1, account).bind(2, value);
+            if (owner.step()) throw std::invalid_argument("An algorithm command cannot become a manual command.");
+            Statement add(*db_, "INSERT OR IGNORE INTO activity_manual_commands VALUES (?,?)");
+            add.bind(1, account).bind(2, value); add.exec();
+        }
+    });
+}
+
+json ActivityReporting::working_orders(const AccountDirectory& accounts) {
+    std::lock_guard lock(mutex_);
+    if (!db_) throw std::runtime_error("activity reporting is closed");
+    json result = json::array();
+    auto labels = session_labels();
+    Statement rows(*db_, "SELECT o.account_id,o.order_id,o.session_id,o.payload,o.created_epoch,"
+                         "s.status,s.ended_at,c.state,s.parameters FROM activity_orders o "
+                         "LEFT JOIN activity_sessions s ON s.id=o.session_id "
+                         "LEFT JOIN activity_cancellations c ON c.account_id=o.account_id AND c.order_id=o.order_id "
+                         "WHERE json_extract(o.payload,'$.status') NOT IN ('FILLED','CANCELED','REJECTED','EXPIRED') "
+                         "ORDER BY o.updated_epoch DESC,o.account_id,o.order_id");
+    while (rows.step()) {
+        std::string account = rows.column_text(0);
+        if (!accounts.contains(account)) continue;
+        json order = json::parse(rows.column_text(3));
+        std::string origin = "manual_external";
+        std::string session = rows.column_optional_text(2).value_or("");
+        bool manual = false;
+        std::set<std::string> owners;
+        if (!session.empty()) owners.insert(session);
+        for (const char* key : {"command_id", "client_order_id"}) {
+            auto id = json_to_string(json_find(order, key)).value_or("");
+            if (id.empty()) continue;
+            Statement cmd(*db_, "SELECT session_id FROM activity_commands WHERE account_id=? AND command_id=?");
+            cmd.bind(1, account).bind(2, id);
+            if (cmd.step()) owners.insert(cmd.column_text(0));
+            Statement ui(*db_, "SELECT 1 FROM activity_manual_commands WHERE account_id=? AND command_id=?");
+            ui.bind(1, account).bind(2, id);
+            manual = ui.step() || manual;
+        }
+        if (owners.size() > 1 || (manual && !owners.empty())) origin = "unknown";
+        else if (!owners.empty()) { origin = "algo"; session = *owners.begin(); }
+        else if (manual) origin = "manual_ui";
+        else {
+            // A broker snapshot can beat its correlated update. Do not treat it as manual while
+            // an overlapping session still has an unaccounted-for submission on this account.
+            Statement pending(*db_, "SELECT s.parameters,s.started_at,s.ended_at FROM activity_sessions s "
+                "WHERE EXISTS (SELECT 1 FROM activity_commands c WHERE c.session_id=s.id AND c.account_id=? "
+                "AND NOT EXISTS (SELECT 1 FROM activity_orders o WHERE o.account_id=c.account_id AND json_extract(o.payload,'$.command_id')=c.command_id) "
+                "AND NOT EXISTS (SELECT 1 FROM activity_orders o WHERE o.account_id=c.account_id AND json_extract(o.payload,'$.client_order_id')=c.command_id))");
+            pending.bind(1, account);
+            while (pending.step()) {
+                auto p = json::parse(pending.column_text(0));
+                if (canonical_symbol(p.value("symbol", "")) != canonical_symbol(order.value("symbol", ""))) continue;
+                double created = rows.column_double(4);
+                if (created + 5 < timestamp(pending.column_text(1))) continue;
+                origin = "unknown"; break;
+            }
+        }
+        order["origin"] = origin;
+        order["session_id"] = session.empty() ? json(nullptr) : json(session);
+        order["session_label"] = labels.count(session) ? json(labels.at(session)) : json(nullptr);
+        order["session_status"] = rows.column_optional_text(5).value_or("");
+        order["session_ended"] = !rows.is_null(6);
+        order["cancel_state"] = rows.column_optional_text(7).value_or("");
+        auto parameters = rows.is_null(8) ? json::object() : json::parse(rows.column_text(8));
+        order["session_mode"] = parameters.value("trading_mode", "");
+        order["can_cancel"] = starts_with(origin, "manual_") && order["cancel_state"] == "" &&
+                              order.value("status", "") != "PENDING_CANCEL";
+        result.push_back(std::move(order));
+    }
+    return result;
+}
+
+bool ActivityReporting::claim_cancel(const json& command) {
+    return transaction(true, [&] {
+        Statement add(*db_, "INSERT OR IGNORE INTO activity_cancellations VALUES (?,?,?,?,?)");
+        add.bind(1, command.at("account_id").get<std::string>()).bind(2, command.at("order_id").get<std::string>());
+        add.bind(3, json_dump_compact(command)).bind(4, "dispatching").bind(5, iso(now_())); add.exec();
+        Statement changed(*db_, "SELECT changes()"); changed.step(); return changed.column_int(0) == 1;
+    });
+}
+
+void ActivityReporting::cancel_dispatched(const json& command, const std::string& state) {
+    transaction(true, [&] {
+        Statement update(*db_, "UPDATE activity_cancellations SET state=? WHERE account_id=? AND order_id=?");
+        update.bind(1, state).bind(2, command.at("account_id").get<std::string>()).bind(3, command.at("order_id").get<std::string>());
+        update.exec();
+    });
+}
+
 bool ActivityReporting::record_order(const orders::OrderEvent& event) {
-    const json& data = event.payload;
+    json data = event.payload;
     std::string account_id = data.at("account_id").get<std::string>();
     std::string order_id = data.at("order_id").get<std::string>();
     long long sequence = integer_field(data.at("sequence"));
@@ -357,6 +469,14 @@ bool ActivityReporting::record_order(const orders::OrderEvent& event) {
                 }
                 if (symbol != old.column_text(3) || !previous.is_object() || data.at("side") != previous.value("side", json(nullptr))) {
                     throw std::invalid_argument("Order symbol and side are immutable.");
+                }
+                // Status-only updates must not erase established provenance.
+                for (const char* key : {"command_id", "client_order_id"}) {
+                    auto prior = json_to_string(json_find(previous, key)).value_or("");
+                    auto next = json_to_string(json_find(data, key)).value_or("");
+                    if (!prior.empty() && !next.empty() && prior != next)
+                        throw std::invalid_argument("Order command identity cannot change.");
+                    if (!prior.empty() && next.empty()) data[key] = prior;
                 }
                 session_id = old.column_optional_text(4);
             }

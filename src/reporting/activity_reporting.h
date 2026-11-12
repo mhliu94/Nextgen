@@ -60,6 +60,13 @@ public:
     // Stable public labels, backed by one global AUTOINCREMENT sequence.
     std::map<std::string, std::string> session_labels();
 
+    // Durable provenance and cancellation ledger. Never infer algo ownership from the UI.
+    void register_manual_command(const json& command);
+    json working_orders(const AccountDirectory& accounts);
+    // Claims a cancellation once, across HTTP retries and process restarts.
+    bool claim_cancel(const json& command);
+    void cancel_dispatched(const json& command, const std::string& state);
+
 private:
     template <typename Fn>
     auto transaction(bool durable, Fn&& fn) -> decltype(fn());

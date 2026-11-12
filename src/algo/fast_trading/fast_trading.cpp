@@ -575,11 +575,9 @@ std::string StrategyManager::start_strategy(const json& start_command) {
         strategies_[session_id] = strategy;
         auto accounts = strategy_accounts(strategy->command);
         std::vector<std::string> sorted_accounts(accounts.begin(), accounts.end());
-        report("start_session", [&](reporting::SessionReporter& r) {
-            r.start_session(session_id, strategy->command, sorted_accounts, strategy->started_at);
-        });
-        record_started(*strategy);
         try {
+            if (reporting_) reporting_->start_session(session_id, strategy->command, sorted_accounts, strategy->started_at);
+            record_started(*strategy);
             std::function<void()> body = [this, strategy] { run_strategy(strategy); };
             strategy->thread = worker_spawner_ ? worker_spawner_(std::move(body)) : std::thread(std::move(body));
         } catch (...) {
@@ -854,7 +852,7 @@ CycleResult StrategyManager::run_cycle(const json& command) {
                             command_json(cmd));
             } else {
                 if (has_session) {
-                    report("register_command", [&](reporting::SessionReporter& r) { r.register_command(session_id, cmd); });
+                    if (reporting_) reporting_->register_command(session_id, cmd);
                 }
                 NG_LOG_INFO(kLog, "Publishing fast trading command key={} command={}", key, command_json(cmd));
                 publish_(cmd, key);

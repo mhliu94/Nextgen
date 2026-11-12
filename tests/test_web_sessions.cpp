@@ -269,11 +269,11 @@ TEST_CASE_FIXTURE(SessionFixture, "concurrent starts on one account admit exactl
     }
 }
 
-TEST_CASE_FIXTURE(SessionFixture, "manual orders and cancellations are blocked for entire owned accounts") {
+TEST_CASE_FIXTURE(SessionFixture, "new manual orders are blocked for entire owned accounts") {
     control->start_fast_strategy(fast_command());
     control->start_smart_parent(smart_settings);
     for (const char* account : {"A", "B"}) {
-        for (const char* kind : {"MARKET_ORDER", "DELAYED_MARKET_ORDER", "LIMIT_ORDER", "LIMIT_ORDER_FOK", "CANCEL_OPEN_ORDERS",
+        for (const char* kind : {"MARKET_ORDER", "DELAYED_MARKET_ORDER", "LIMIT_ORDER", "LIMIT_ORDER_FOK",
                                  "CURRENCY_CONVERSION"}) {
             for (const json& symbol : {json("XYZ"), json("OTHER"), json(nullptr)}) {
                 CAPTURE(std::string(account));
@@ -297,18 +297,15 @@ TEST_CASE_FIXTURE(SessionFixture, "manual orders and cancellations are blocked f
     CHECK(sink->count() == 3);
 }
 
-TEST_CASE_FIXTURE(SessionFixture, "manual cancellations on unselected accounts remain available") {
+TEST_CASE_FIXTURE(SessionFixture, "empty manual cancel-all never publishes a broad broker command") {
     control->start_smart_parent(smart_settings);
-    auto c = client();
-    auto allowed = c.Post("/submit-cancel-open-orders", "account_ids=A", "application/x-www-form-urlencoded");
-    REQUIRE(allowed);
-    CHECK(allowed->get_header_value("Location").find("ok=") != std::string::npos);
-    REQUIRE(sink->count() == 1);
-    CHECK(sink->history().back().command["account_id"] == "A");
-    sink->clear();
-    auto blocked = c.Post("/submit-cancel-open-orders", "account_ids=B", "application/x-www-form-urlencoded");
-    REQUIRE(blocked);
-    CHECK(blocked->get_header_value("Location").find("err=") != std::string::npos);
+    control->market_order_store()->update_feed("live", "caught up");
+    for (const auto* account : {"A", "B"}) {
+        auto c = client();
+        auto result = c.Post("/submit-cancel-open-orders", std::string("account_ids=") + account, "application/x-www-form-urlencoded");
+        REQUIRE(result);
+        CHECK(result->get_header_value("Location").find("ok=") != std::string::npos);
+    }
     CHECK(sink->count() == 0);
 }
 

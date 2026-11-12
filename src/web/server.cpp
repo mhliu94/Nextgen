@@ -554,29 +554,15 @@ void Server::start() {
             }
         }
         if (account_ids.empty()) return fail(i18n::t(lang, "quick_pick_account"));
-        std::vector<json> commands;
-        std::set<std::string> seen_accounts;
-        int published = 0;
-        std::string first_id;
-        for (const auto& account_id : account_ids) {
-            if (!seen_accounts.insert(trim(account_id)).second) return fail("Duplicate account IDs are not allowed");
-            orders::Validated v = orders::validate_cancel_open_orders_inputs(account_id, symbol.empty() ? std::nullopt : std::optional(symbol),
-                                                                             control_.accounts(), i18n::t(lang, "invalid_account"));
-            if (!v.ok()) return fail(v.error);
-            commands.push_back(control_.normalize_trading_command(*v.command));
-            ++published;
-            if (first_id.empty()) first_id = v.command->at("command_id").get<std::string>();
-        }
-        json queued=json::array();
-        for (const auto& command:commands) {
-            try { control_.publish_control_command(command,command.at("account_id").get<std::string>()); }
-            catch (const std::exception&) {
-                return Outcome{false,"Batch publication interrupted; inspect queued and uncertain command IDs before retrying",
-                    {{"queued_commands",queued},{"uncertain_command",command},{"requested_count",commands.size()}},503};
-            }
-            queued.push_back(command);
-        }
-        return Outcome{true, i18n::t(lang, "cancel_orders_submitted") + " " + std::to_string(published) + ". " + i18n::t(lang, "published_cmd") + "=" + first_id};
+        auto result = control_.cancel_manual_orders(account_ids, symbol, trim(in.str_or("order_id", "")));
+        bool ok = result.at("errors").empty() && result.at("unresolved") == 0;
+        std::string message = "Manual cancellations queued: " + std::to_string(result.at("queued_commands").size()) +
+            "; algo orders excluded: " + std::to_string(result.at("skipped_algo").get<int>()) +
+            "; already pending: " + std::to_string(result.at("already_pending").get<int>()) +
+            "; unresolved: " + std::to_string(result.at("unresolved").get<int>()) +
+            "; publication errors: " + std::to_string(result.at("errors").size()) +
+            ". Orders remain open until broker confirmation.";
+        return Outcome{ok, message, result, ok ? 200 : 409};
     };
     // Admin Control: one read-only, multi-account request for a day's broker orders. Only the lmh
     // account may use it; the request can be queued while algorithms own an account.
@@ -811,6 +797,10 @@ void Server::start() {
     });
 
     // --- read APIs ------------------------------------------------------------------------------
+    svr.Get("/api/working-orders", [=, this](const Request& req, Response& res) {
+        if (!require_api_user(req, res)) return;
+        json_response(res, control_.working_orders());
+    });
     svr.Get("/api/bootstrap", [=, this](const Request& req, Response& res) {
         auto user = require_api_user(req, res);
         if (!user) return;

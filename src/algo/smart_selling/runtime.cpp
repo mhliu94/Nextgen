@@ -594,7 +594,9 @@ void SmartSellingRuntime::handoff_action(json action) {
         json command = build_smart_selling_command(action, metas_());
         if (type == "submit") {
             std::string session_id = action.at("parent_id").get<std::string>();
-            report("register_command", [&](reporting::SessionReporter& r) { r.register_command(session_id, command); });
+            if (reporting_ && !reported_sessions_.count(session_id))
+                throw std::runtime_error("Session ownership could not be persisted; order was not submitted");
+            if (reporting_) reporting_->register_command(session_id, command);
         }
         publish_started = true;
         publish_(command, action.at("account_id").get<std::string>());

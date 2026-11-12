@@ -187,7 +187,10 @@ void ControlCenter::create_reporting(const std::string& db_path) {
     // Our traded volume covers all visible configured accounts; its fills are attributed in New York time.
     market_order_store_ = std::make_unique<order_ui::OrderStore>(
         accounts_, reporting::MarketActivity::kMarketZone, nullptr,
-        [this](const orders::OrderEvent& event) { market_activity_->record_order(event); });
+        [this](const orders::OrderEvent& event) {
+            reporting_->record_order(event);
+            market_activity_->record_order(event);
+        });
 }
 
 std::vector<smart::SmartSellingRuntime*> ControlCenter::smart_managers() const {
@@ -285,6 +288,9 @@ bool ControlCenter::owned_by_algorithm(const std::string& account_id) const {
     for (auto* manager : smart_managers()) {
         if (manager->owns_account(account_id)) return true;
     }
+    if (reporting_) for (const auto& order : reporting_->working_orders(accounts_)) {
+        if (order.at("account_id") == account_id && order.at("origin") == "algo") return true;
+    }
     return false;
 }
 
@@ -303,9 +309,95 @@ json ControlCenter::normalize_trading_command(const json& command) const {
     return normalized;
 }
 
+json ControlCenter::working_orders() const {
+    if (!reporting_ || !market_order_store_) throw std::runtime_error("Order reporting is unavailable");
+    json feed = market_order_store_->feed_status();
+    json orders = reporting_->working_orders(accounts_);
+    for (auto& order : orders) {
+        order["can_cancel"] = order.at("can_cancel").get<bool>() && feed.value("state", "") == "live";
+    }
+    return browser_payload(json{{"orders", orders}, {"feed", feed}, {"generated_at", iso_utc_now()}});
+}
+
+namespace {
+json exact_cancel(const json& order, const AccountDirectory& accounts) {
+    auto command = orders::build_cancel_open_orders_command(order.at("account_id").get<std::string>(), accounts,
+                                                           order.at("symbol").get<std::string>());
+    command["type"] = "CANCEL_ORDER";
+    command["order_id"] = order.at("order_id");
+    // Zhuorui names the same broker identifier order_reference.
+    command["order_reference"] = order.at("order_id");
+    command["order_created_at"] = order.at("created_at");
+    return command;
+}
+}
+
+json ControlCenter::cancel_manual_orders(const std::vector<std::string>& ids, const std::string& symbol,
+                                        const std::string& order_id) {
+    std::lock_guard lock(algo_lock_);
+    if (ids.empty()) throw std::invalid_argument("Select at least one account");
+    std::set<std::string> selected;
+    for (const auto& id : ids) {
+        if (!accounts_.contains(id)) throw std::invalid_argument("Unknown account: " + id);
+        if (!selected.insert(id).second) throw std::invalid_argument("Duplicate account IDs are not allowed");
+    }
+    if (!order_id.empty() && ids.size() != 1) throw std::invalid_argument("Select exactly one account for an individual cancellation");
+    auto state = working_orders();
+    if (state.at("feed").value("state", "") != "live")
+        throw std::invalid_argument("Order feed is not live; wait for replay/reconnection before cancelling");
+    json result{{"queued_commands", json::array()}, {"errors", json::array()},
+                {"skipped_algo", 0}, {"unresolved", 0}, {"already_pending", 0}};
+    bool found = order_id.empty();
+    for (const auto& order : state.at("orders")) {
+        if (!selected.count(order.at("account_id").get<std::string>())) continue;
+        if (!symbol.empty() && canonical_symbol(order.at("symbol").get<std::string>()) != canonical_symbol(symbol)) continue;
+        if (!order_id.empty() && order.at("order_id") != order_id) continue;
+        found = true;
+        auto origin = order.at("origin").get<std::string>();
+        if (origin == "algo") {
+            if (!order_id.empty()) throw std::invalid_argument("Algorithm orders can only be cancelled by their session");
+            result["skipped_algo"] = result.at("skipped_algo").get<int>() + 1; continue;
+        }
+        if (!starts_with(origin, "manual_")) {
+            if (!order_id.empty()) throw std::invalid_argument("Order ownership is unresolved; cancellation is blocked");
+            result["unresolved"] = result.at("unresolved").get<int>() + 1; continue;
+        }
+        if (!order.at("can_cancel").get<bool>()) {
+            result["already_pending"] = result.at("already_pending").get<int>() + 1; continue;
+        }
+        auto command = exact_cancel(order, accounts_);
+        try {
+            publish_trading_command(command, order.at("account_id").get<std::string>());
+            result["queued_commands"].push_back(command);
+        } catch (const std::exception& e) {
+            result["errors"].push_back(json{{"account_id", order.at("account_id")}, {"order_id", order.at("order_id")},
+                                            {"command_id", command.at("command_id")}, {"error", e.what()}});
+        }
+    }
+    if (!found) throw std::invalid_argument("Open order not found on the selected account");
+    return result;
+}
+
 void ControlCenter::publish_trading_command(const json& command, const std::string& key) {
     if (!sink_) throw std::runtime_error("Kafka producer is unavailable");
-    sink_->publish(normalize_trading_command(command), key);
+    const auto type = command.value("type", "");
+    bool cancellation = type == "CANCEL_ORDER";
+    json outgoing = normalize_trading_command(command);
+    if (cancellation && reporting_) {
+        if (!outgoing.contains("order_created_at")) for (const auto& order : reporting_->working_orders(accounts_)) {
+            if (order.at("account_id") == outgoing.at("account_id") && order.at("order_id") == outgoing.at("order_id")) {
+                outgoing["order_created_at"] = order.at("created_at"); break;
+            }
+        }
+        if (!reporting_->claim_cancel(outgoing)) return;
+    }
+    try {
+        sink_->publish(outgoing, key);
+        if (cancellation && reporting_) reporting_->cancel_dispatched(command, "queued");
+    } catch (...) {
+        if (cancellation && reporting_) reporting_->cancel_dispatched(command, "uncertain");
+        throw;
+    }
     if (operations_log_ == nullptr) return;
     notify_hub(kTopicCommands);
 }
@@ -331,7 +423,14 @@ void ControlCenter::publish_control_command(const json& command, const std::stri
     bool places_order = type == "LIMIT_ORDER" || type == "LIMIT_ORDER_FOK" || type == "MARKET_ORDER" || type == "DELAYED_MARKET_ORDER";
     std::lock_guard lock(algo_lock_);
     std::string account_id = json_to_string(json_find(command, "account_id")).value_or("");
-    if (places_order || type == "CURRENCY_CONVERSION" || starts_with(type, "CANCEL_")) {
+    if (starts_with(type, "CANCEL_")) {
+        if (type != "CANCEL_OPEN_ORDERS" && type != "CANCEL_ORDER") throw std::invalid_argument("Unsupported cancellation");
+        if (type == "CANCEL_ORDER" && command.value("order_id", "").empty()) throw std::invalid_argument("An exact broker order ID is required");
+        auto result = cancel_manual_orders({account_id}, command.value("symbol", ""), command.value("order_id", ""));
+        if (!result.at("errors").empty()) throw std::runtime_error("Some manual cancellations could not be queued; inspect working orders");
+        return;
+    }
+    if (places_order || type == "CURRENCY_CONVERSION") {
         if (owned_by_algorithm(account_id)) {
             throw std::invalid_argument(
                 "An algorithm session owns this account; stop it and await outstanding order confirmations first");
@@ -339,6 +438,7 @@ void ControlCenter::publish_control_command(const json& command, const std::stri
     }
     json normalized=normalize_trading_command(command);
     if (places_order) {
+        if (reporting_) reporting_->register_manual_command(normalized);
         for (auto* manager : smart_managers()) manager->track_external_order(normalized);
     }
     publish_trading_command(normalized, key);
