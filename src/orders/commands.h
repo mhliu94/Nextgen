@@ -56,6 +56,8 @@ struct BrokerOrdersMessages {
 std::string iso_utc_now();
 std::string i18n_format_account(const std::string& text, const std::string& account);
 std::string new_command_id(const std::string& prefix);
+// Round positive limit prices to the nearest configured tick; halfway rounds up.
+double nearest_tick_price(const json& price, const std::string& tick_size);
 
 // Pure builders.
 json build_market_order_command(const std::string& account_id, const std::string& symbol, const std::string& side,

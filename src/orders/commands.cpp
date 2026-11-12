@@ -5,6 +5,7 @@
 #include <set>
 
 #include "core/strings.h"
+#include "core/decimal.h"
 #include "core/time_util.h"
 #include "core/time_zone.h"
 
@@ -14,6 +15,23 @@ std::string iso_utc_now() { return ng::iso_utc_now(); }
 
 std::string new_command_id(const std::string& prefix) {
     return prefix + "_" + iso_utc_now() + "_" + std::to_string(epoch_micros());
+}
+
+double nearest_tick_price(const json& value, const std::string& tick_size) {
+    try {
+        if (value.is_boolean() || (!value.is_number() && !value.is_string()))
+            throw std::invalid_argument("Limit price must be a positive number");
+        Decimal price=value.is_string() ? Decimal::parse(value.get<std::string>()) :
+            value.is_number_float() ? Decimal::from_double(value.get<double>()) : Decimal::parse(value.dump());
+        Decimal tick=Decimal::parse(tick_size);
+        if (!price.is_positive() || !tick.is_positive()) throw std::invalid_argument("Limit price and tick size must be positive");
+        Decimal lower=price.round_down_to_step(tick);
+        Decimal rounded=(price-lower)*Decimal(2)>=tick ? lower+tick : lower;
+        if (!rounded.is_positive()) throw std::invalid_argument("Limit price rounds below the minimum configured tick");
+        return rounded.to_double();
+    } catch (const DecimalError&) {
+        throw std::invalid_argument("Limit price or tick size is invalid");
+    }
 }
 
 namespace {
@@ -286,10 +304,15 @@ Validated validate_limit_order_inputs(const std::string& account_id, const std::
     }
     if (!pct || *pct <= 0) return {std::nullopt, m.price_positive};
     if (!market_last || !std::isfinite(*market_last) || *market_last <= 0) return {std::nullopt, m.no_last_price};
-    double price = side == "BUY" ? *market_last * (1.0 + *pct / 100.0) : *market_last * (1.0 - *pct / 100.0);
+    double price;
+    try {
+        Decimal change=Decimal::from_double(*pct).scaleb(-2);
+        price=(Decimal::from_double(*market_last)*(side=="BUY" ? Decimal(1)+change : Decimal(1)-change)).to_double();
+    } catch (const DecimalError&) { return {std::nullopt,m.price_positive}; }
     if (!std::isfinite(price) || price <= 0) return {std::nullopt, m.price_positive};
-    double rounded = std::round(price * 10000.0) / 10000.0;
-    return {build_limit_order_command(account_id, sym, side, *shares, rounded, accounts), ""};
+    // The common publishing boundary applies the instrument's tick once. An
+    // intermediate four-decimal rounding could round twice near half a tick.
+    return {build_limit_order_command(account_id, sym, side, *shares, price, accounts), ""};
 }
 
 Validated validate_cancel_open_orders_inputs(const std::string& account_id, const std::optional<std::string>& symbol,

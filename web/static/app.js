@@ -765,6 +765,7 @@
       message.textContent = t("submitting");
       try {
         const result = await api(isLimit ? "/api/account-orders/limit" : "/api/account-orders/quick-market", { form: payload });
+        if (isLimit && price.value.trim() && result.limit_price != null) price.value = String(result.limit_price);
         message.className = "ok-msg";
         message.textContent = result.message || t("order_submitted");
         toast("ok", result.message || t("order_submitted"));

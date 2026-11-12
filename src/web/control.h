@@ -133,6 +133,7 @@ public:
     void publish_control_command(const json& command, const std::string& key);
     void publish_fast_trading_command(const json& command, const std::string& key);
     void publish_trading_command(const json& command, const std::string& key);
+    json normalize_trading_command(const json& command) const;
     // Serialize starts with global stop notifications and order handoffs. The shared session
     // coordinator also makes admission atomic for direct runtime starts across E/F/G/H.
     std::string start_fast_strategy(const json& command);

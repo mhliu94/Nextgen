@@ -77,7 +77,7 @@ TEST_CASE("limit order uses manual price or percent through market") {
     CHECK((*through_buy.command)["limit_price"] == 105.0);
     auto through_sell = validate_limit_order_inputs("A", "AAPL", "SELL", std::string("100"), std::nullopt, std::string("10"), 123.4567, dir, lm());
     REQUIRE(through_sell.ok());
-    CHECK((*through_sell.command)["limit_price"].get<double>() == doctest::Approx(111.111).epsilon(1e-9));
+    CHECK((*through_sell.command)["limit_price"].get<double>() == doctest::Approx(111.11103).epsilon(1e-9));
     CHECK(validate_limit_order_inputs("A", "AAPL", "BUY", std::string("100"), std::nullopt, std::string("5"), std::nullopt, dir, lm()).error == "no_last");
     CHECK(validate_limit_order_inputs("A", "AAPL", "BUY", std::string("100"), std::nullopt, std::nullopt, 100.0, dir, lm()).error == "price_positive");
     CHECK(validate_limit_order_inputs("A", "AAPL", "BUY", std::string("x"), std::string("1"), std::nullopt, 100.0, dir, lm()).error == "shares_positive");

@@ -488,7 +488,7 @@ void Server::start() {
             if (!seen_accounts.insert(trim(account_id)).second) return fail("Duplicate account IDs are not allowed");
             orders::Validated v = orders::validate_quick_order_inputs(account_id, symbol, side, dollars, last, control_.accounts(), quick_messages(lang));
             if (!v.ok()) return fail(v.error);
-            commands.push_back(*v.command);
+            commands.push_back(control_.normalize_trading_command(*v.command));
             ++published;
             if (first_id.empty()) first_id = v.command->at("command_id").get<std::string>();
         }
@@ -522,7 +522,7 @@ void Server::start() {
             orders::Validated v = orders::validate_limit_order_inputs(account_id, symbol, side, shares, limit_price, through, last,
                                                                       control_.accounts(), limit_messages(lang));
             if (!v.ok()) return fail(v.error);
-            commands.push_back(*v.command);
+            commands.push_back(control_.normalize_trading_command(*v.command));
             ++published;
             if (first_id.empty()) first_id = v.command->at("command_id").get<std::string>();
         }
@@ -563,7 +563,7 @@ void Server::start() {
             orders::Validated v = orders::validate_cancel_open_orders_inputs(account_id, symbol.empty() ? std::nullopt : std::optional(symbol),
                                                                              control_.accounts(), i18n::t(lang, "invalid_account"));
             if (!v.ok()) return fail(v.error);
-            commands.push_back(*v.command);
+            commands.push_back(control_.normalize_trading_command(*v.command));
             ++published;
             if (first_id.empty()) first_id = v.command->at("command_id").get<std::string>();
         }
@@ -618,7 +618,7 @@ void Server::start() {
             if (!seen_accounts.insert(trim(account_id)).second) return fail("Duplicate account IDs are not allowed");
             orders::Validated v = orders::validate_trading_status_inputs(account_id, enabled_raw, control_.accounts(), m);
             if (!v.ok()) return fail(v.error);
-            commands.push_back(*v.command);
+            commands.push_back(control_.normalize_trading_command(*v.command));
             ++published;
             if (first_id.empty()) first_id = v.command->at("command_id").get<std::string>();
         }
@@ -1028,6 +1028,7 @@ void Server::start() {
                 m.neither_shares_nor_dollars = m.shares_positive;
                 v = orders::validate_order_inputs(account_id, symbol, side, shares, std::nullopt, control_.accounts(), m);
             }
+            if (v.ok()) v.command=control_.normalize_trading_command(*v.command);
         } catch (const std::exception&) {
             api_error(res, i18n::t(lang, limit ? "price_positive" : "shares_positive"), 400);
             return;
@@ -1048,7 +1049,9 @@ void Server::start() {
             return;
         }
         std::string command_id = v.command->at("command_id").get<std::string>();
-        json_response(res, json{{"ok", true}, {"message", i18n::t(lang, "order_submitted") + ". " + i18n::t(lang, "published_cmd") + "=" + command_id}, {"command_id", command_id}});
+        json response{{"ok",true},{"message",i18n::t(lang,"order_submitted")+". "+i18n::t(lang,"published_cmd")+"="+command_id},{"command_id",command_id}};
+        if (limit) response["limit_price"]=v.command->at("limit_price");
+        json_response(res,response);
     };
     svr.Post("/api/account-orders/quick-market", [=, this](const Request& req, Response& res) { account_order(req, res, false); });
     svr.Post("/api/account-orders/limit", [=, this](const Request& req, Response& res) { account_order(req, res, true); });

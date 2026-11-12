@@ -288,9 +288,24 @@ bool ControlCenter::owned_by_algorithm(const std::string& account_id) const {
     return false;
 }
 
+json ControlCenter::normalize_trading_command(const json& command) const {
+    json normalized=command;
+    std::string type=json_to_string(json_find(command,"type")).value_or("");
+    if (type=="LIMIT_ORDER" || type=="LIMIT_ORDER_FOK") {
+        std::string side=to_upper(json_to_string(json_find(command,"side")).value_or(""));
+        if (side!="BUY" && side!="SELL") throw std::invalid_argument("Invalid order side");
+        std::string symbol=canonical_symbol(json_to_string(json_find(command,"symbol")).value_or(""));
+        const auto& settings=side=="BUY" ? config_.smart_buying : config_.smart_selling;
+        auto rules=settings.rules_for(symbol);
+        auto tick=rules.find("tick_size");
+        normalized["limit_price"]=orders::nearest_tick_price(command.at("limit_price"),tick==rules.end() ? "0.01" : tick->second);
+    }
+    return normalized;
+}
+
 void ControlCenter::publish_trading_command(const json& command, const std::string& key) {
     if (!sink_) throw std::runtime_error("Kafka producer is unavailable");
-    sink_->publish(command, key);
+    sink_->publish(normalize_trading_command(command), key);
     if (operations_log_ == nullptr) return;
     notify_hub(kTopicCommands);
 }
@@ -305,9 +320,10 @@ void ControlCenter::publish_fast_trading_command(const json& command, const std:
         if (manager->owns(account, symbol)) throw std::invalid_argument(
             "Cannot publish algorithm order: account " + account + " already has a Smart algorithm session on symbol " +
             symbol + "; all strategies on an account must use distinct symbols");
-        manager->track_external_order(command);
     }
-    publish_trading_command(command, key);
+    json normalized=normalize_trading_command(command);
+    for (auto* manager : smart_managers()) manager->track_external_order(normalized);
+    publish_trading_command(normalized, key);
 }
 
 void ControlCenter::publish_control_command(const json& command, const std::string& key) {
@@ -321,10 +337,11 @@ void ControlCenter::publish_control_command(const json& command, const std::stri
                 "An algorithm session owns this account; stop it and await outstanding order confirmations first");
         }
     }
+    json normalized=normalize_trading_command(command);
     if (places_order) {
-        for (auto* manager : smart_managers()) manager->track_external_order(command);
+        for (auto* manager : smart_managers()) manager->track_external_order(normalized);
     }
-    publish_trading_command(command, key);
+    publish_trading_command(normalized, key);
 }
 
 std::string ControlCenter::start_fast_strategy(const json& command) {

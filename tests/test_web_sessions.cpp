@@ -369,7 +369,7 @@ TEST_CASE_FIXTURE(SessionFixture, "a new start waits until the previous global s
 
 TEST_CASE_FIXTURE(SessionFixture, "algorithm order handoff bypasses the manual guard but not a stop") {
     control->start_fast_strategy(fast_command());
-    json command = {{"type", "LIMIT_ORDER_FOK"}, {"account_id", "A"}, {"symbol", "AAPL"}, {"command_id", "child-1"}};
+    json command = {{"type", "LIMIT_ORDER_FOK"}, {"account_id", "A"}, {"symbol", "AAPL"}, {"command_id", "child-1"}, {"side","BUY"}, {"qty_shares",100}, {"limit_price",10.0}};
     control->publish_fast_trading_command(command, "A");
     REQUIRE(sink->count() == 1);
     CHECK(sink->history()[0].command == command);
@@ -383,7 +383,7 @@ TEST_CASE_FIXTURE(SessionFixture, "algorithm order handoff bypasses the manual g
 TEST_CASE_FIXTURE(SessionFixture, "fast handoff proceeds while Smart shares the account on another symbol") {
     control->start_fast_strategy(fast_command());
     start_mode("G", "XYZ", {"A"});
-    json command = {{"type", "LIMIT_ORDER_FOK"}, {"account_id", "A"}, {"symbol", "AAPL"}, {"command_id", "child-1"}};
+    json command = {{"type", "LIMIT_ORDER_FOK"}, {"account_id", "A"}, {"symbol", "AAPL"}, {"command_id", "child-1"}, {"side","BUY"}, {"qty_shares",100}, {"limit_price",10.0}};
     control->publish_fast_trading_command(command, "A");
     REQUIRE(sink->count() == 1);
     CHECK(sink->history()[0].key == "A");
