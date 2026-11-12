@@ -316,6 +316,7 @@
   // `gate` names the bootstrap entitlement a page requires (the server enforces the same rules).
   const PAGES = [
     { id: "account-details", path: "/account-details", label: "nav_account" },
+    { id: "working-orders", path: "/working-orders", label: "wo_title" },
     { id: "control-panel", path: "/control-panel", label: "nav_control" },
     { id: "market-data", path: "/market-data", label: "nav_market", gate: "can_access_market_data", forbidden: "md_forbidden" },
     { id: "market-insights", path: "/market-insights", label: "nav_insights" },
@@ -1261,6 +1262,49 @@
   // ---- Market data (lmh only) -------------------------------------------------------------------
   // Five-minute windows of market volume, our own traded volume and an estimated VWAP for one
   // publisher symbol, plus the live quote table for every market-data symbol.
+  pages["working-orders"] = {
+    render(root) {
+      this.root = root; this.closed = false; this.pending = false;
+      root.append(h("div", {class:"page-head"}, h("h1", {class:"page-title",text:t("wo_title")})),
+        h("p", {class:"help",text:t("wo_note")}), h("div", {id:"wo-status",class:"warn",role:"status"}));
+      for (const group of ["manual", "algo", "unknown"]) root.append(
+        h("section", {class:"card",style:"margin-bottom:var(--gap)"},
+          h("h2", {class:"card-title",text:t("wo_"+group)}), h("div", {class:"table-scroll",id:"wo-"+group})));
+      this.poll(); this.timer = setInterval(() => this.poll(), 2000);
+    },
+    destroy() { this.closed = true; clearInterval(this.timer); },
+    async poll() {
+      if (this.pending || this.closed) return;
+      this.pending = true;
+      try {
+        const data = await api("/api/working-orders");
+        if (this.closed) return;
+        $("#wo-status",this.root).textContent = data.feed.state === "live" ? "" : t("wo_feed_wait");
+        for (const group of ["manual", "algo", "unknown"]) {
+          const rows = data.orders.filter(o => group === "manual" ? o.origin.startsWith("manual_") : o.origin === group);
+          const table = h("table", {class:"data"}, h("thead", null, h("tr", null,
+            ...["wo_account","symbol","wo_side","wo_quantity","wo_filled","wo_price","wo_state","wo_origin","wo_order_id","wo_action"].map(k=>h("th",{text:t(k)})))),
+            h("tbody", null, rows.map(o => {
+              const button = h("button", {class:"btn danger",disabled:!o.can_cancel,text:t("wo_cancel"),onclick:async()=>{
+                if (!(await confirmDialog(t("wo_confirm") + " " + o.account_id + " / " + o.order_id))) return;
+                button.disabled = true;
+                try { const result = await api("/api/orders/cancel",{json:{account_ids:[o.account_id],order_id:o.order_id}}); toast("info",result.message || t("wo_pending")); }
+                catch(e) { toast("err",e.message); }
+                this.poll();
+              }});
+              return h("tr", null, ...[o.account_id,o.symbol,o.side,fmt.qty(o.quantity),fmt.qty(o.filled_quantity),fmt.price(o.limit_price),
+                o.status + (o.cancel_state ? " / " + t("wo_pending") + " (" + o.cancel_state + ")" : ""),
+                o.session_label || t("wo_"+o.origin),o.order_id].map(value=>h("td",{text:value})),
+                h("td",null,group === "manual" ? button : "—"));
+            })));
+          if (!rows.length) table.append(h("caption",{text:t("wo_empty")}));
+          updateScrollableTable($("#wo-"+group,this.root),table);
+        }
+      } catch(e) { if (!this.closed) $("#wo-status",this.root).textContent=e.message; }
+      finally { this.pending = false; }
+    }
+  };
+
   pages["market-data"] = {
     render(root) {
       const symbols = state.boot.market_data_symbols || [];

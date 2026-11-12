@@ -703,7 +703,7 @@ void Server::start() {
 
     // --- static & pages ----------------------------------------------------------------------
     svr.Get("/", [=, this](const Request&, Response& res) { redirect(res, "/account-details", 302); });
-    for (const char* page : {"/account-details", "/control-panel", "/market-insights", "/trading-status", "/login"}) {
+    for (const char* page : {"/account-details", "/control-panel", "/market-insights", "/working-orders", "/trading-status", "/login"}) {
         svr.Get(page, [serve_app](const Request&, Response& res) { serve_app(res); });
     }
     // Admin Control and Market Data are only available to the lmh account: other signed-in users get

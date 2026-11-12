@@ -7,6 +7,11 @@ unresolved algorithm submission could explain them. Ambiguous ownership is shown
 separately and cannot be cancelled through manual controls. Exact command identity
 survives later status-only snapshots and process restarts.
 
+`/api/working-orders` supplies the admin application's Working orders tab. It uses
+the durable activity order projection, including prior-day GTC orders. Only
+nonterminal orders appear. Algorithm rows show the stable public session ID.
+Browser payload privacy filtering still applies.
+
 `POST /api/orders/cancel` accepts `account_ids`, optional `symbol`, and optional
 `order_id` for an individual order on exactly one account. `__ALL__` selects every
 visible configured account. The server selects confirmed manual orders and emits
