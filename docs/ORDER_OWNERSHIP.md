@@ -23,6 +23,13 @@ remains visible until terminal broker feedback; an acknowledgment is not a fill 
 a confirmed cancellation. Uncertain requests need reconciliation rather than a
 new cancellation ID.
 
+G/H cancellation intents use the current child's exact broker ID, including stop,
+deadline, and other engine cancellation reasons. They cannot sweep up manual
+orders. E/F stop cleanup scans only orders correlated to that session. It also
+handles broker acknowledgments arriving after the session ends. Ended-session
+cleanup continues on the control server's status loop after reconnection/replay.
+Other sessions' orders and manual orders are excluded.
+
 Broker rollout must precede activating this control-server build. Bosco,
 GigaMoney, Fangde and Star need the exact-cancellation dispatcher changes;
 Zhuorui needs strict exact-ID parsing and creation-day history lookup for older

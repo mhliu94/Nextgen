@@ -137,6 +137,7 @@ public:
     json working_orders() const;
     json cancel_manual_orders(const std::vector<std::string>& account_ids, const std::string& symbol = "",
                               const std::string& order_id = "");
+    void reconcile_session_cancellations();
     // Serialize starts with global stop notifications and order handoffs. The shared session
     // coordinator also makes admission atomic for direct runtime starts across E/F/G/H.
     std::string start_fast_strategy(const json& command);

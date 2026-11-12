@@ -75,6 +75,16 @@ TEST_CASE("unmatched algo submissions block ambiguous broker snapshots from manu
     CHECK(f.control->working_orders()["orders"][0]["origin"]=="algo");
 }
 
+TEST_CASE("ended-session cleanup handles late acknowledgements and never touches manual or other sessions") {
+    WebFixture f;session(f,"stopped","late-command","E");session(f,"other","other-command");
+    f.control->reporting()->end_session("stopped");live(f);
+    f.control->reconcile_session_cancellations();CHECK(f.sink->count()==0);
+    receive(f,ticket("late","A","late-command"));receive(f,ticket("other","A","other-command"));receive(f,ticket("manual","B"));
+    f.control->reconcile_session_cancellations();REQUIRE(f.sink->count()==1);
+    CHECK(f.sink->history()[0].command["order_id"]=="late");CHECK(f.sink->history()[0].command["parent_id"]=="stopped");
+    f.control->reconcile_session_cancellations();CHECK(f.sink->count()==1);
+}
+
 TEST_CASE("uncertain cancellation is visible and is not duplicated by retries or reopening") {
     WebFixture f;receive(f,ticket("manual"));live(f);f.sink->fail_next("transport uncertain");
     auto result=f.control->cancel_manual_orders({"A"});CHECK(result["errors"].size()==1);
@@ -88,4 +98,11 @@ TEST_CASE("disconnected order feed and invalid accounts never publish cancellati
     WebFixture f;receive(f,ticket("manual"));
     CHECK_THROWS(f.control->cancel_manual_orders({"A"}));live(f);
     CHECK_THROWS(f.control->cancel_manual_orders({"A","missing"}));CHECK(f.sink->count()==0);
+}
+
+TEST_CASE("Smart stop translation requires and uses the exact owned broker ID") {
+    WebFixture f;json action{{"type","cancel"},{"account_id","A"},{"symbol","TANH"},{"parent_id","session"},{"broker_order_id","owned"}};
+    auto cmd=ng::smart::build_smart_selling_command(action,f.control->accounts());
+    CHECK(cmd["type"]=="CANCEL_ORDER");CHECK(cmd["order_id"]=="owned");
+    action["broker_order_id"]=nullptr;CHECK_THROWS(ng::smart::build_smart_selling_command(action,f.control->accounts()));
 }

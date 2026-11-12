@@ -40,7 +40,12 @@ json build_smart_selling_command(const json& action, const AccountDirectory& acc
         command["ts"] = action.at("send_time");
         command["deadline"] = action.at("deadline");
     } else if (type == "cancel") {
+        const auto broker_id = json_to_string(json_find(action, "broker_order_id")).value_or("");
+        if (trim(broker_id).empty()) throw std::invalid_argument("Cancellation requires the session's broker order ID");
         command = orders::build_cancel_open_orders_command(account_id, accounts, symbol);
+        command["type"] = "CANCEL_ORDER";
+        command["order_id"] = broker_id;
+        command["order_reference"] = broker_id;
     } else {
         throw std::invalid_argument("Only submit/cancel intents translate to trading commands");
     }

@@ -481,7 +481,7 @@ TEST_CASE_FIXTURE(RuntimeFixture, "backend event signal defaults off and explici
     }
 }
 
-TEST_CASE_FIXTURE(RuntimeFixture, "portable existing limit then symbol cancel with reserved quantity") {
+TEST_CASE_FIXTURE(RuntimeFixture, "portable existing limit then exact-order cancel with reserved quantity") {
     json command = submit();
     CHECK(command["type"] == "LIMIT_ORDER");
     CHECK(command["broker"] == "AnyBroker");
@@ -495,7 +495,7 @@ TEST_CASE_FIXTURE(RuntimeFixture, "portable existing limit then symbol cancel wi
     runtime->tick();
     runtime->wait_idle();
     json cancel = published.back();
-    CHECK(cancel["type"] == "CANCEL_OPEN_ORDERS");
+    CHECK(cancel["type"] == "CANCEL_ORDER");
     CHECK(cancel["account_id"] == "A");
     CHECK(cancel["symbol"] == "XYZ");
     CHECK(engine->get_parent(parent_id)["reserved"] == "100");
@@ -538,7 +538,7 @@ TEST_CASE_FIXTURE(RuntimeFixture, "independent volume feed drives command and ha
     book();
     runtime->tick();
     runtime->wait_idle();
-    CHECK(published.back()["type"] == "CANCEL_OPEN_ORDERS");
+    CHECK(published.back()["type"] == "CANCEL_ORDER");
     CHECK(runtime->list_parents()[0]["market_state"] == "HALTED");
     CHECK(engine->get_parent(parent_id)["reserved"] == "100");
 }

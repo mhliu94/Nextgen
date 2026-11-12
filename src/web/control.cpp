@@ -242,6 +242,8 @@ void ControlCenter::start_background() {
     // mutations, so push them on a 1 Hz cadence (clients coalesce).
     status_thread_ = std::thread([this] {
         while (!stop_.load()) {
+            try { reconcile_session_cancellations(); }
+            catch (const std::exception& e) { NG_LOG_ERROR(kLog, "Session order cleanup pending: {}", e.what()); }
             if (++housekeeping_ticks % 60 == 0) malloc_trim(0);  // return freed arena pages to the OS once a minute
             notify_hub(kTopicSmart | kTopicAlgo | kTopicFeeds | kTopicCommands);
             for (int i = 0; i < 10 && !stop_.load(); ++i) std::this_thread::sleep_for(std::chrono::milliseconds(100));
@@ -376,6 +378,24 @@ json ControlCenter::cancel_manual_orders(const std::vector<std::string>& ids, co
     }
     if (!found) throw std::invalid_argument("Open order not found on the selected account");
     return result;
+}
+
+void ControlCenter::reconcile_session_cancellations() {
+    std::lock_guard lock(algo_lock_);
+    if (!reporting_ || !market_order_store_ || !sink_) return;
+    if (market_order_store_->feed_status().value("state", "") != "live") return;
+    for (const auto& order : reporting_->working_orders(accounts_)) {
+        if (order.at("origin") != "algo" || order.at("cancel_state") != "" || order.value("status", "") == "PENDING_CANCEL") continue;
+        bool fast_stopping = (order.at("session_mode") == "E" || order.at("session_mode") == "F") &&
+                             order.at("session_status") == "stopping";
+        if (!order.at("session_ended").get<bool>() && !fast_stopping) continue;
+        auto command = exact_cancel(order, accounts_);
+        command["parent_id"] = order.at("session_id");
+        command["trading_mode"] = order.at("session_mode");
+        try { publish_trading_command(command, order.at("account_id").get<std::string>()); }
+        catch (const std::exception& e) { NG_LOG_ERROR(kLog, "Session cancellation uncertain account={} order={}: {}",
+            order.at("account_id").get<std::string>(), order.at("order_id").get<std::string>(), e.what()); }
+    }
 }
 
 void ControlCenter::publish_trading_command(const json& command, const std::string& key) {
