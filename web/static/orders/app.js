@@ -361,7 +361,7 @@ function renderUnreconciled() {
     if (item.session_id) {
       const session = document.createElement("span");
       session.className = "secondary";
-      session.textContent = `${t("session_id")}: ${item.session_id}`;
+      session.textContent = `${t("session_id")}: ${item.display_id || item.session_id}`;
       identity.append(session);
     }
     cell(row, t(`unreconciled_reason_${item.reason}`), item.message || "", "detail wide", "reason");
@@ -418,7 +418,7 @@ function renderSessionList(sessions) {
   const status = el("algo-status").value;
   const query = el("algo-search").value.trim().toLowerCase();
   const matching = sessions.filter((session) => (!status || session.status === status) &&
-    (!query || [session.symbol, session.id, sessionMode(session), session.started_at,
+    (!query || [session.symbol, session.display_id, session.id, sessionMode(session), session.started_at,
       reportTime(session.started_at), session.ended_at, ...(session.account_ids || [])]
       .some((value) => value && String(value).toLowerCase().includes(query))));
   const pages = Math.max(1, Math.ceil(matching.length / algoPageSize));
@@ -443,14 +443,14 @@ function renderSessionList(sessions) {
     cell(row, sessionMode(session));
     cell(row, label(session.status));
     cell(row, (session.account_ids || []).join(", ") || "—", "", "session-accounts");
-    cell(row, session.id, "", "identifier");
+    cell(row, session.display_id || session.id, "", "identifier");
     const action = document.createElement("button");
     action.type = "button";
     action.className = "btn ghost sm session-select";
     action.dataset.algoSession = session.id;
     action.setAttribute("aria-pressed", String(isSelected));
     action.setAttribute("aria-controls", "algo-report");
-    action.setAttribute("aria-label", t("view_session", {id: session.id}));
+    action.setAttribute("aria-label", t("view_session", {id: session.display_id || session.id}));
     action.textContent = t(isSelected ? "selected_session" : "view_details");
     cell(row, "").append(action);
     body.append(row);
@@ -555,7 +555,7 @@ function renderReports() {
   const session = renderSessionList(sessions);
   el("algo-report").hidden = !session;
   if (session) {
-    reportSummary("algo-summary", [["symbol", session.symbol], ["status", label(session.status)], ["session_id", session.id], ["started_at", reportTime(session.started_at)], ["ended_at", reportTime(session.ended_at)], ["updated", reportTime(session.updated_at)], ["reason", session.reason]]);
+    reportSummary("algo-summary", [["symbol", session.symbol], ["status", label(session.status)], ["session_id", session.display_id || session.id], ["started_at", reportTime(session.started_at)], ["ended_at", reportTime(session.ended_at)], ["updated", reportTime(session.updated_at)], ["reason", session.reason]]);
     const parameters = document.createDocumentFragment();
     for (const [key, value] of Object.entries(session.parameters || {})) {
       const term = document.createElement("dt");

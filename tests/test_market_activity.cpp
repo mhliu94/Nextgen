@@ -254,6 +254,15 @@ TEST_CASE_FIXTURE(History, "conflicting sequences and identity changes are rejec
                          std::invalid_argument);
 }
 
+TEST_CASE_FIXTURE(History, "obsolete retained reports cannot poison the current own-volume window") {
+    const double created=START-86400;
+    REQUIRE(db->record_order(order(created+30,20,{.sequence=2,.created=created})));
+    CHECK_FALSE(db->record_order(order(created+10,5,{.sequence=0,.created=created})));
+    CHECK_FALSE(db->record_order(order(created+20,10,{.sequence=0,.created=created})));
+    CHECK_THROWS(db->record_order(order(created+20,10,{.sequence=0,.created=created,.symbol="OTHER"})));
+    REQUIRE(db->record_order(order(START+10,25,{.sequence=3,.created=created})));
+}
+
 TEST_CASE_FIXTURE(History, "equivalent numeric fills are deduplicated") {
     CHECK(db->record_order(order(START + 10, 10)));
     CHECK(db->record_order(order(START + 10, 10.0)) == false);

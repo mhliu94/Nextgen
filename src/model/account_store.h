@@ -19,6 +19,7 @@ public:
     using Listener = std::function<void()>;
 
     void upsert(AccountSnapshot snapshot);
+    void invalidate(const std::string& account_id);
     std::map<std::string, AccountSnapshot> get_all() const;
     std::optional<AccountSnapshot> get(const std::string& account_id) const;
     // Wall-clock time of the last Kafka update, if any.

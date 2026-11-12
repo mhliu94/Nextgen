@@ -4,6 +4,20 @@
 
 namespace ng {
 
+void AccountStore::invalidate(const std::string& account_id) {
+    {
+        std::unique_lock lock(mutex_);
+        auto it=accounts_.find(account_id);
+        if (it==accounts_.end()) return;
+        it->second.trading_enabled=false;
+        it->second.ts=std::nullopt;
+        ++version_;
+    }
+    std::vector<Listener> listeners;
+    { std::lock_guard lock(listeners_mutex_); listeners=listeners_; }
+    for (auto& listener:listeners) listener();
+}
+
 void AccountStore::upsert(AccountSnapshot snapshot) {
     {
         std::unique_lock lock(mutex_);

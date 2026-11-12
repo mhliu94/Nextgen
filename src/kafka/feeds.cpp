@@ -131,8 +131,30 @@ bool AccountDetailsConsumer::handle_payload(const json& payload, const std::stri
         return false;
     }
     if (!validate_snapshot(*snapshot, topic, partition, offset)) return false;
-    store_.upsert(std::move(*snapshot));
-    return true;
+    try {
+        if (!payload.contains("account_update_version")) {
+            if (payload.contains("message_type")) return false;
+            replicas_.erase(snapshot->account_id);
+            store_.upsert(std::move(*snapshot));
+            return true;
+        }
+        auto& replica=replicas_[snapshot->account_id];
+        json event=payload;
+        event["account_id"]=snapshot->account_id;
+        event["account_num_id"]=snapshot->account_num_id ? json(*snapshot->account_num_id) : json(nullptr);
+        auto state=replica.apply(event);
+        if (!state) {
+            if (replica.needs_snapshot()) store_.invalidate(snapshot->account_id);
+            return false;
+        }
+        auto complete=parse_snapshot_obj(*state);
+        if (!complete) return false;
+        store_.upsert(std::move(*complete));
+        return true;
+    } catch (const std::exception&) {
+        NG_LOG_WARN(kAccountLog,"Ignoring invalid account stream topic={} partition={} offset={}",topic,partition,offset);
+        return false;
+    }
 }
 
 bool AccountDetailsConsumer::validate_snapshot(AccountSnapshot& snap, const std::string& topic, int partition,

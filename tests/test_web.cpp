@@ -431,7 +431,8 @@ TEST_CASE("algorithm sessions share the server and block manual orders on their 
     std::string parent_id = smart["parent"]["parent_id"].get<std::string>();
     CHECK(smart["parent"]["quantity"] == "1000");
     CHECK(smart["parent"]["mode"] == "ultra");
-    CHECK(smart["parent"]["participation"] == "0.30");
+    CHECK_FALSE(smart["parent"].contains("participation"));
+    CHECK(f.control->smart_runtime()->list_parents()[0]["participation"] == "0.30");
     CHECK(smart["parent"]["disable_child_cap"] == true);
     CHECK(smart["parent"]["child_cap"].is_null());
     json status = body(c.Get("/api/smart-selling"));
@@ -471,7 +472,8 @@ TEST_CASE("authenticated same-origin API starts and stops mode H") {
     REQUIRE(created);
     CHECK(created->status == 200);
     json parent = body(created)["parent"];
-    CHECK(parent["participation"] == "0.08");
+    CHECK_FALSE(parent.contains("participation"));
+    CHECK(f.control->buying_runtime()->list_parents()[0]["participation"] == "0.08");
     CHECK(parent["trading_mode"] == "H");
     CHECK(parent["maximum_price"].is_null());
     CHECK(parent["accounts"]["A"]["cash_budget"] == "10000.0");

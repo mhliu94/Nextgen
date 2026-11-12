@@ -1,4 +1,5 @@
 #include "web/server.h"
+#include "core/public_payload.h"
 
 #include <httplib.h>
 #include <functional>
@@ -328,10 +329,10 @@ void Server::start() {
     auto current_user = [this](const Request& req) -> std::optional<std::string> {
         return sessions_.user_for(cookie_value(req, kAuthCookie));
     };
-    auto json_response = [](Response& res, const json& payload, int status = 200) {
+    auto json_response = [this](Response& res, const json& payload, int status = 200) {
         res.status = status;
         res.set_header("Cache-Control", "no-store");
-        res.set_content(json_dump_compact(payload), kJson);
+        res.set_content(json_dump_compact(control_.browser_payload(payload)), kJson);
     };
     auto text_response = [](Response& res, const std::shared_ptr<const std::string>& payload) {
         res.status = 200;
@@ -479,14 +480,26 @@ void Server::start() {
         if (dollars.empty()) dollars = "10000";
         if (account_ids.empty()) return fail(i18n::t(lang, "quick_pick_account"));
         std::optional<double> last = control_.market_last(symbol);
+        std::vector<json> commands;
+        std::set<std::string> seen_accounts;
         int published = 0;
         std::string first_id;
         for (const auto& account_id : account_ids) {
+            if (!seen_accounts.insert(trim(account_id)).second) return fail("Duplicate account IDs are not allowed");
             orders::Validated v = orders::validate_quick_order_inputs(account_id, symbol, side, dollars, last, control_.accounts(), quick_messages(lang));
             if (!v.ok()) return fail(v.error);
-            control_.publish_control_command(*v.command, account_id);
+            commands.push_back(*v.command);
             ++published;
             if (first_id.empty()) first_id = v.command->at("command_id").get<std::string>();
+        }
+        json queued=json::array();
+        for (const auto& command:commands) {
+            try { control_.publish_control_command(command,command.at("account_id").get<std::string>()); }
+            catch (const std::exception&) {
+                return Outcome{false,"Batch publication interrupted; inspect queued and uncertain command IDs before retrying",
+                    {{"queued_commands",queued},{"uncertain_command",command},{"requested_count",commands.size()}},503};
+            }
+            queued.push_back(command);
         }
         return Outcome{true, i18n::t(lang, "quick_submitted") + " " + std::to_string(published) + ". " + i18n::t(lang, "published_cmd") + "=" + first_id};
     };
@@ -500,15 +513,27 @@ void Server::start() {
         if (account_ids.empty()) return fail(i18n::t(lang, "quick_pick_account"));
         std::optional<double> last;
         if (!limit_price || trim(*limit_price).empty()) last = control_.market_last(symbol);
+        std::vector<json> commands;
+        std::set<std::string> seen_accounts;
         int published = 0;
         std::string first_id;
         for (const auto& account_id : account_ids) {
+            if (!seen_accounts.insert(trim(account_id)).second) return fail("Duplicate account IDs are not allowed");
             orders::Validated v = orders::validate_limit_order_inputs(account_id, symbol, side, shares, limit_price, through, last,
                                                                       control_.accounts(), limit_messages(lang));
             if (!v.ok()) return fail(v.error);
-            control_.publish_control_command(*v.command, account_id);
+            commands.push_back(*v.command);
             ++published;
             if (first_id.empty()) first_id = v.command->at("command_id").get<std::string>();
+        }
+        json queued=json::array();
+        for (const auto& command:commands) {
+            try { control_.publish_control_command(command,command.at("account_id").get<std::string>()); }
+            catch (const std::exception&) {
+                return Outcome{false,"Batch publication interrupted; inspect queued and uncertain command IDs before retrying",
+                    {{"queued_commands",queued},{"uncertain_command",command},{"requested_count",commands.size()}},503};
+            }
+            queued.push_back(command);
         }
         return Outcome{true, i18n::t(lang, "limit_submitted") + " " + std::to_string(published) + ". " + i18n::t(lang, "published_cmd") + "=" + first_id};
     };
@@ -529,15 +554,27 @@ void Server::start() {
             }
         }
         if (account_ids.empty()) return fail(i18n::t(lang, "quick_pick_account"));
+        std::vector<json> commands;
+        std::set<std::string> seen_accounts;
         int published = 0;
         std::string first_id;
         for (const auto& account_id : account_ids) {
+            if (!seen_accounts.insert(trim(account_id)).second) return fail("Duplicate account IDs are not allowed");
             orders::Validated v = orders::validate_cancel_open_orders_inputs(account_id, symbol.empty() ? std::nullopt : std::optional(symbol),
                                                                              control_.accounts(), i18n::t(lang, "invalid_account"));
             if (!v.ok()) return fail(v.error);
-            control_.publish_control_command(*v.command, account_id);
+            commands.push_back(*v.command);
             ++published;
             if (first_id.empty()) first_id = v.command->at("command_id").get<std::string>();
+        }
+        json queued=json::array();
+        for (const auto& command:commands) {
+            try { control_.publish_control_command(command,command.at("account_id").get<std::string>()); }
+            catch (const std::exception&) {
+                return Outcome{false,"Batch publication interrupted; inspect queued and uncertain command IDs before retrying",
+                    {{"queued_commands",queued},{"uncertain_command",command},{"requested_count",commands.size()}},503};
+            }
+            queued.push_back(command);
         }
         return Outcome{true, i18n::t(lang, "cancel_orders_submitted") + " " + std::to_string(published) + ". " + i18n::t(lang, "published_cmd") + "=" + first_id};
     };
@@ -573,14 +610,26 @@ void Server::start() {
             return ids;
         }() : std::vector<std::string>{in.str_or("account_id", "")};
         orders::TradingStatusMessages m{i18n::t(lang, "invalid_account"), i18n::t(lang, "invalid_trading_status")};
+        std::vector<json> commands;
+        std::set<std::string> seen_accounts;
         int published = 0;
         std::string first_id;
         for (const auto& account_id : account_ids) {
+            if (!seen_accounts.insert(trim(account_id)).second) return fail("Duplicate account IDs are not allowed");
             orders::Validated v = orders::validate_trading_status_inputs(account_id, enabled_raw, control_.accounts(), m);
             if (!v.ok()) return fail(v.error);
-            control_.publish_control_command(*v.command, v.command->value("account_id", std::string("SET_TRADING_ENABLED")));
+            commands.push_back(*v.command);
             ++published;
             if (first_id.empty()) first_id = v.command->at("command_id").get<std::string>();
+        }
+        json queued=json::array();
+        for (const auto& command:commands) {
+            try { control_.publish_control_command(command,command.at("account_id").get<std::string>()); }
+            catch (const std::exception&) {
+                return Outcome{false,"Batch publication interrupted; inspect queued and uncertain command IDs before retrying",
+                    {{"queued_commands",queued},{"uncertain_command",command},{"requested_count",commands.size()}},503};
+            }
+            queued.push_back(command);
         }
         return Outcome{true, i18n::t(lang, disable_all ? "trading_disabled_all" : "trading_status_submitted") + " " + std::to_string(published) + ". " +
                                  i18n::t(lang, "published_cmd") + "=" + first_id};
@@ -620,7 +669,10 @@ void Server::start() {
     // Convert an Outcome into a JSON response.
     auto respond = [=, this](Response& res, const Outcome& outcome, int error_status = 400) {
         if (!outcome.ok) {
-            api_error(res, outcome.message, outcome.status != 400 ? outcome.status : error_status);
+            json out=outcome.extra;
+            out["ok"]=false;
+            out["error"]=outcome.message;
+            json_response(res,out,outcome.status != 400 ? outcome.status : error_status);
             return;
         }
         json out = outcome.extra;

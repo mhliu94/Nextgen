@@ -251,6 +251,20 @@ bool MarketActivity::record_order(const orders::OrderEvent& event) {
     db_->begin_immediate();
     try {
         bool duplicate = false;
+        // A retained baseline already covers older reports outside the analytics
+        // window. Replaying those obsolete versions must not make today's own
+        // volume incomplete (legacy publishers sometimes restarted sequence 0).
+        if (event.updated_at < clock_() - kHistorySeconds) {
+            Statement baseline(*db_, "SELECT sequence,created,updated,symbol,side FROM market_order_samples "
+                                     "WHERE account_id=? AND order_id=? ORDER BY sequence DESC LIMIT 1");
+            baseline.bind(1,account_id).bind(2,order_id);
+            if (baseline.step() && baseline.column_int(0) > sequence &&
+                baseline.column_double(1) == event.created_at && baseline.column_double(2) >= event.updated_at &&
+                baseline.column_text(3) == symbol && baseline.column_text(4) == side) {
+                db_->commit();
+                return false;
+            }
+        }
         {
             Statement existing(*db_, "SELECT created,updated,symbol,side,filled FROM market_order_samples "
                                      "WHERE account_id=? AND order_id=? AND sequence=?");

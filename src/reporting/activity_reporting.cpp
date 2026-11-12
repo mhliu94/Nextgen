@@ -173,7 +173,21 @@ ActivityReporting::ActivityReporting(const std::string& db_path, Clock now) {
         );
         CREATE UNIQUE INDEX IF NOT EXISTS activity_one_active_tag
             ON activity_tags((1)) WHERE stopped_at IS NULL;
+        CREATE TABLE IF NOT EXISTS activity_session_ids (
+            sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id TEXT NOT NULL UNIQUE
+        );
     )SQL");
+    // Backfill before accepting new starts. A second process sees the same
+    // durable mapping; reopening the DB never consumes additional numbers.
+    db_->begin_immediate();
+    try {
+        db_->exec("INSERT INTO activity_session_ids(session_id) "
+                  "SELECT id FROM activity_sessions WHERE NOT EXISTS "
+                  "(SELECT 1 FROM activity_session_ids WHERE session_id=activity_sessions.id) "
+                  "ORDER BY julianday(started_at),started_at,id");
+        db_->commit();
+    } catch (...) { db_->rollback();throw; }
 }
 
 ActivityReporting::~ActivityReporting() { close(); }
@@ -232,7 +246,27 @@ void ActivityReporting::start_session(const std::string& session_id, const json&
         insert.bind(1, session_id).bind(2, json_dump_compact(parameters)).bind(3, json_dump_compact(accounts));
         insert.bind(4, started).bind(5, now).bind(6, "running");
         insert.exec();
+        Statement label(*db_, "INSERT INTO activity_session_ids(session_id) SELECT ? "
+                              "WHERE NOT EXISTS (SELECT 1 FROM activity_session_ids WHERE session_id=?)");
+        label.bind(1,session_id).bind(2,session_id);label.exec();
     });
+}
+
+std::map<std::string,std::string> ActivityReporting::session_labels() {
+    std::lock_guard lock(mutex_);
+    if (!db_) throw std::runtime_error("activity reporting is closed");
+    std::map<std::string,std::string> labels;
+    Statement rows(*db_,"SELECT s.id,s.parameters,n.sequence FROM activity_sessions s "
+                        "JOIN activity_session_ids n ON n.session_id=s.id");
+    while(rows.step()) {
+        auto parameters=json::parse(rows.column_text(1),nullptr,false);
+        if (!parameters.is_object()) continue;
+        auto symbol=to_upper(trim(json_to_string(json_find(parameters,"symbol")).value_or("")));
+        auto mode=to_upper(trim(json_to_string(json_find(parameters,"trading_mode")).value_or("")));
+        if (symbol.empty() || mode.size()!=1 || std::string("EFGH").find(mode)==std::string::npos) continue;
+        labels[rows.column_text(0)]=symbol+"-"+mode+"-"+std::to_string(rows.column_int(2));
+    }
+    return labels;
 }
 
 void ActivityReporting::heartbeat_session(const std::string& session_id, const std::string& status) {
@@ -509,6 +543,7 @@ json ActivityReporting::snapshot(const AccountDirectory& accounts) {
         db_->rollback();
     }
     double now = now_();
+    auto labels=session_labels();
     json session_reports = json::array();
     for (const SessionRow& session : sessions) {
         json all_accounts = json::parse(session.account_ids, nullptr, false);
@@ -521,6 +556,7 @@ json ActivityReporting::snapshot(const AccountDirectory& accounts) {
         if (selected.empty()) continue;
         json report;
         report["id"] = session.id;
+        if (auto label=labels.find(session.id);label!=labels.end()) report["display_id"]=label->second;
         json parameters = json::parse(session.parameters, nullptr, false);
         report["parameters"] = parameters.is_discarded() ? json::object() : parameters;
         report["account_ids"] = selected;

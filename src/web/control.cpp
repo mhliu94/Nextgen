@@ -1,5 +1,6 @@
 #include <malloc.h>
 #include "web/control.h"
+#include "core/public_payload.h"
 
 #include <algorithm>
 #include <chrono>
@@ -410,6 +411,12 @@ void ControlCenter::notify_hub(unsigned topics, const std::string& symbol) {
     hub_.notify(topics, symbol);
 }
 
+json ControlCenter::browser_payload(const json& payload) const {
+    auto out=public_payload(payload);
+    if (reporting_) label_sessions(out,reporting_->session_labels());
+    return out;
+}
+
 std::shared_ptr<const std::string> ControlCenter::cached_text(const std::string& name, std::uint64_t key,
                                                               const std::function<json()>& build) const {
     {
@@ -417,7 +424,7 @@ std::shared_ptr<const std::string> ControlCenter::cached_text(const std::string&
         auto it = text_cache_.find(name);
         if (it != text_cache_.end() && it->second.first == key) return it->second.second;
     }
-    auto text = std::make_shared<const std::string>(json_dump_compact(build()));
+    auto text = std::make_shared<const std::string>(json_dump_compact(browser_payload(build())));
     std::lock_guard lock(text_cache_mutex_);
     if (text_cache_.size() > 512) text_cache_.clear();
     text_cache_[name] = {key, text};

@@ -1,4 +1,5 @@
 #include "order_ui/server.h"
+#include "core/public_payload.h"
 
 #include <httplib.h>
 
@@ -38,7 +39,7 @@ void fail(httplib::Response& res, int status, const std::string& detail) {
 
 void respond(httplib::Response& res, const json& payload, int status = 200) {
     res.status = status;
-    res.set_content(json_dump_compact(payload), kJson);
+    res.set_content(json_dump_compact(public_payload(payload)), kJson);
 }
 
 // A JSON object body whose string fields respect the given length limits; nullopt otherwise (422).
@@ -57,20 +58,7 @@ std::optional<json> validated_body(const httplib::Request& req, std::initializer
 }  // namespace
 
 json public_algo_parameters(const json& value) {
-    if (value.is_object()) {
-        json out = json::object();
-        for (auto it = value.begin(); it != value.end(); ++it) {
-            if (it.key() == "participation" || it.key() == "participation_percentage" || it.key() == "participation_percentages") continue;
-            out[it.key()] = public_algo_parameters(it.value());
-        }
-        return out;
-    }
-    if (value.is_array()) {
-        json out = json::array();
-        for (const auto& item : value) out.push_back(public_algo_parameters(item));
-        return out;
-    }
-    return value;
+    return public_payload(value);
 }
 
 struct OrderServer::Impl {
@@ -135,6 +123,7 @@ json OrderServer::orders_payload(const std::string& username) {
     for (const AccountMeta* meta : config_.accounts.by_num_id()) {
         snapshot["accounts"].push_back(json{{"id", meta->id}, {"num_id", meta->num_id}, {"broker", meta->broker}});
     }
+    label_sessions(snapshot,reporting_.session_labels());
     return snapshot;
 }
 

@@ -126,6 +126,7 @@ public:
 
     // Snapshots restricted to configured accounts (get_served_snapshots).
     std::map<std::string, AccountSnapshot> served_snapshots() const;
+    json browser_payload(const json& payload) const;
     std::optional<double> market_last(const std::string& symbol) const;
 
     // Publishing paths (webserver._publish_*). Throw std::invalid_argument / std::runtime_error.

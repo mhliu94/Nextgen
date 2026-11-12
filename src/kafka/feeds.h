@@ -14,6 +14,7 @@
 #include "core/json.h"
 #include "kafka/kafka_client.h"
 #include "model/account.h"
+#include "model/account_delta.h"
 #include "model/account_store.h"
 #include "model/market_data.h"
 
@@ -58,6 +59,7 @@ private:
     KafkaConfig kafka_;
     AccountStore& store_;
     const AccountDirectory& accounts_;
+    std::map<std::string, AccountReplica> replicas_;
     std::unique_ptr<Consumer> consumer_;
     std::thread thread_;
     std::atomic<bool> stop_{false};

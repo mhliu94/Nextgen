@@ -38,7 +38,7 @@ const account = {account_id: "A", account_num_id: 1, broker: "Tiger", shares_bou
     cash_change: 125, complete: true, average_buy_price: 17.5, average_sell_price: 37.5},
     HKD: {shares_bought: 0, shares_sold: 1, buy_cost: 0, sell_proceeds: 200.126,
       cash_change: 200.126, complete: true, average_buy_price: null, average_sell_price: 200.126}}};
-const sessions = Array.from({length: 25}, (_, i) => ({id: "session-" + i,
+const sessions = Array.from({length: 25}, (_, i) => ({id: "session-" + i, display_id: (i === 24 ? "BIYA" : "TANH") + "-G-" + (i + 1),
   symbol: i === 24 ? "BIYA" : "TANH", account_ids: ["A"],
   parameters: {trading_mode: "G", minimum_price: 38, account_ids: ["A"]},
   status: i === 0 ? "running" : "stopped", running: i === 0,
@@ -62,18 +62,19 @@ run(async () => {
   const search = value => { get("algo-search").value = value; get("algo-search").dispatchEvent(new Event("input")); };
   get("tab-algo").click();
   check(rows().length === 10, "Expected ten sessions on first page");
+  check(rows()[0].textContent.includes("TANH-G-1"), "Public session ID missing in order UI");
   check(get("algo-previous").disabled && !get("algo-next").disabled, "Incorrect first-page controls");
   check(get("algo-page").textContent.includes("1") && get("algo-page").textContent.includes("3"), "Page count incorrect");
   get("algo-next").click();
-  check(rows().length === 10 && rows()[0].textContent.includes("session-10"), "Second page incorrect");
+  check(rows().length === 10 && rows()[0].textContent.includes("TANH-G-11"), "Second page incorrect");
   rows()[4].querySelector("button").click();
   await refresh();
-  check(get("algo-summary").textContent.includes("session-14"), "Selection lost after polling");
+  check(get("algo-summary").textContent.includes("TANH-G-15"), "Selection lost after polling");
   get("algo-next").click();
   check(rows().length === 5 && get("algo-next").disabled, "Last page incorrect");
   check(!get("algo-rows").querySelector("img"), "Session ID interpreted as HTML");
   search("BIYA");
-  check(rows().length === 1 && get("algo-summary").textContent.includes("session-24"), "Session search failed");
+  check(rows().length === 1 && get("algo-summary").textContent.includes("BIYA-G-25"), "Session search failed");
   search("nothing-matches");
   check(rows().length === 0 && !get("algo-empty").hidden && get("algo-report").hidden, "Empty search state failed");
   search("");
@@ -121,7 +122,7 @@ window.EventSource = class {
   addEventListener(name, fn) { listeners[name] = fn; }
   close() {}
 };
-const parent = {parent_id: "parent-1", account_id: "A", account_ids: ["A", "B", "C"], symbol: "TANH",
+const parent = {parent_id: "parent-1", display_id: "TANH-G-11", account_id: "A", account_ids: ["A", "B", "C"], symbol: "TANH",
   active: true, state: "RUNNING", reason: "earning volume credit", market_state: "TRADING", market_reason: "",
   quantity: "10000", filled: "123", remaining: "9877", reserved: "0", free_credit: "80", mode: "urgent",
   participation: "0.2", child_cap: "100", start: new Date().toISOString(), accounts: {}, minimum_price: "38"};
@@ -157,6 +158,9 @@ run(async () => {
   check(scroll.scrollLeft === 0, "Cannot scroll back to first column");
   document.querySelector('#nav a[href="/control-panel"]').click();
   await until(() => document.querySelector("#smart-status-table"), "Algo table did not load");
+  check(!document.body.textContent.includes("20.00%"), "Proprietary participation rate was rendered");
+  check(!document.body.textContent.includes("smart_participation"), "Participation label was rendered");
+  check(document.body.textContent.includes("TANH-G-11"), "Public session ID missing in admin UI");
   for (const [mode, category] of [["e", "buying"], ["f", "selling"], ["g", "selling"], ["h", "buying"]])
     check(document.querySelector("#algo-mode-" + mode).nextSibling.querySelector("small").dataset.algoCategory === category,
       "Incorrect algorithm category for mode " + mode);

@@ -57,6 +57,8 @@ public:
     std::map<std::pair<std::string, std::string>, json> order_tags(const std::vector<json>& orders);
     // Session and tag reports restricted to the given (visible) accounts.
     json snapshot(const AccountDirectory& accounts);
+    // Stable public labels, backed by one global AUTOINCREMENT sequence.
+    std::map<std::string, std::string> session_labels();
 
 private:
     template <typename Fn>

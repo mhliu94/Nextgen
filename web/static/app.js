@@ -1040,7 +1040,7 @@
               h("div", { class: "status-meta" }, t("algo_running_since") + " " + fmt.clock(s.started_at) + " · " + t("algo_cycles") + " " + s.cycles + " · " + t("algo_published") + " " + s.published_commands + " · " + t("fast_accounts") + ": " + (cmd.fast_trading_account_ids || []).join(", ")),
               h("div", { class: "status-meta" }, t("fast_cycle_result") + ": " + (cycle.reason ? algoReason(cycle.reason) : (cycle.commands ? cycle.commands + " cmd" : "—")) + (cycle.limit_price ? " @" + fmt.price(cycle.limit_price) : "") + (cycle.total_resting_qty ? " · " + t("fast_target_percentage").split(" (")[0] + " " + fmt.int(cycle.target_quantity) + "/" + fmt.int(cycle.total_resting_qty) : "")),
               position,
-              h("div", { class: "status-meta faint mono", text: t("fast_session_id") + ": " + (s.session_id || "") })));
+              h("div", { class: "status-meta faint mono", text: t("fast_session_id") + ": " + (s.display_id || s.session_id || "") })));
         }));
       }
     }
@@ -1060,10 +1060,10 @@
       root.replaceChildren(summaries, scroll);
     }
     const active = parents.filter((p) => p.active);
-    const signature = JSON.stringify([state.lang, active.map((p) => [p.parent_id, p.symbol, p.state, p.reason, p.market_state, p.market_reason])]);
+    const signature = JSON.stringify([state.lang, active.map((p) => [p.parent_id, p.display_id, p.symbol, p.state, p.reason, p.market_state, p.market_reason])]);
     if (summaries.dataset.signature !== signature) {
       summaries.replaceChildren(...active.map((p) => h("div", { class: "smart-session-summary", dataset: { parentId: p.parent_id } },
-        h("div", { class: "status-title" }, p.symbol, " · ", smartStateLabel(p.state)),
+        h("div", { class: "status-title" }, p.display_id || p.symbol, " · ", smartStateLabel(p.state)),
         h("div", { class: "status-meta", text: [algoReason(p.reason), p.market_state !== "TRADING" ? p.market_reason : ""].filter(Boolean).join(" · ") }))));
       summaries.dataset.signature = signature;
     }
@@ -1091,7 +1091,8 @@
         return text;
       }).join(", ");
       const details = h("details", { dataset: { parentId: p.parent_id } }, h("summary", { text: t("details") }), h("dl", { class: "kv" },
-        h("dt", { text: t("smart_mode") }), h("dd", { text: t("smart_" + p.mode) + " · " + t("smart_participation") + " " + (Number(p.participation) * 100).toFixed(2) + "%" }),
+        h("dt", { text: t("fast_session_id") }), h("dd", { class:"mono", text:p.display_id || p.parent_id }),
+        h("dt", { text: t("smart_mode") }), h("dd", { text: t("smart_" + p.mode) }),
         h("dt", { text: t("smart_credit") }), h("dd", { text: fmt.decimal(p.free_credit) }),
         buying ? null : [h("dt", { text: t("smart_child_cap") }), h("dd", { text: p.disable_child_cap ? t("smart_child_cap_disabled") : fmt.decimal(p.child_cap) })],
         h("dt", { text: t("smart_started_at") }), h("dd", { text: fmt.time(p.start) }),
@@ -1163,8 +1164,8 @@
         const config = { price_limit: priceLimit, account_ids: accountIds, book_levels: Number(levels.value()), target_percentage: Number(target.value()), cycle_seconds: Number(cycle.value()), test_mode: testMode.checked };
         if (targetText) config.total_target_position = Number(targetText);
         const result = await api("/api/submit-algo", { json: { trading_mode: mode, symbol, fast_trading_config: config } });
-        msgEl.textContent = t("algo_submitted") + " " + result.strategy_key + ". " + t("published_cmd") + "=" + result.command.command_id;
-        toast("ok", t("algo_submitted") + " " + result.strategy_key);
+        msgEl.textContent = t("algo_submitted") + " " + (result.display_id || result.strategy_key) + ". " + t("published_cmd") + "=" + result.command.command_id;
+        toast("ok", t("algo_submitted") + " " + (result.display_id || result.strategy_key));
         closeModal();
         refreshAlgo();
       } catch (err) {
