@@ -121,6 +121,8 @@ public:
     std::string start_strategy(const json& start_command);
     // Stops every running session for this mode and symbol.
     int stop_strategy(const std::string& trading_mode, const std::string& symbol);
+    // Stops one durable session ID, never every session sharing a mode/ticker.
+    int stop_session(const std::string& session_id);
     int stop_matching(const std::string& trading_mode, const std::vector<std::string>& account_ids);
     int stop_all();
     // Runs one cycle for `command` (publishing unless test mode); exposed for tests and status.

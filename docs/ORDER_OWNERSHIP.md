@@ -42,8 +42,15 @@ operation and before publication. G/H additionally retain their stricter configu
 account-age checks. Account ownership remains reserved against manual UI entry
 while confirmed algorithm orders remain open.
 
+The Algo / 算法 tab sits beside Trading and is available to every authenticated
+user. It lists only active sessions across E/F/G/H, including paused and stopping
+sessions; concluded sessions stay in the order UI reports. Individual stops target
+the durable session ID (including E/F sessions sharing a ticker), and are available
+to every authenticated user. Initial sell inventory and
+per-account initial quantities/costs are omitted from the active-session display.
+
 Broker rollout must precede activating this control-server build. Bosco,
 GigaMoney, Fangde and Star need the exact-cancellation dispatcher changes;
 Zhuorui needs strict exact-ID parsing and creation-day history lookup for older
-orders. Bitget already supports exact-ID cancellation. Do not restart the admin
-service until the operator releases the current hold. BOSCO-WJY stays stopped.
+orders. Bitget already supports exact-ID cancellation. Use an operator-authorized
+restart window. BOSCO-WJY stays stopped until the operator explicitly requests it.

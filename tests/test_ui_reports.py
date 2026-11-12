@@ -157,13 +157,14 @@ run(async () => {
   scroll.scrollLeft = 0;
   check(scroll.scrollLeft === 0, "Cannot scroll back to first column");
   document.querySelector('#nav a[href="/control-panel"]').click();
+  for (const [mode, category] of [["e", "buying"], ["f", "selling"], ["g", "selling"], ["h", "buying"]])
+    check(document.querySelector("#algo-mode-" + mode).nextSibling.querySelector("small").dataset.algoCategory === category,
+      "Incorrect algorithm category for mode " + mode);
+  document.querySelector('#nav a[href="/algo"]').click();
   await until(() => document.querySelector("#smart-status-table"), "Algo table did not load");
   check(!document.body.textContent.includes("20.00%"), "Proprietary participation rate was rendered");
   check(!document.body.textContent.includes("smart_participation"), "Participation label was rendered");
   check(document.body.textContent.includes("TANH-G-11"), "Public session ID missing in admin UI");
-  for (const [mode, category] of [["e", "buying"], ["f", "selling"], ["g", "selling"], ["h", "buying"]])
-    check(document.querySelector("#algo-mode-" + mode).nextSibling.querySelector("small").dataset.algoCategory === category,
-      "Incorrect algorithm category for mode " + mode);
   scroll = document.querySelector("#smart-status .table-scroll");
   check(scroll.scrollWidth > scroll.clientWidth, "Algo table has no mobile scroll area");
   const details = scroll.querySelector("details");

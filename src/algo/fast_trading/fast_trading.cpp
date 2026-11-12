@@ -639,6 +639,10 @@ int StrategyManager::stop_all() {
     return stop_sessions(session_ids, kStopReasonManual);
 }
 
+int StrategyManager::stop_session(const std::string& session_id) {
+    return stop_sessions({session_id}, kStopReasonManual);
+}
+
 void StrategyManager::request_stop(Strategy& strategy) {
     {
         std::lock_guard lock(strategy.wait_mutex);

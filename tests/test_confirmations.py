@@ -87,6 +87,7 @@ window.addEventListener("load", async () => {
     check(!modal(), "Confirmed modal stayed open");
     check(reason.closest("form").textContent.includes("Request accepted"), "Stop result was not shown");
 
+    document.querySelector('#nav a[href="/control-panel"]').click();
     document.querySelector("#cancel-open-orders-form button[type=submit]").click();
     check(modal() && requests.length === 1, "Cancel-all bypassed confirmation");
     document.querySelector(".modal-actions .red").click();
@@ -161,7 +162,7 @@ def run_browser(browser, harness, static=None, path="/control-panel", width=1280
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--browser", required=True, help="Chromium or Chrome executable")
-    return run_browser(parser.parse_args().browser, HARNESS)
+    return run_browser(parser.parse_args().browser, HARNESS, path="/algo")
 
 
 if __name__ == "__main__":

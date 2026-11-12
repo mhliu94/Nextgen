@@ -703,7 +703,7 @@ void Server::start() {
 
     // --- static & pages ----------------------------------------------------------------------
     svr.Get("/", [=, this](const Request&, Response& res) { redirect(res, "/account-details", 302); });
-    for (const char* page : {"/account-details", "/control-panel", "/market-insights", "/working-orders", "/trading-status", "/login"}) {
+    for (const char* page : {"/account-details", "/control-panel", "/algo", "/market-insights", "/working-orders", "/trading-status", "/login"}) {
         svr.Get(page, [serve_app](const Request&, Response& res) { serve_app(res); });
     }
     // Admin Control and Market Data are only available to the lmh account: other signed-in users get
@@ -948,6 +948,12 @@ void Server::start() {
         std::string lang = lang_of(req);
         guarded(res, [=, this] { return do_algo_stop(in.str("reason"), lang); });
     });
+    svr.Post(R"(/api/algo/fast/([^/]+)/stop)", [=, this](const Request& req, Response& res) {
+        if (!require_api_user(req, res)) return;
+        try { json_response(res, control_.stop_fast_session(req.matches[1])); }
+        catch (const std::out_of_range& e) { api_error(res, e.what(), 404); }
+        catch (const std::exception& e) { api_error(res, e.what(), 500); }
+    });
 
     // Legacy JSON APIs (same request/response shapes as the Python server).
     svr.Post("/api/submit-order", [=, this](const Request& req, Response& res) {
@@ -1190,7 +1196,7 @@ void Server::start() {
     svr.Post("/submit-algo-stop", [=, this](const Request& req, Response& res) {
         RequestInput in(req);
         std::string lang = lang_of(req);
-        legacy(req, res, "/control-panel", [=, this] { return do_algo_stop(in.str("reason"), lang); });
+        legacy(req, res, "/algo", [=, this] { return do_algo_stop(in.str("reason"), lang); });
     });
     for (const char* path : {"/submit-order", "/submit-quick-order", "/submit-limit-order", "/submit-cancel-open-orders", "/submit-algo",
                              "/submit-algo-stop"}) {

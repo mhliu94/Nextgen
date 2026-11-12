@@ -318,6 +318,7 @@
     { id: "account-details", path: "/account-details", label: "nav_account" },
     { id: "working-orders", path: "/working-orders", label: "wo_title" },
     { id: "control-panel", path: "/control-panel", label: "nav_control" },
+    { id: "algo", path: "/algo", label: "nav_algo" },
     { id: "market-data", path: "/market-data", label: "nav_market", gate: "can_access_market_data", forbidden: "md_forbidden" },
     { id: "market-insights", path: "/market-insights", label: "nav_insights" },
     { id: "admin-control", path: "/admin-control", label: "nav_admin", gate: "can_access_admin_control", forbidden: "admin_control_forbidden" },
@@ -435,7 +436,7 @@
       queueRender("quotes");
     });
     es.addEventListener("smart", (e) => { state.smart = JSON.parse(e.data); queueRender("smart"); });
-    es.addEventListener("algo", (e) => { state.algo = JSON.parse(e.data); queueRender("algo"); });
+    es.addEventListener("algo", (e) => { state.algo = JSON.parse(e.data); state.smart = state.algo.smart; queueRender("algo"); });
     es.addEventListener("feeds", (e) => { state.feeds = JSON.parse(e.data); renderFeedPills(); queueRender("feeds"); });
     es.addEventListener("commands", (e) => { state.commands = JSON.parse(e.data); queueRender("commands"); });
   }
@@ -889,18 +890,6 @@
         h("div", { class: "row" }, h("div", { class: "field" }, h("label", { text: t("trading_mode") }), algoMode.el), h("div", { class: "field" }, h("label", { for: "algo_symbol", text: t("symbol") }), algoSymbol)),
         h("p", { class: "help", text: t("algo_session_rules") }),
         h("button", { class: "btn green", id: "algo-submit", type: "submit" }, t("algo_submit")));
-      const algoStatus = h("div", { id: "algo-status" });
-      const smartStatus = h("div", { id: "smart-status" });
-      const buyingStatus = h("div", { id: "smart-buying-status" });
-
-      // --- Stop all
-      const stopReason = h("input", { id: "stop_reason", type: "text", placeholder: t("stop_reason_placeholder") });
-      const stopMsg = h("div", { class: "warn" });
-      const stopForm = h("form", { onsubmit: async (e) => { e.preventDefault(); if (!(await confirmDialog(t("confirm_stop_all")))) return; submitForm(e, "/api/algo/stop", () => ({ reason: stopReason.value }), stopMsg, true); } },
-        h("p", { class: "help", text: t("algo_stop_help") }),
-        h("div", { class: "field" }, h("label", { for: "stop_reason", text: t("stop_reason") }), stopReason), stopMsg,
-        h("button", { class: "btn red", type: "submit" }, t("algo_stop")));
-
       // --- Cancel open orders
       const cAll = h("input", { class: "choice-input", type: "checkbox", id: "cancel-acct-all", value: "__ALL__", checked: true });
       const cAccounts = checkboxGrid("account_ids", metas.map((m) => ({ value: m.id, label: "#" + m.num_id + " " + m.id, checked: false, title: [m.id, m.broker, m.machine_alias, m.ip_address].filter(Boolean).join(" | ") })));
@@ -922,14 +911,10 @@
           h("div", { class: "col" },
             card(t("market_order"), marketForm),
             card(t("quick_market_order"), quickForm),
-            card(t("algo_stop_title"), stopForm),
             card(t("recent_commands"), recent)),
           h("div", { class: "col" },
             card(t("limit_order"), limitForm),
-            card(t("algo_title"), [algoForm, h("div", { class: "divider" }), h("div", { class: "section-heading", text: t("active_algo") }), algoStatus,
-              state.boot.smart_selling_available ? [h("div", { class: "divider" }), h("div", { class: "section-heading", text: t("smart_status_title") }), smartStatus] : null,
-              state.boot.smart_buying_available ? [h("div", { class: "divider" }), h("div", { class: "section-heading", text: t("smart_buying_status_title") }), buyingStatus] : null,
-              h("div", { class: "help", style: "margin-top:8px", text: t("smart_sessions_filter_note") })]),
+            card(t("algo_title"), algoForm),
             card(t("cancel_orders_title"), cancelForm))),
         h("datalist", { id: "symbol-suggestions" }, symbolOptions()));
 
@@ -939,7 +924,6 @@
     update(topics) {
       if (!$("#algo-form")) return;
       if (topics.has("accounts") || topics.has("quotes")) { this.renderers.renderMarketCash(); this.renderers.renderQuick(); this.renderers.renderLimit(); }
-      if (topics.has("smart") || topics.has("algo")) renderSmartStatus($("#smart-status"), $("#algo-status"), $("#smart-buying-status"));
       if (topics.has("commands")) renderRecentCommands($("#recent-commands"));
     },
   };
@@ -1014,42 +998,81 @@
       })))));
   }
 
-  const SMART_STATE_KEYS = { IDLE: "idle", SCHEDULED: "scheduled", RUNNING: "running", HOLD: "halted", STOPPING: "stopping", STOPPED: "stopped", COMPLETED: "completed", DEADLINE: "expired", SUBMIT_PENDING: "submit_pending", LIVE: "live", CANCEL_PENDING: "cancel_pending", RECONCILE: "reconcile", EXPIRED: "expired", HALTED: "halted" };
+  const SMART_STATE_KEYS = { IDLE: "idle", SCHEDULED: "scheduled", RUNNING: "running", HOLD: "paused", STOPPING: "stopping", STOPPED: "stopped", COMPLETED: "completed", DEADLINE: "expired", SUBMIT_PENDING: "submit_pending", LIVE: "live", CANCEL_PENDING: "cancel_pending", RECONCILE: "reconcile", EXPIRED: "expired", HALTED: "halted" };
   function smartStateLabel(stateName) { const key = SMART_STATE_KEYS[stateName]; return key ? t("smart_state_" + key) : String(stateName || "—"); }
 
   const stopRequests = new Set();
-  // Sessions started today (browser-local date) plus every active session, as the trading UI shows them.
-  function visibleParents(parents) {
-    const today = new Date().toDateString();
-    return (parents || []).filter((p) => p.active || new Date(p.start).toDateString() === today);
+  function visibleParents(parents) { return (parents || []).filter(p => p.active); }
+
+  function sessionStopButton(id, label, endpoint, stopping) {
+    const button = h("button", {class:"btn sm red",type:"button",dataset:{stopSession:id},
+      disabled:stopping || stopRequests.has(id),"aria-label":t("smart_stop") + " " + label,
+      onclick:async()=>{
+        if (!(await confirmDialog(t("algo_confirm_stop_one") + " " + label))) return;
+        button.disabled=true;stopRequests.add(id);
+        try { await api(endpoint,{method:"POST"});toast("info",t("smart_stopping")); }
+        catch(err) { toast("err",err.message);if(err instanceof AuthError)showLogin(err.message); }
+        finally {stopRequests.delete(id);refreshAlgo();}
+      }},t("smart_stop"));
+    return button;
   }
-  function renderSmartStatus(smartRoot, algoRoot, buyingRoot) {
-    if (algoRoot) {
-      const fast = (state.algo && state.algo.fast) || [];
-      if (!fast.length) {
-        algoRoot.replaceChildren(h("div", { class: "empty", text: t("no_active_algo") }));
-      } else {
-        algoRoot.replaceChildren(...fast.map((s) => {
+
+  pages["algo"] = {
+    render(root) {
+      root.append(h("div",{class:"page-head"},h("h1",{class:"page-title",text:t("nav_algo")})),
+        h("p",{class:"help",text:t("algo_active_only_note")}),h("div",{id:"algo-empty",class:"empty",text:t("no_active_algo")}));
+      this.sections={};this.roots={};
+      for(const mode of ["E","F","G","H"]) {
+        const id=mode==="G" ? "smart-status" : mode==="H" ? "smart-buying-status" : "algo-"+mode.toLowerCase()+"-status";
+        const body=h("div",{id});const section=card(t("mode_"+mode.toLowerCase()),body);
+        section.dataset.algoMode=mode;section.style.marginBottom="var(--gap)";
+        this.sections[mode]=section;this.roots[mode]=body;root.append(section);
+      }
+        const reason=h("input",{id:"stop_reason",type:"text",placeholder:t("stop_reason_placeholder")});
+        const msg=h("div",{class:"warn"});
+        const form=h("form",{id:"algo-stop-all-form",onsubmit:async e=>{
+          e.preventDefault();if(!(await confirmDialog(t("confirm_stop_all"))))return;
+          await submitForm(e,"/api/algo/stop",()=>({reason:reason.value}),msg,true);refreshAlgo();
+        }},h("p",{class:"help",text:t("algo_stop_help")}),
+          h("div",{class:"field"},h("label",{for:"stop_reason",text:t("stop_reason")}),reason),msg,
+          h("button",{class:"btn red",type:"submit",text:t("algo_stop")}));
+        root.append(card(t("algo_stop_title"),form));
+      this.update(new Set(["algo"]));
+    },
+    update(topics) {
+      if(!topics.has("algo") && !topics.has("smart"))return;
+      const data=state.algo || {};
+      const groups={E:(data.fast||[]).filter(s=>s.command.trading_mode==="E"),
+        F:(data.fast||[]).filter(s=>s.command.trading_mode==="F"),
+        G:visibleParents((state.smart||data.smart||{}).parents),H:visibleParents((data.buying||{}).parents)};
+      let count=0;
+      for(const mode of ["E","F","G","H"]) {
+        const rows=groups[mode];count+=rows.length;this.sections[mode].hidden=!rows.length;
+        if(mode==="E"||mode==="F")renderFastStatus(this.roots[mode],rows);
+        else renderParentsTable(this.roots[mode],rows,mode==="H");
+      }
+      $("#algo-empty").hidden=count>0;
+    }
+  };
+
+  function renderFastStatus(root, fast) {
+    root.replaceChildren(...fast.map((s) => {
           const cmd = s.command || {};
           const cycle = s.last_cycle || {};
           const target = cmd.fast_trading_total_target_position;
           const position = target !== undefined && target !== null
             ? h("div", { class: "status-meta", text: t("fast_target_position_status", { current: cycle.total_position === null || cycle.total_position === undefined ? "—" : fmt.qty(cycle.total_position), target: fmt.int(target) }) })
             : null;
-          return h("div", { class: "status-item" },
+          return h("div", { class: "status-item", dataset: {sessionId:s.session_id} },
             h("div", null,
               h("div", { class: "status-title" }, h("span", { class: "pill info", text: cmd.trading_mode || "" }), " ", cmd.symbol || "", " ", s.stopping ? h("span", { class: "pill stale", text: t("smart_state_stopping") }) : h("span", { class: "pill on", text: t("smart_state_running") }), cmd.fast_trading_test_mode ? h("span", { class: "pill purple", text: t("test_mode_tag") }) : null),
               h("div", { class: "status-meta" }, t("algo_running_since") + " " + fmt.clock(s.started_at) + " · " + t("algo_cycles") + " " + s.cycles + " · " + t("algo_published") + " " + s.published_commands + " · " + t("fast_accounts") + ": " + (cmd.fast_trading_account_ids || []).join(", ")),
               h("div", { class: "status-meta" }, t("fast_cycle_result") + ": " + (cycle.reason ? algoReason(cycle.reason) : (cycle.commands ? cycle.commands + " cmd" : "—")) + (cycle.limit_price ? " @" + fmt.price(cycle.limit_price) : "") + (cycle.total_resting_qty ? " · " + t("fast_target_percentage").split(" (")[0] + " " + fmt.int(cycle.target_quantity) + "/" + fmt.int(cycle.total_resting_qty) : "")),
               position,
-              h("div", { class: "status-meta faint mono", text: t("fast_session_id") + ": " + (s.display_id || s.session_id || "") })));
+              h("div", { class: "status-meta faint mono", text: t("fast_session_id") + ": " + (s.display_id || s.session_id || "") })),
+              sessionStopButton(s.session_id, s.display_id || s.session_id,
+                "/api/algo/fast/" + encodeURIComponent(s.session_id) + "/stop", s.stopping));
         }));
-      }
-    }
-    const smart = state.smart || (state.algo && state.algo.smart);
-    if (smartRoot) renderParentsTable(smartRoot, visibleParents(smart && smart.parents), false);
-    const buying = state.algo && state.algo.buying;
-    if (buyingRoot) renderParentsTable(buyingRoot, visibleParents(buying && buying.parents), true);
   }
 
   function renderParentsTable(root, parents, buying) {
@@ -1079,17 +1102,12 @@
       const total = Number(p.quantity), filled = Number(p.filled);
       const pct = Number.isFinite(total) && total > 0 && Number.isFinite(filled) ? Math.min(100, Math.max(0, (filled / total) * 100)) : 0;
       const terminal = ["STOPPING", "STOPPED", "COMPLETED", "DEADLINE", "EXPIRED"].includes(p.state);
-      const stopBtn = h("button", { class: "btn sm red", type: "button", "aria-label": t("smart_stop") + " " + accountLabel + " " + p.symbol, disabled: stopRequests.has(p.parent_id) || terminal, onclick: async () => {
-        stopBtn.disabled = true; stopRequests.add(p.parent_id);
-        try { await api(base + encodeURIComponent(p.parent_id) + "/stop", { method: "POST" }); toast("info", t("smart_stopping")); }
-        catch (err) { toast("err", t("smart_request_failed") + " " + err.message); if (err instanceof AuthError) showLogin(err.message); }
-        finally { stopRequests.delete(p.parent_id); refreshAlgo(); }
-      } }, t("smart_stop"));
+      const stopBtn = sessionStopButton(p.parent_id,p.display_id || p.parent_id,
+        base + encodeURIComponent(p.parent_id) + "/stop",terminal);
       const bound = buying ? p.maximum_price : p.minimum_price;
       const perAccount = Object.entries(p.accounts || {}).map(([id, a]) => {
-        let text = id + ": " + fmt.decimal(a.filled) + "/" + fmt.decimal(a.quantity);
+        let text = id + ": " + t("smart_filled") + " " + fmt.decimal(a.filled);
         if (buying) text += " (" + t("smart_cash_budget") + " " + fmt.money(a.spent) + " / " + fmt.money(a.cash_budget) + ")";
-        else if (a.average_cost !== null && a.average_cost !== undefined) text += " (" + t("smart_average_cost") + " " + fmt.decimal(a.average_cost) + ")";
         return text;
       }).join(", ");
       const details = h("details", { dataset: { parentId: p.parent_id } }, h("summary", { text: t("details") }), h("dl", { class: "kv" },
@@ -1103,7 +1121,7 @@
         h("dt", { text: t("smart_accounts_detail") }), h("dd", { text: perAccount })));
       return h("tr", null,
         h("td", { class: "smart-account-label" }, h("b", { text: accountLabel }), " / ", p.symbol, details),
-        h("td", { class: "right num", text: fmt.decimal(p.quantity) }),
+        buying ? h("td", { class: "right num", text: fmt.decimal(p.quantity) }) : null,
         h("td", { class: "right num" }, fmt.decimal(p.filled), h("div", { class: "progress", title: pct.toFixed(1) + "%" }, h("span", { style: "width:" + pct.toFixed(1) + "%" }))),
         h("td", { class: "right num", text: fmt.decimal(p.remaining) }),
         h("td", { class: "right num", text: fmt.decimal(p.reserved) }),
@@ -1112,7 +1130,7 @@
         h("td", null, stopBtn));
     });
     updateScrollableTable(scroll, h("table", { class: "data", id: buying ? "smart-buying-status-table" : "smart-status-table" },
-      h("thead", null, h("tr", null, h("th", { text: t("account") + " / " + t("symbol") }), h("th", { class: "right", text: t(buying ? "smart_target" : "smart_inventory") }), h("th", { class: "right", text: t("smart_filled") }), h("th", { class: "right", text: t("smart_remaining") }), h("th", { class: "right", text: t("smart_reserved") }), h("th", { text: t("smart_state") }), h("th", { text: t("smart_reason") }), h("th", { text: t("smart_stop") }))),
+      h("thead", null, h("tr", null, h("th", { text: t("account") + " / " + t("symbol") }), buying ? h("th", { class: "right", text: t("smart_target") }) : null, h("th", { class: "right", text: t("smart_filled") }), h("th", { class: "right", text: t("smart_remaining") }), h("th", { class: "right", text: t("smart_reserved") }), h("th", { text: t("smart_state") }), h("th", { text: t("smart_reason") }), h("th", { text: t("smart_stop") }))),
       h("tbody", { id: buying ? "smart-buying-status-rows" : "smart-status-rows" }, rows)));
   }
   async function refreshAlgo() {

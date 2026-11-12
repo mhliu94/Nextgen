@@ -141,6 +141,7 @@ public:
     // Serialize starts with global stop notifications and order handoffs. The shared session
     // coordinator also makes admission atomic for direct runtime starts across E/F/G/H.
     std::string start_fast_strategy(const json& command);
+    json stop_fast_session(const std::string& session_id);
     json start_smart_parent(const json& settings);
     json stop_smart_parent(const std::string& parent_id);
     json start_smart_buying_parent(const json& settings);

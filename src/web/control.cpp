@@ -510,6 +510,18 @@ json ControlCenter::start_smart_parent(const json& settings) {
     return parent;
 }
 
+json ControlCenter::stop_fast_session(const std::string& session_id) {
+    std::lock_guard lock(algo_lock_);
+    if (!fast_) throw std::runtime_error("The algorithm trading manager is unavailable");
+    bool found = false;
+    for (const auto& session : fast_->statuses()) if (session.session_id == session_id) found = true;
+    if (!found) throw std::out_of_range("Unknown active E/F session");
+    fast_->stop_session(session_id);
+    reconcile_session_cancellations();
+    notify_hub(kTopicAlgo);
+    return json{{"ok", true}, {"session_id", session_id}, {"stopping", true}};
+}
+
 json ControlCenter::stop_smart_parent(const std::string& parent_id) {
     std::lock_guard lock(algo_lock_);
     if (!smart_) throw std::runtime_error("Smart selling is unavailable");
@@ -755,7 +767,7 @@ json ControlCenter::smart_status() const {
     out["ok"] = true;
     out["parents"] = json::array();
     if (smart_) {
-        for (auto& p : smart_->list_parents()) out["parents"].push_back(p);
+        for (auto& p : smart_->list_parents()) if (p.value("active", false)) out["parents"].push_back(p);
         json feeds = json::object();
         for (auto& [k, v] : smart_->feed_states()) feeds[k] = v;
         out["feeds"] = feeds;
@@ -769,7 +781,7 @@ json ControlCenter::smart_buying_status() const {
     out["ok"] = true;
     out["parents"] = json::array();
     if (buying_) {
-        for (auto& p : buying_->list_parents()) out["parents"].push_back(p);
+        for (auto& p : buying_->list_parents()) if (p.value("active", false)) out["parents"].push_back(p);
         json feeds = json::object();
         for (auto& [k, v] : buying_->feed_states()) feeds[k] = v;
         out["feeds"] = feeds;
