@@ -6,6 +6,7 @@
 
 #include <filesystem>
 #include <fstream>
+#include <future>
 #include <regex>
 #include <set>
 #include <sstream>
@@ -126,6 +127,59 @@ TEST_CASE_FIXTURE(StoreFixture, "today uses the creation date, not the update da
     CHECK(store.snapshot()["date"] == "2026-09-28");
     CHECK(store.snapshot()["orders"].empty());
     CHECK_FALSE(store.upsert(event({{"updated_at", "2026-09-28T05:00:00Z"}})));
+}
+
+TEST_CASE("order store readers remain available while an algorithm callback waits") {
+    std::promise<void> entered,release;
+    auto released=release.get_future().share();
+    OrderStore store(ngtest::directory({ngtest::meta("A",1,"Other")}),"America/New_York",
+        []{return epoch("2026-09-27T15:00:00Z");},
+        [&](const auto&){entered.set_value();released.wait();});
+    auto writer=std::async(std::launch::async,[&]{return store.upsert(event());});
+    entered.get_future().wait();
+    auto reader=std::async(std::launch::async,[&]{
+        store.update_feed("live","caught up");store.received();
+        return std::make_pair(store.feed_status(),store.snapshot());
+    });
+    const auto readiness=reader.wait_for(std::chrono::seconds(1));
+    // Always unblock/join on failure: the old implementation must fail, not hang the suite.
+    release.set_value();CHECK(writer.get());auto read=reader.get();
+    CHECK(readiness==std::future_status::ready);
+    CHECK(read.first["state"]=="live");CHECK(read.first["last_message_at"].is_string());
+    CHECK(store.snapshot()["orders"].size()==1);
+}
+
+TEST_CASE("order store keeps concurrent reporting in ingestion order") {
+    std::promise<void> entered,release;
+    auto released=release.get_future().share();std::vector<long long> sequences;
+    OrderStore store(ngtest::directory({ngtest::meta("A",1,"Other")}),"America/New_York",
+        []{return epoch("2026-09-27T15:00:00Z");},[&](const auto& received){
+            auto sequence=received.payload.at("sequence").template get<long long>();
+            if(sequence==0){entered.set_value();released.wait();}
+            sequences.push_back(sequence);
+        });
+    auto first=std::async(std::launch::async,[&]{return store.upsert(event());});
+    entered.get_future().wait();
+    auto second=std::async(std::launch::async,[&]{return store.upsert(event({{"sequence",1}}));});
+    release.set_value();CHECK(first.get());CHECK(second.get());
+    CHECK(sequences==std::vector<long long>{0,1});CHECK(store.snapshot()["orders"][0]["sequence"]==1);
+}
+
+TEST_CASE("order store callback rejection remains retryable and cannot publish a partial projection") {
+    bool reject=true;int calls=0;
+    OrderStore store(ngtest::directory({ngtest::meta("A",1,"Other")}),"America/New_York",
+        []{return epoch("2026-09-27T15:00:00Z");},[&](const auto&){++calls;if(reject)throw std::invalid_argument("report rejected");});
+    CHECK_THROWS_WITH_AS(store.upsert(event()),"report rejected",std::invalid_argument);
+    CHECK(store.snapshot()["orders"].empty());reject=false;
+    CHECK(store.upsert(event()));CHECK(calls==2);CHECK(store.snapshot()["orders"].size()==1);
+}
+
+TEST_CASE("order store rechecks midnight rollover after a reporting callback") {
+    double now=epoch("2026-09-28T03:59:59Z");
+    OrderStore store(ngtest::directory({ngtest::meta("A",1,"Other")}),"America/New_York",
+        [&]{return now;},[&](const auto&){now=epoch("2026-09-28T04:00:00Z");});
+    CHECK_FALSE(store.upsert(event()));CHECK(store.snapshot()["orders"].empty());
+    CHECK(store.snapshot()["date"]=="2026-09-28");
 }
 
 TEST_CASE("New York daylight saving boundaries") {

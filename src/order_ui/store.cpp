@@ -68,7 +68,11 @@ void OrderStore::reject_message() {
 
 bool OrderStore::upsert(const orders::OrderEvent& event) {
     const json& data = event.payload;
-    std::lock_guard lock(mutex_);
+    // Serialize ingestion and reporting, while allowing readers to inspect the
+    // feed/projection during callbacks. Algo callbacks acquire their own locks;
+    // their cycle threads may already hold those locks while reading this store.
+    std::lock_guard ingestion(upsert_mutex_);
+    std::unique_lock lock(mutex_);
     std::string today = rollover();
     const AccountMeta* meta = accounts_.find(data.at("account_id").get<std::string>());
     if (!meta) {
@@ -81,7 +85,12 @@ bool OrderStore::upsert(const orders::OrderEvent& event) {
         if (!matches) throw std::invalid_argument("account_num_id does not match the configured account_id.");
     }
     std::string event_day = zone_.date(event.created_at);
-    if (reporting_ && event_day <= today) reporting_(event);
+    if (reporting_ && event_day <= today) {
+        lock.unlock();
+        reporting_(event);
+        lock.lock();
+        today = rollover();  // A reader may have rolled the projection at midnight.
+    }
     if (event_day != today) {
         ++ignored_messages_;
         return false;

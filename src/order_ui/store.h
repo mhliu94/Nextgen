@@ -20,6 +20,7 @@ public:
     using Clock = std::function<double()>;  // wall-clock epoch seconds
     // Receives every accepted event created today or earlier (reports span dates; late fills on a
     // tagged order remain reportable). May throw std::invalid_argument to reject the event.
+    // Runs in ingestion order, without holding the snapshot/feed mutex.
     using Reporting = std::function<void(const orders::OrderEvent& event)>;
 
     // Throws std::invalid_argument for an unsupported time zone.
@@ -46,6 +47,7 @@ private:
     TimeZone zone_;
     Clock now_;
     Reporting reporting_;
+    std::recursive_mutex upsert_mutex_;
     std::recursive_mutex mutex_;
     std::map<std::pair<std::string, std::string>, orders::OrderEvent> orders_;
     std::string day_;
