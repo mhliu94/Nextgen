@@ -133,7 +133,7 @@ const algo = {active: true, fast: [], smart: {parents: [parent]}, buying: {paren
 window.fetch = async (url, options = {}) => {
   check(!options.method || options.method === "GET", "Unexpected mutation");
   const fixtures = {
-    "/api/i18n": {algo_waiting_volume: "Waiting for market volume", algo_waiting_reconciliation: "Waiting for broker order confirmation"},
+    "/api/i18n": {mode_e: "E Buying (Upper Limit)", algo_waiting_volume: "Waiting for market volume", algo_waiting_reconciliation: "Waiting for broker order confirmation"},
     "/api/bootstrap": {user: "lmh", symbols: ["TANH"], market_data_symbols: ["TANH"], accounts: [],
       limit_share_shortcuts: [100], through_market_choices: [1], smart_selling_available: true, smart_buying_available: true},
     "/api/accounts/view": accounts, "/api/quotes": {rows: {}}, "/api/algo": algo, "/api/health": {feeds: {}},
@@ -157,9 +157,10 @@ run(async () => {
   scroll.scrollLeft = 0;
   check(scroll.scrollLeft === 0, "Cannot scroll back to first column");
   document.querySelector('#nav a[href="/control-panel"]').click();
-  for (const [mode, category] of [["e", "buying"], ["f", "selling"], ["g", "selling"], ["h", "buying"]])
-    check(document.querySelector("#algo-mode-" + mode).nextSibling.querySelector("small").dataset.algoCategory === category,
-      "Incorrect algorithm category for mode " + mode);
+  check(document.querySelector("#algo-mode-e").nextSibling.textContent === "E Buying (Upper Limit)", "E label contains extra classification");
+  check(!document.querySelector("[data-algo-category]"), "Backend categories leaked into the controls");
+  check(JSON.stringify([...document.querySelectorAll("#nav a")].slice(0, 4).map(a => a.pathname)) ===
+    '["/account-details","/control-panel","/algo","/working-orders"]', "Incorrect first four tabs");
   document.querySelector('#nav a[href="/algo"]').click();
   await until(() => document.querySelector("#smart-status-table"), "Algo table did not load");
   check(!document.body.textContent.includes("20.00%"), "Proprietary participation rate was rendered");

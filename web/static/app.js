@@ -316,9 +316,9 @@
   // `gate` names the bootstrap entitlement a page requires (the server enforces the same rules).
   const PAGES = [
     { id: "account-details", path: "/account-details", label: "nav_account" },
-    { id: "working-orders", path: "/working-orders", label: "wo_title" },
     { id: "control-panel", path: "/control-panel", label: "nav_control" },
     { id: "algo", path: "/algo", label: "nav_algo" },
+    { id: "working-orders", path: "/working-orders", label: "wo_title" },
     { id: "market-data", path: "/market-data", label: "nav_market", gate: "can_access_market_data", forbidden: "md_forbidden" },
     { id: "market-insights", path: "/market-insights", label: "nav_insights" },
     { id: "admin-control", path: "/admin-control", label: "nav_admin", gate: "can_access_admin_control", forbidden: "admin_control_forbidden" },
@@ -875,8 +875,6 @@
       algoMode.inputs.forEach((i) => {
         i.id = "algo-mode-" + i.value.toLowerCase();
         i.nextSibling.setAttribute("for", i.id);
-        const category = ["E", "H"].includes(i.value) ? "buying" : "selling";
-        i.nextSibling.append(" ", h("small", { dataset: { algoCategory: category }, text: "(" + t("algo_category_" + category) + ")" }));
       });
       const algoSymbol = h("select", { id: "algo_symbol", required: true }, symbolOptions());
       const algoMsg = h("div", { class: "help", id: "smart-selling-message", role: "status" });
