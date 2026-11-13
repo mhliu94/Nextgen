@@ -6,6 +6,7 @@
 
 #include "core/strings.h"
 #include "core/decimal.h"
+#include "core/equity_price.h"
 #include "core/time_util.h"
 #include "core/time_zone.h"
 
@@ -25,8 +26,7 @@ double nearest_tick_price(const json& value, const std::string& tick_size) {
             value.is_number_float() ? Decimal::from_double(value.get<double>()) : Decimal::parse(value.dump());
         Decimal tick=Decimal::parse(tick_size);
         if (!price.is_positive() || !tick.is_positive()) throw std::invalid_argument("Limit price and tick size must be positive");
-        Decimal lower=price.round_down_to_step(tick);
-        Decimal rounded=(price-lower)*Decimal(2)>=tick ? lower+tick : lower;
+        Decimal rounded=nearest_equity_price(price,tick);
         if (!rounded.is_positive()) throw std::invalid_argument("Limit price rounds below the minimum configured tick");
         return rounded.to_double();
     } catch (const DecimalError&) {

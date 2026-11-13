@@ -6,6 +6,7 @@
 
 #include "core/logging.h"
 #include "core/strings.h"
+#include "core/equity_price.h"
 #include "core/time_util.h"
 #include "orders/commands.h"
 
@@ -139,15 +140,20 @@ struct BookQuantity {
 };
 
 BookQuantity book_quantity_and_limit(const std::string& mode, const std::vector<BookLevel>& levels, double price_limit,
-                                     int book_levels) {
+                                     int book_levels, const Decimal& tick) {
     auto top = ordered_top_levels(levels, mode, book_levels);
     if (top.empty()) return {0, std::nullopt, "no_resting_orders"};
     double extreme = *top[0].price;
     for (auto& l : top) extreme = mode == "E" ? std::max(extreme, *l.price) : std::min(extreme, *l.price);
-    double execution_limit = mode == "E" ? std::min(extreme, price_limit) : std::max(extreme, price_limit);
+    Decimal bound = mode=="E" ? round_equity_price_down(Decimal::from_double(price_limit),tick)
+                              : round_equity_price_up(Decimal::from_double(price_limit),tick);
+    if (!bound.is_positive()) return {0, std::nullopt, "price_limit_below_minimum_tick"};
+    Decimal execution = mode=="E" ? Decimal::min(round_equity_price_up(Decimal::from_double(extreme),tick),bound)
+                                  : Decimal::max(round_equity_price_down(Decimal::from_double(extreme),tick),bound);
+    double execution_limit = execution.to_double();
     double total = 0.0;
     for (auto& l : top) {
-        bool in_range = mode == "E" ? *l.price <= price_limit : *l.price >= price_limit;
+        bool in_range = mode == "E" ? *l.price <= execution_limit : *l.price >= execution_limit;
         if (in_range && l.quantity && *l.quantity > 0) total += *l.quantity;
     }
     if (static_cast<long long>(std::floor(total)) <= 0) return {0, execution_limit, "no_resting_orders_within_price_limit"};
@@ -321,7 +327,7 @@ CycleResult build_fast_trading_cycle_commands(const CycleInputs& in) {
         return result;
     }
     const auto& levels = mode == "E" ? in.book.asks : in.book.bids;
-    BookQuantity bq = book_quantity_and_limit(mode, levels, in.price_limit, book_levels);
+    BookQuantity bq = book_quantity_and_limit(mode, levels, in.price_limit, book_levels, Decimal::parse(in.tick_size));
     long long total_qty = static_cast<long long>(std::floor(bq.total));
     result.total_resting_qty = total_qty;
     result.target_quantity = static_cast<long long>(std::floor(bq.total * target_percentage / 100.0));
@@ -826,6 +832,7 @@ CycleResult StrategyManager::run_cycle(const json& command) {
         inputs.symbol = v.symbol;
         inputs.book = book;
         inputs.price_limit = v.price_limit;
+        if (settings_.price_tick) inputs.tick_size = settings_.price_tick(v.symbol,v.mode=="E");
         inputs.account_ids = v.account_ids;
         inputs.book_levels = v.book_levels;
         inputs.target_percentage = v.target_percentage;

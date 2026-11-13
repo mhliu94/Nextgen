@@ -1,4 +1,5 @@
 #include "algo/smart_buying/runtime.h"
+#include "core/equity_price.h"
 
 #include <cmath>
 #include <set>
@@ -92,8 +93,8 @@ json SmartBuyingRuntime::start_parent(const json& settings) {
     const std::optional<double>& best_ask = book.asks.front().price;
     if (!best_ask) throw ValueError("best ask must be a finite number");
     if (!std::isfinite(*best_ask)) throw ValueError("invalid best ask");
-    Decimal reference_price =
-        parse_input_decimal(json(python_float_repr(*best_ask)), "best ask", true).round_up_to_step(Decimal::parse(rules.at("tick_size")));
+    Decimal reference_price = round_equity_price_up(
+        parse_input_decimal(json(python_float_repr(*best_ask)), "best ask", true), Decimal::parse(rules.at("tick_size")));
 
     std::map<std::string, Decimal> budgets, quantities;
     Decimal quantity;

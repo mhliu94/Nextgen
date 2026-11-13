@@ -1,4 +1,5 @@
 #include "algo/smart_selling/engine.h"
+#include "core/equity_price.h"
 
 #include <algorithm>
 #include <cmath>
@@ -426,7 +427,7 @@ std::optional<Decimal> SmartSellingEngine::depth_budget(const QuoteState&) const
 
 std::pair<Decimal, bool> SmartSellingEngine::dispatch_price(const json& parent, const json& order, const QuoteState& quote) const {
     Decimal floor = is_blank(parent.at("minimum_price")) ? Decimal::zero() : D(parent, "minimum_price");
-    Decimal price = Decimal::max(Decimal::max(D(order, "limit_price"), quote.bid), floor).round_up_to_step(D(parent, "tick_size"));
+    Decimal price = round_equity_price_up(Decimal::max(Decimal::max(D(order, "limit_price"), quote.bid), floor), D(parent, "tick_size"));
     return {price, order.at("aggressive").get<bool>() || D(order, "limit_price") <= quote.bid};
 }
 
@@ -577,7 +578,7 @@ void SmartSellingEngine::on_quote(const std::string& symbol_in, const QuoteUpdat
         if (healthy && update.accessible && bid.is_positive()) {
             for (json& parent : parents) {
                 Decimal floor = parent.at("minimum_price").is_null() ? Decimal::zero() : D(parent, "minimum_price");
-                Decimal price = Decimal::max(bid, floor).round_up_to_step(D(parent, "tick_size"));
+                Decimal price = round_equity_price_up(Decimal::max(bid, floor), D(parent, "tick_size"));
                 Decimal legal_minimum = Decimal::max(
                     D(parent, "min_quantity"), D(parent, "min_notional").div(price, 30).round_up_to_step(D(parent, "quantity_step")));
                 Decimal base = parent.contains("base_child_cap") ? D(parent, "base_child_cap") : D(parent, "child_cap");

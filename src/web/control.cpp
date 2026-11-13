@@ -204,6 +204,9 @@ void ControlCenter::create_fast_trading_manager() {
     fast::RuntimeSettings settings;
     for (auto& [level, cfg] : config_.fast_trading.aggression_levels) settings.aggression_levels[level] = {cfg.book_levels, cfg.cycle_seconds};
     settings.minimum_cycle_seconds_by_medium = config_.fast_trading.minimum_cycle_seconds_by_medium;
+    settings.price_tick = [this](const std::string& symbol,bool buying) {
+        return (buying ? config_.smart_buying : config_.smart_selling).rules_for(symbol).at("tick_size");
+    };
     fast_ = std::make_unique<fast::StrategyManager>(
         market_store_, [this]() -> const AccountDirectory& { return accounts_; },
         [this](const json& command, const std::string& key) { publish_fast_trading_command(command, key); },

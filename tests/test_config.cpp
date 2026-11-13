@@ -107,7 +107,7 @@ TEST_CASE("smart selling config normalisation") {
     CHECK(rules.at("quantity_step") == "1");
     CHECK(cfg.rules_for("OTHER").at("tick_size") == "0.01");
     ng::json bad = ng::json::parse(R"({"instruments": {"X": {"tick_ladder": []}}})");
-    CHECK_THROWS_WITH(ng::normalize_smart_selling_config(&bad), "Smart selling currently requires a constant tick_size");
+    CHECK_THROWS_WITH(ng::normalize_smart_selling_config(&bad), "Custom tick_ladder is unsupported; sub-dollar ticks are applied automatically");
     ng::json bad_enabled = ng::json::parse(R"({"enabled": "yes"})");
     CHECK_THROWS_WITH(ng::normalize_smart_selling_config(&bad_enabled), "smart_selling.enabled must be boolean");
 }

@@ -5,6 +5,7 @@
 #include <stdexcept>
 
 #include "core/strings.h"
+#include "core/equity_price.h"
 #include "core/time_util.h"
 
 namespace ng::smart {
@@ -190,8 +191,8 @@ ChildPlan plan_child_order(const json& parent, const QuoteState& quote, double n
     if (!min_price.is_null() && !(min_price.is_string() && min_price.get<std::string>().empty())) {
         minimum_price = parse_decimal(min_price);
     }
-    Decimal price = Decimal::max(Decimal::max(selected_price, quote.bid), minimum_price)
-                        .round_up_to_step(parse_decimal(parent.at("tick_size")));
+    Decimal price = round_equity_price_up(Decimal::max(Decimal::max(selected_price, quote.bid), minimum_price),
+                                         parse_decimal(parent.at("tick_size")));
 
     if (!meets_order_minimum(parent, ready_quantity, price)) {
         return ChildPlan{std::nullopt, price, aggressive, depth_limited, "residual quantity below broker minimum"};
@@ -210,7 +211,7 @@ ChildPlan plan_child_order(const json& parent, const QuoteState& quote, double n
 
 ChildPlan plan_buy(const json& parent, const QuoteState& quote, double now) {
     (void)now;
-    Decimal price = quote.ask.round_up_to_step(parse_decimal(parent.at("tick_size")));
+    Decimal price = round_equity_price_up(quote.ask, parse_decimal(parent.at("tick_size")));
     const json& ceiling = parent.at("maximum_price");
     if (!ceiling.is_null() && price > parse_decimal(ceiling)) {
         return ChildPlan{std::nullopt, price, true, false, "best ask exceeds maximum price"};

@@ -57,6 +57,34 @@ CycleInputs inputs(const AccountDirectory& dir, const OrderBookSnapshot& book, c
 
 }  // namespace
 
+TEST_CASE("E and F sub-dollar ticks respect fractional user limits before allocation") {
+    auto dir=ngtest::directory({ngtest::meta("A",1)});
+    auto book=book_with({{0.0910,500},{0.0912,500}},{{0.0913,500},{0.0911,500}});
+    auto buy=build_fast_trading_cycle_commands(inputs(dir,book,"E",0.09115,2,100));
+    REQUIRE(buy.commands.size()==1);CHECK(buy.limit_price==0.0911);CHECK(buy.total_resting_qty==500);
+    auto sell=build_fast_trading_cycle_commands(inputs(dir,book,"F",0.09115,2,100));
+    REQUIRE(sell.commands.size()==1);CHECK(sell.limit_price==0.0912);CHECK(sell.total_resting_qty==500);
+}
+
+TEST_CASE("E sizes buying capacity from its actual tick-rounded execution price") {
+    auto dir=ngtest::directory({ngtest::meta("A",1)});
+    auto book=book_with({{0.09115,1000}},{});
+    std::map<std::string,AccountSnapshot> snapshots{{"A",snapshot("A",9.114,0)}};
+    auto result=build_fast_trading_cycle_commands(inputs(dir,book,"E",0.10,1,100,&snapshots));
+    CHECK(result.limit_price==0.0912);CHECK(result.commands.empty());CHECK(result.capacity_noop);
+}
+
+TEST_CASE("E and F honor configured upper-band ticks and the dollar threshold") {
+    auto dir=ngtest::directory({ngtest::meta("A",1)});
+    auto book=book_with({{1.023,1000}},{{1.023,1000}});
+    auto buy=inputs(dir,book,"E",1.03,1,100);buy.tick_size="0.005";
+    CHECK(build_fast_trading_cycle_commands(buy).limit_price==1.025);
+    auto sell=inputs(dir,book,"F",1.02,1,100);sell.tick_size="0.005";
+    CHECK(build_fast_trading_cycle_commands(sell).limit_price==1.02);
+    buy.book=book_with({{0.9999,1000}},{});buy.price_limit=0.99995;
+    CHECK(build_fast_trading_cycle_commands(buy).limit_price==0.9999);
+}
+
 TEST_CASE("mode E sums only the top N asks within the limit and allocates evenly") {
     auto dir = ngtest::directory({ngtest::meta("A", 1), ngtest::meta("B", 2)});
     auto book = book_with({{10.0, 300}, {10.5, 300}, {11.0, 1000}}, {});

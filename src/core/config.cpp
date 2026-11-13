@@ -165,7 +165,7 @@ namespace {
 
 std::map<std::string, std::string> validate_instrument_rules(const json& rules, const char* context) {
     if (!rules.is_object()) throw ConfigError("Smart selling instrument rules must be objects");
-    if (rules.contains("tick_ladder")) throw ConfigError("Smart selling currently requires a constant tick_size");
+    if (rules.contains("tick_ladder")) throw ConfigError("Custom tick_ladder is unsupported; sub-dollar ticks are applied automatically");
     static const std::set<std::string> known = {"tick_size", "quantity_step", "min_quantity", "min_notional"};
     std::vector<std::string> unknown;
     for (auto it = rules.begin(); it != rules.end(); ++it) {

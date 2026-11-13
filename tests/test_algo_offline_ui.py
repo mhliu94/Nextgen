@@ -21,10 +21,15 @@ window.addEventListener("load",async()=>{
     check(rows.length===3,'Missing account rows');
     check(!rows[0].disabled,'Fresh account blocked');
     check(rows[1].disabled && rows[2].disabled,'Stale or missing account remained selectable');
+    const price=document.querySelector('#fast-price-limit');
+    if(price){
+      for(const value of ['0.0911','0.0001','0.09115']){price.value=value;check(price.checkValidity(),'Sub-dollar price rejected: '+value);}
+      price.value='0.00001';check(!price.checkValidity(),'Price below the minimum tick accepted by the input');
+    }
     document.querySelector('.modal-close').click();
   }
   check(requests.length===0,'Opening checklist submitted a command');
-  result.textContent='PASS: E/F/G/H disable stale and missing accounts while keeping fresh accounts selectable';
+  result.textContent='PASS: E/F/G/H keep offline accounts blocked; E/F inputs accept sub-dollar price precision';
  }catch(e){result.textContent='FAIL: '+e.message;}
 });
 '''

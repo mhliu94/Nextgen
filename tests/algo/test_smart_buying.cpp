@@ -156,6 +156,24 @@ TEST_CASE("fixed participation and minimum child") {
     }
 }
 
+TEST_CASE_FIXTURE(BuyingFixture,"Smart buying sub-dollar sizing and orders preserve the actual best ask") {
+    snapshots["A"]=account("A",91.10);
+    OrderBookSnapshot book;book.symbol="XYZ";book.asof_epoch=static_cast<long long>(clock);
+    book.asks={{0.0911,1000,std::nullopt}};md.upsert_book(book);
+    auto p=start({{"maximum_price","0.0911"}});CHECK(Dec(p["quantity"])==Dec(1000));
+    QuoteUpdate u;u.bid="0.0910";u.ask="0.0911";u.bid_size=1000;u.ask_size=1000;u.source_time=clock;
+    engine->on_quote("XYZ",u);volume(20000);auto command=tick();REQUIRE(command.is_object());
+    CHECK(command["limit_price"]==0.0911);CHECK(command["qty_shares"]==1000);
+}
+
+TEST_CASE_FIXTURE(BuyingFixture,"Smart buying rejects sub-dollar asks that exceed its exact maximum after tick rounding") {
+    OrderBookSnapshot book;book.symbol="XYZ";book.asof_epoch=static_cast<long long>(clock);
+    book.asks={{0.09115,1000,std::nullopt}};md.upsert_book(book);
+    start({{"maximum_price","0.09115"}});
+    QuoteUpdate u;u.bid="0.0910";u.ask="0.09115";u.bid_size=1000;u.ask_size=1000;u.source_time=clock;
+    engine->on_quote("XYZ",u);volume(20000);CHECK(tick().is_null());
+}
+
 TEST_CASE_FIXTURE(BuyingFixture, "selling ultra mode is not available for buying") {
     CHECK(runtime->config().participation_percentages ==
           std::map<std::string, std::string>{{"patient", "5"}, {"normal", "8"}, {"urgent", "15"}});

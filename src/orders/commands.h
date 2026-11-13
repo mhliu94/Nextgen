@@ -56,7 +56,8 @@ struct BrokerOrdersMessages {
 std::string iso_utc_now();
 std::string i18n_format_account(const std::string& text, const std::string& account);
 std::string new_command_id(const std::string& prefix);
-// Round positive limit prices to the nearest configured tick; halfway rounds up.
+// Round positive USD equity limits on the $0.0001 sub-dollar grid, or the
+// configured tick at/above $1; halfway rounds up.
 double nearest_tick_price(const json& price, const std::string& tick_size);
 
 // Pure builders.

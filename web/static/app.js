@@ -1224,7 +1224,7 @@
 
   function openFastModal(mode, symbol, msgEl) {
     const selling = mode === "F";
-    const price = h("input", { id: "fast-price-limit", type: "number", min: "0.01", step: "0.01", inputmode: "decimal" });
+    const price = h("input", { id: "fast-price-limit", type: "number", min: "0.0001", step: "any", inputmode: "decimal" });
     const accounts = accountChecklist("fastAccountId", (a) => "— " + (selling ? t("owned_shares") + " (" + symbol + ")" : t("usd_cash")) + ": " + formatAccountBalance(a, selling, symbol));
     const levels = radioGroup("fast_book_levels", state.boot.fast_trading.book_level_choices.map((v) => ({ value: v, label: String(v) })), "");
     const target = radioGroup("fast_target_percentage", state.boot.fast_trading.target_percentage_choices.map((v) => ({ value: v, label: v + "%" })), "");

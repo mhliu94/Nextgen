@@ -33,6 +33,7 @@ inline constexpr const char* kStopReasonTargetPosition = "Total target position 
 struct RuntimeSettings {
     std::map<int, std::pair<int, double>> aggression_levels;  // level -> (book_levels, cycle_seconds)
     std::map<std::string, double> minimum_cycle_seconds_by_medium;
+    std::function<std::string(const std::string&, bool)> price_tick; // symbol, buying; upper-band grid
     static RuntimeSettings defaults();
 };
 
@@ -66,6 +67,7 @@ struct CycleInputs {
     std::string symbol;
     OrderBookSnapshot book;
     double price_limit = 0.0;
+    std::string tick_size = "0.01"; // at/above $1; sub-dollar prices use $0.0001
     std::vector<std::string> account_ids;
     int book_levels = 0;
     int target_percentage = 0;
