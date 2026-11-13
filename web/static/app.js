@@ -575,7 +575,12 @@
         h("div", { class: "grid", id: "trading-account-grid" }));
       this.update(new Set(["accounts"]));
       this.staleTimer = setInterval(() => this.update(new Set(["accounts"])), 15000);
+      this.orderAvailabilityTimer = setInterval(() => {
+        if (!$("#trading-account-grid")) { clearInterval(this.orderAvailabilityTimer); return; }
+        refreshAccountOrderButtons();
+      }, 1000);
     },
+    destroy() { clearInterval(this.staleTimer); clearInterval(this.orderAvailabilityTimer); },
     update(topics) {
       if (!topics.has("accounts") && !topics.has("quotes")) return;
       if (!$("#trading-account-grid")) { clearInterval(this.staleTimer); return; }
@@ -659,14 +664,36 @@
   }
 
   function isStale(ts, now) {
-    if (!ts) return false;
-    let text = String(ts).trim();
-    if (!/(?:[zZ]|[+-]\d{2}:?\d{2})$/.test(text)) text += "Z";
+    if (!ts) return true;
+    const text = String(ts).trim();
+    if (!/(?:[zZ]|[+-]\d{2}:?\d{2})$/.test(text)) return true;
     const parsed = Date.parse(text);
-    return Number.isFinite(parsed) && now - parsed > 5 * 60 * 1000;
+    return !Number.isFinite(parsed) || now - parsed > 300000 || parsed - now > 30000;
+  }
+
+  function accountSnapshotAvailable(meta, acct, now = Date.now()) {
+    return !!acct && meta.has_snapshot !== false && !meta.stale && !isStale(acct.ts, now);
+  }
+
+  function currentAccountSnapshotAvailable(accountId) {
+    const view = state.accounts || {};
+    const acct = (view.accounts || []).find(a => a.account_id === accountId);
+    const meta = (view.metas || []).find(m => m.id === accountId) || {};
+    return accountSnapshotAvailable(meta, acct);
+  }
+
+  function refreshAccountOrderButtons() {
+    for (const button of $$("#trading-account-grid [data-account-order]")) {
+      const available = currentAccountSnapshotAvailable(button.dataset.accountId);
+      button.disabled = !available;
+      button.classList.toggle("gray", !available);
+      if (button.dataset.accountOrder === "limit") button.classList.toggle("green", available);
+      button.title = available ? "" : t("account_order_unavailable");
+    }
   }
 
   function accountCard(meta, acct, quotes, now) {
+    const available = accountSnapshotAvailable(meta, acct, now);
     const metaParts = [t("broker") + ": " + meta.broker, t("trading_medium") + ": " + meta.trading_medium];
     const metaLine = h("div", { class: "meta" });
     metaLine.append(metaParts.join(" · "));
@@ -685,7 +712,7 @@
       pill = h("span", { class: "pill " + (acct.trading_enabled ? "on" : "off"), text: t(acct.trading_enabled ? "trading_on" : "trading_off") });
       cash = fmt.money(usdCash(acct));
       tsText = acct.ts ? fmt.time(acct.ts) : "";
-      if (isStale(acct.ts, now)) stale = h("span", { class: "pill stale", title: t("stale_account_help"), text: t("stale") });
+      if (!available) stale = h("span", { class: "pill stale", title: t("stale_account_help"), text: t("stale") });
     }
     const extraCash = acct ? Object.entries(acct.cash_by_currency || {}).filter(([c]) => c !== "USD").map(([c, v]) => c + " " + fmt.num(v)).join(" · ") : "";
     const positions = acct ? acct.positions.slice().sort((a, b) => String(a.symbol).localeCompare(String(b.symbol))) : [];
@@ -706,8 +733,8 @@
         h("thead", null, h("tr", null, h("th", { text: t("symbol") }), h("th", { class: "right", text: t("qty") }), h("th", { class: "right", text: t("avg_px") }), h("th", { class: "right", text: t("portfolio_market_value") }))),
         h("tbody", null, posRows.length ? posRows : h("tr", null, h("td", { colspan: 4 }, h("em", { class: "faint", text: t("positions_none") })))))),
       h("div", { class: "account-actions" },
-        h("button", { class: "btn sm", type: "button", dataset: { accountOrder: "market", accountId: meta.id }, onclick: () => openAccountOrderModal("market", meta, label) }, t("market_order")),
-        h("button", { class: "btn sm green", type: "button", dataset: { accountOrder: "limit", accountId: meta.id }, onclick: () => openAccountOrderModal("limit", meta, label) }, t("limit_order"))));
+        h("button", { class: "btn sm" + (available ? "" : " gray"), type: "button", disabled: !available, title: available ? null : t("account_order_unavailable"), dataset: { accountOrder: "market", accountId: meta.id }, onclick: () => openAccountOrderModal("market", meta, label) }, t("market_order")),
+        h("button", { class: "btn sm " + (available ? "green" : "gray"), type: "button", disabled: !available, title: available ? null : t("account_order_unavailable"), dataset: { accountOrder: "limit", accountId: meta.id }, onclick: () => openAccountOrderModal("limit", meta, label) }, t("limit_order"))));
   }
 
   // Per-account order dialogs (quick market / limit), posting to the /api/account-orders endpoints.
@@ -740,6 +767,7 @@
   }
 
   function openAccountOrderModal(kind, meta, label) {
+    if (!currentAccountSnapshotAvailable(meta.id)) { toast("err", t("account_order_unavailable")); return; }
     const isLimit = kind === "limit";
     const picker = symbolPicker("symbol", true);
     const side = radioGroup("side", [{ value: "BUY", label: t("buy") }, { value: "SELL", label: t("sell") }], "BUY");
@@ -759,6 +787,9 @@
     picker.input.addEventListener("symbolchange", renderSummary);
     const form = h("form", { onsubmit: async (e) => {
       e.preventDefault();
+      if (!currentAccountSnapshotAvailable(meta.id)) {
+        message.className = "warn"; message.textContent = t("account_order_unavailable"); return;
+      }
       const payload = { account_id: meta.id, symbol: picker.selected(), side: side.value(), shares: shares.value.trim() };
       if (isLimit) { payload.limit_price = price.value.trim(); payload.through_market_pct = through.value(); }
       const controls = $$("input,select,button", form);
