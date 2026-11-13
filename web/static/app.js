@@ -66,10 +66,10 @@
       return n.toLocaleString(undefined, { minimumFractionDigits: digits, maximumFractionDigits: digits });
     },
     price(v) { return fmt.num(v, 4); },
-    qty(v) {
+    qty(v, options = { maximumFractionDigits: 8 }) {
       const n = Number(v);
       if (v === null || v === undefined || v === "" || !Number.isFinite(n)) return "—";
-      return n.toLocaleString(undefined, { maximumFractionDigits: 8 });
+      return n.toLocaleString(undefined, options);
     },
     int(v) {
       const n = Number(v);
@@ -636,7 +636,7 @@
       const cashChips = Object.entries(portfolio.cash || {}).map(([cur, amt]) => h("div", { class: "chip" }, h("div", { class: "chip-label", text: cur }), h("div", { class: "chip-value num", text: fmt.num(amt) })));
       const rows = (portfolio.positions || []).map((p) => h("tr", null,
         h("td", null, h("b", { text: p.symbol })),
-        h("td", { class: "right num", text: fmt.num(p.qty) }),
+        h("td", { class: "right num", text: fmt.qty(p.qty, { maximumSignificantDigits: 21 }) }),
         h("td", { class: "right num", text: p.avg_price === null ? "—" : fmt.price(p.avg_price) }),
         h("td", { class: "right num", text: p.last === null ? "--" : fmt.price(p.last) }),
         h("td", { class: "right num", text: p.market_value === null ? "--" : fmt.num(p.market_value) }),
@@ -749,7 +749,7 @@
     const posRows = positions.map((p) => {
       const q = quotes[String(p.symbol || "").trim().toUpperCase()];
       const last = q && typeof q.last === "number" ? q.last : null;
-      return h("tr", null, h("td", { text: p.symbol }), h("td", { class: "right num", text: fmt.num(p.qty) }),
+      return h("tr", null, h("td", { text: p.symbol }), h("td", { class: "right num", text: fmt.qty(p.qty, { maximumSignificantDigits: 21 }) }),
         h("td", { class: "right num", text: p.avg_price === null || p.avg_price === undefined ? "" : fmt.price(p.avg_price) }),
         h("td", { class: "right num faint", text: last === null ? "--" : fmt.num(last * Number(p.qty || 0)) }));
     });
