@@ -205,6 +205,7 @@
     connected: true,
     quoteCache: new Map(),  // symbol -> { row, at } from /api/quotes?symbol= (symbols outside the live set)
     activePage: null,
+    loadErrors: new Set(),
   };
 
   function t(key, params) {
@@ -238,18 +239,29 @@
       delete init.form;
     }
     init.headers = Object.assign({ Accept: "application/json" }, init.headers || {});
-    const response = await fetch(url, init);
-    if (response.status === 401) throw new AuthError(t("session_expired"));
-    let payload = null;
-    try { payload = await response.json(); } catch (e) { payload = null; }
-    if (!response.ok || (payload && payload.ok === false)) {
-      const message = (payload && (payload.error || payload.detail)) || t("error_generic");
-      const error = new Error(message);
-      error.status = response.status;
-      error.payload = payload;
-      throw error;
-    }
-    return payload;
+    // Bound reads (including response bodies). Mutating requests are never retried
+    // or timed out here: a lost reply does not prove a trade was not submitted.
+    const readOnly = !init.method || ["GET", "HEAD"].includes(init.method.toUpperCase());
+    const controller = readOnly && !init.signal ? new AbortController() : null;
+    if (controller) init.signal = controller.signal;
+    const timer = controller ? setTimeout(() => controller.abort(), 10000) : null;
+    try {
+      const response = await fetch(url, init);
+      if (response.status === 401) throw new AuthError(t("session_expired"));
+      let payload = null;
+      try { payload = await response.json(); } catch (e) { if (controller && controller.signal.aborted) throw e; }
+      if (!response.ok || (payload && payload.ok === false) || payload === null) {
+        const message = (payload && (payload.error || payload.detail)) || t("error_generic");
+        const error = new Error(message);
+        error.status = response.status;
+        error.payload = payload;
+        throw error;
+      }
+      return payload;
+    } catch (e) {
+      if (controller && controller.signal.aborted) throw new Error(t("request_timeout"));
+      throw e;
+    } finally { if (timer !== null) clearTimeout(timer); }
   }
 
   function toast(kind, message, ttl = 6000) {
@@ -421,11 +433,12 @@
     state.stream = es;
     es.onopen = () => setConnected(true);
     es.onerror = () => { setConnected(false); checkSession(); };
-    es.addEventListener("accounts", (e) => { state.accounts = JSON.parse(e.data); queueRender("accounts"); });
+    es.addEventListener("accounts", (e) => { state.accounts = JSON.parse(e.data); setLoadProblem("accounts", false); queueRender("accounts"); });
     es.addEventListener("quotes", (e) => {
       const payload = JSON.parse(e.data);
       state.prevRows = state.rows;
       state.rows = payload.rows || {};
+      setLoadProblem("quotes", false);
       for (const [symbol, row] of Object.entries(state.rows)) {
         if (row && typeof row.last === "number") {
           const hist = state.midHistory.get(symbol) || [];
@@ -436,8 +449,8 @@
       queueRender("quotes");
     });
     es.addEventListener("smart", (e) => { state.smart = JSON.parse(e.data); queueRender("smart"); });
-    es.addEventListener("algo", (e) => { state.algo = JSON.parse(e.data); state.smart = state.algo.smart; queueRender("algo"); });
-    es.addEventListener("feeds", (e) => { state.feeds = JSON.parse(e.data); renderFeedPills(); queueRender("feeds"); });
+    es.addEventListener("algo", (e) => { state.algo = JSON.parse(e.data); state.smart = state.algo.smart; setLoadProblem("algo", false); queueRender("algo"); });
+    es.addEventListener("feeds", (e) => { state.feeds = JSON.parse(e.data); setLoadProblem("feeds", false); renderFeedPills(); queueRender("feeds"); });
     es.addEventListener("commands", (e) => { state.commands = JSON.parse(e.data); queueRender("commands"); });
   }
 
@@ -495,24 +508,41 @@
     const topics = state.renderQueued;
     state.renderQueued = new Set();
     const page = pages[state.route];
-    if (page && page.update) page.update(topics);
+    if (state.boot && page && page.update) page.update(topics);
   }
 
-  async function refreshAll() {
-    try {
-      const [accounts, market, algo, feeds] = await Promise.all([
-        api("/api/accounts/view"), api("/api/quotes"), api("/api/algo"), api("/api/health"),
-      ]);
-      state.accounts = accounts;
-      state.rows = market.rows || {};
-      state.algo = algo;
-      state.smart = algo.smart;
-      state.feeds = feeds.feeds;
-      renderFeedPills();
-      renderPage();
-    } catch (e) {
-      if (e instanceof AuthError) showLogin(e.message);
-    }
+  let refreshPending = null, refreshTimer = null;
+  function setLoadProblem(topic, failed) {
+    if (failed) state.loadErrors.add(topic); else state.loadErrors.delete(topic);
+    const banner = $("#data-banner");
+    banner.hidden = !state.boot || state.loadErrors.size === 0;
+    banner.textContent = t("views_unavailable");
+  }
+
+  function refreshAll() {
+    const boot = state.boot;
+    if (!boot) return Promise.resolve();
+    if (refreshPending && refreshPending.boot === boot) return refreshPending.promise;
+    const run = { boot, promise: null };
+    refreshPending = run;
+    const jobs = [
+      ["accounts", "/api/accounts/view", data => { state.accounts = data; }],
+      ["quotes", "/api/quotes", data => { state.rows = data.rows || {}; }],
+      ["algo", "/api/algo", data => { state.algo = data; state.smart = data.smart; }],
+      ["feeds", "/api/health", data => { state.feeds = data.feeds; renderFeedPills(); }],
+    ];
+    run.promise = Promise.allSettled(jobs.map(async ([topic, url, apply]) => {
+      try {
+        const data = await api(url);
+        if (state.boot !== boot) return;
+        apply(data); setLoadProblem(topic, false); queueRender(topic);
+      } catch (e) {
+        if (state.boot !== boot) return;
+        if (e instanceof AuthError) { showLogin(e.message); return; }
+        setLoadProblem(topic, true); queueRender(topic);
+      }
+    })).finally(() => { if (refreshPending === run) refreshPending = null; });
+    return run.promise;
   }
 
   // ------------------------------------------------------------------------------------------
@@ -1083,6 +1113,7 @@
         else renderParentsTable(this.roots[mode],rows,mode==="H");
       }
       $("#algo-empty").hidden=count>0;
+      $("#algo-empty").textContent=state.algo ? t("no_active_algo") : t(state.loadErrors.has("algo") ? "view_unavailable" : "loading");
     }
   };
 
@@ -1690,6 +1721,11 @@
 
   // ---- Login -----------------------------------------------------------------------------
   function showLogin(message) {
+    state.boot = null;
+    clearInterval(refreshTimer); refreshTimer = null;
+    state.loadErrors.clear(); setLoadProblem("", false);
+    if (state.activePage && state.activePage.destroy) state.activePage.destroy();
+    state.activePage = null;
     if (state.stream) { state.stream.close(); state.stream = null; }
     closeBookStream();
     $("#topbar").hidden = true;
@@ -1748,13 +1784,16 @@
       return;
     }
     state.boot = bootstrap;
+    state.accounts = state.algo = state.smart = state.feeds = null;
+    state.rows = {}; state.loadErrors.clear(); setLoadProblem("", false);
     $("#topbar").hidden = false;
-    renderNav();
-    await refreshAll();
     if (location.pathname === "/login" || location.pathname === "/") history.replaceState({}, "", "/account-details");
     showLegacyFlash();
     setRoute();
     openStream();
+    refreshAll();
+    clearInterval(refreshTimer);
+    refreshTimer = setInterval(() => { if (state.loadErrors.size || !state.connected) refreshAll(); }, 5000);
   }
 
   // Legacy form endpoints (/submit-order, /submit-algo, ...) redirect back with ?ok= / ?err= messages.

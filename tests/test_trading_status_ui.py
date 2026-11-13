@@ -32,6 +32,7 @@ window.addEventListener('load',async()=>{
  const result=document.createElement('pre');result.id='confirmation-test-result';document.body.append(result);
  try {
   await until(()=>row('UNKNOWN'));
+  await until(()=>row('ON') && !buttons('ON')[1].disabled);
   for(const id of ['UNKNOWN','NOFLAG','STALE','INVALID','FUTURE','META']){
     check(buttons(id).every(b=>b.disabled && b.classList.contains('gray')),'Unreachable controls enabled or colored: '+id);
     buttons(id).forEach(b=>b.click());
